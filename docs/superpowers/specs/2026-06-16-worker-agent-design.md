@@ -1,43 +1,43 @@
-# Worker Agent Design
+# Worker Agent 设计
 
-Date: 2026-06-16
+日期：2026-06-16
 
-## Purpose
+## 目标
 
-Build a Windows host-side Worker Agent that coordinates local VMware Workstation VMs for RPA execution profiles. The Agent does not execute RPA tasks, does not start `runner.jar`, and does not manage task leases. It selects idle compatible VMs, switches them to the required profile snapshot, waits for the VM-side runner to become observable, and reports state.
+建设一个运行在 Windows 宿主机侧的 Worker Agent，用于协调本机 VMware Workstation VM 与 RPA 执行环境画像。Agent 不执行 RPA 任务，不启动 `runner.jar`，也不管理任务 lease。Agent 只负责选择空闲且兼容的 VM，将其切换到目标 profile 快照，等待 VM 内 runner 可被监控，并上报状态。
 
-The VM-side `runner.jar` continues to pull tasks from the scheduler center by itself.
+VM 内的 `runner.jar` 继续按原有机制自行从调度中心拉取任务。
 
-## Confirmed Scope
+## 确认范围
 
-In scope:
+本期范围：
 
-- Run as a C#/.NET Windows Service.
-- Manage multiple local VMs on one host.
-- Use `vmrun.exe` as the only VM control provider.
-- Query scheduler queues by `profileId`.
-- Switch an idle VM to a target profile snapshot when that profile has pending tasks.
-- Allow the same `profileId` to run on multiple compatible VMs.
-- Keep VMs powered on after they become idle.
-- Stop `runner.jar` before log backup and snapshot switching.
-- Back up VM logs before reverting snapshots.
-- Persist local switch transactions in SQLite.
-- Recover or quarantine after service restart and failed VM operations.
-- Expose a localhost-only operations API protected by API key.
-- Report Agent, VM, worker, profile, snapshot, and runner state.
+- 以 C#/.NET Windows Service 形式运行。
+- 管理单台宿主机上的多台本地 VM。
+- 仅使用 `vmrun.exe` 作为 VM 控制方式。
+- 按 `profileId` 查询调度队列。
+- 当某个 profile 存在待执行任务时，将一台空闲 VM 切换到目标 profile 快照。
+- 允许同一个 `profileId` 同时运行在多台兼容 VM 上。
+- VM 空闲后保持开机。
+- 快照切换和日志备份前先停止 `runner.jar`。
+- 快照回滚前备份 VM 日志。
+- 使用 SQLite 持久化本地切换事务。
+- 服务重启或 VM 操作失败后支持恢复或隔离。
+- 暴露仅监听 localhost、使用 API Key 保护的本机运维 API。
+- 上报 Agent、VM、worker、profile、snapshot 和 runner 状态。
 
-Out of scope:
+不在本期范围：
 
-- RPA task execution.
-- Starting `runner.jar` from the Agent.
-- Lease management.
-- Direct task assignment to runner.
-- Capacity calculation based on task count.
-- vSphere, ESXi, PowerCLI, dynamic clone, or cross-host scheduling.
+- RPA 任务执行。
+- 由 Agent 启动 `runner.jar`。
+- lease 管理。
+- 向 runner 直接分配任务。
+- 根据任务数量计算目标容量。
+- vSphere、ESXi、PowerCLI、动态 Clone 或跨宿主机调度。
 
-## Naming Model
+## 命名模型
 
-Use a three-layer model:
+采用三层模型：
 
 ```text
 profileId    = rpa-{city}-{business}-{system}
@@ -45,7 +45,7 @@ workerId     = {profileId}-{instance}
 snapshotName = {profileId}-{version}
 ```
 
-Example:
+示例：
 
 ```text
 profileId    = rpa-sh-tax-etax
@@ -53,18 +53,18 @@ workerId     = rpa-sh-tax-etax-001
 snapshotName = rpa-sh-tax-etax-v20260615.1
 ```
 
-Definitions:
+定义：
 
-- `profileId` identifies the environment capability needed by tasks.
-- `workerId` identifies one runner instance and must be unique on the host.
-- `snapshotName` identifies the concrete VM environment version.
-- `version` should use a sortable format such as `vYYYYMMDD.N`.
+- `profileId` 表示任务所需的环境能力画像。
+- `workerId` 表示一个 runner 实例，在宿主机内必须唯一。
+- `snapshotName` 表示具体的 VM 环境版本。
+- `version` 建议使用可排序格式，例如 `vYYYYMMDD.N`。
 
-The Agent must not require `workerId` and `snapshotName` to be the same.
+Agent 不要求 `workerId` 与 `snapshotName` 相同。
 
-## Configuration Model
+## 配置模型
 
-Each VM explicitly declares the profiles it supports and the snapshot used for each profile.
+每台 VM 显式声明它支持的 profiles，以及每个 profile 对应的快照。
 
 ```json
 {
@@ -115,93 +115,93 @@ Each VM explicitly declares the profiles it supports and the snapshot used for e
 }
 ```
 
-Startup validation:
+启动校验：
 
-- `vmrun.exe` exists.
-- VMX files exist.
-- `workerId` values are unique on the host.
-- `profileId` values match the naming rule.
-- Each enabled profile has exactly one snapshot mapping per VM.
-- Each configured `snapshotName` exists according to `vmrun listSnapshots`.
-- Backup root is writable.
-- Local operations API is bound to `127.0.0.1` unless explicitly changed in a later version.
+- `vmrun.exe` 存在。
+- VMX 文件存在。
+- `workerId` 在宿主机内唯一。
+- `profileId` 符合命名规则。
+- 每台 VM 内每个启用 profile 只能配置一个快照映射。
+- 每个配置的 `snapshotName` 都能通过 `vmrun listSnapshots` 查询到。
+- 日志备份根目录可写。
+- 本机运维 API 默认绑定到 `127.0.0.1`，除非后续版本明确调整。
 
-## Architecture
+## 架构
 
-`Seebot.WorkerAgent.Service` is one .NET Windows Service that hosts background workers and a localhost ASP.NET Core operations API.
+`Seebot.WorkerAgent.Service` 是一个 .NET Windows Service，内部托管后台任务和 localhost ASP.NET Core 运维 API。
 
-Components:
+组件：
 
-- `PoolSchedulerService`: polls scheduler queues by `profileId` and creates VM switch intents.
-- `VmCoordinator`: one coordinator per VM, with one async lock per VM.
-- `VmSwitchService`: orchestrates stop runner, backup logs, stop VM, revert snapshot, start VM, and readiness checks.
-- `VmrunService`: wraps `vmrun.exe`, captures output, exit code, timeout, and duration.
-- `GuestWorkerClient`: calls existing VM-side HTTP APIs for runner health, status, and stop.
-- `SchedulerClient`: queries pending profile tasks and reports Agent, VM, worker, and switch state.
-- `LogBackupService`: copies or collects VM logs and writes backup manifests.
-- `LocalStore`: persists VM state, switch transactions, recovery markers, and audit records in SQLite.
-- `RecoveryService`: resumes safe transaction steps or quarantines VMs after service restart.
-- `OperationsApi`: localhost-only API protected by `X-Agent-Api-Key`.
+- `PoolSchedulerService`：按 `profileId` 轮询调度队列，并生成 VM 切换意图。
+- `VmCoordinator`：每台 VM 一个协调器，每台 VM 持有一把异步锁。
+- `VmSwitchService`：编排停止 runner、备份日志、关闭 VM、回滚快照、启动 VM 和 ready 检查。
+- `VmrunService`：封装 `vmrun.exe`，记录输出、退出码、超时和耗时。
+- `GuestWorkerClient`：调用 VM 内已有 HTTP API，读取 runner 健康、状态并停止 runner。
+- `SchedulerClient`：查询 profile 待执行任务，并上报 Agent、VM、worker、profile 能力和切换状态。
+- `LogBackupService`：复制或收集 VM 日志，并生成备份 manifest。
+- `LocalStore`：使用 SQLite 持久化 VM 状态、切换事务、恢复标记和审计记录。
+- `RecoveryService`：服务重启后继续安全事务步骤，或隔离异常 VM。
+- `OperationsApi`：仅监听 localhost，并通过 `X-Agent-Api-Key` 鉴权。
 
-Different VMs can be operated in parallel. Automatic scheduling, manual operations, and recovery for the same VM must use the same VM lock.
+不同 VM 可以并行操作。同一 VM 的自动调度、人工操作和恢复操作必须共用同一把 VM 锁。
 
-## Scheduling Rules
+## 调度规则
 
-The scheduler uses priority, waiting time, profile compatibility, and snapshot stickiness. It does not calculate a target VM count from pending task count.
+调度器使用优先级、等待时间、profile 兼容性和快照粘性进行决策。它不根据待执行任务数计算目标 VM 数量。
 
-Per poll cycle:
+每轮调度：
 
-1. Query pending state for enabled `profileId` values.
-2. If no profile has pending tasks, only monitor and report current VM state.
-3. Pick the next target profile by scheduler priority and queue wait time.
-4. Prefer VMs already running the target profile.
-5. If more capacity is still useful because the target profile still has pending tasks, choose one compatible idle VM.
-6. At most one VM switch is started per poll cycle.
-7. The same profile may run on all compatible VMs over multiple cycles while its queue still has pending tasks.
-8. Do not switch VMs in `Running`, `Upgrading`, quarantined, or transaction-in-progress states.
+1. 查询所有启用 `profileId` 的待执行状态。
+2. 如果没有任何 profile 存在待执行任务，只监控并上报当前 VM 状态。
+3. 根据调度优先级和队列等待时间选择下一个目标 profile。
+4. 优先复用已经运行目标 profile 的 VM。
+5. 如果目标 profile 仍有待执行任务，则选择一台兼容的空闲 VM。
+6. 每轮最多启动一次 VM 快照切换。
+7. 只要队列仍有待执行任务，同一个 profile 可在多轮调度后占用全部兼容 VM。
+8. 不切换 `Running`、`Upgrading`、已隔离或存在事务中的 VM。
 
-An idle switch candidate must satisfy all of these:
+空闲切换候选 VM 必须同时满足：
 
-- VM supports the target profile.
-- VM is not quarantined.
-- VM has no active switch transaction.
-- Runner status is `Runnable`.
-- The VM current profile queue is empty.
-- The VM has stayed idle for at least `IdleStableSeconds`.
+- VM 支持目标 profile。
+- VM 未被隔离。
+- VM 没有活跃切换事务。
+- runner 状态为 `Runnable`。
+- VM 当前 profile 的队列为空。
+- VM 已持续空闲至少 `IdleStableSeconds`。
 
-If a candidate becomes busy during the switch attempt, the Agent cancels that VM's transaction and tries again in a future cycle.
+如果候选 VM 在切换尝试期间变为忙碌，Agent 取消该 VM 的事务，并在后续轮次重试。
 
-## Safe Switch Flow
+## 安全切换流程
 
-The Agent does not implement a drain protocol in this version. The existing VM-side stop API is the final concurrency gate.
+本版本不实现 drain 协议。已有的 VM 内停止接口是最终并发闸门。
 
-Switch flow:
+切换流程：
 
-1. Acquire the VM lock.
-2. Create a local switch transaction.
-3. Re-read VM runner status.
-4. Call the VM-side stop API to stop `runner.jar`.
-5. If the stop API reports that runner has already started a task or is `Running`, cancel this transaction and do not switch the VM.
-6. Confirm runner is stopped and `currentTaskId` is empty.
-7. Back up VM logs to the host.
-8. Write `backup_manifest.json`.
-9. Stop the VM with `vmrun stop`.
-10. Revert to the target snapshot with `vmrun revertToSnapshot`.
-11. Start the VM with `vmrun start`.
-12. Wait for network and VM-side HTTP health.
-13. Wait until runner status is `Runnable` or `Running`.
-14. Verify reported `workerId` and `profileId` match the expected VM/profile.
-15. Report success and enter monitoring.
+1. 获取 VM 锁。
+2. 创建本地切换事务。
+3. 重新读取 VM runner 状态。
+4. 调用 VM 内停止接口关闭 `runner.jar`。
+5. 如果停止接口报告 runner 已经开始任务或状态为 `Running`，取消本次事务，不切换该 VM。
+6. 确认 runner 已停止且 `currentTaskId` 为空。
+7. 将 VM 日志备份到宿主机。
+8. 写入 `backup_manifest.json`。
+9. 使用 `vmrun stop` 关闭 VM。
+10. 使用 `vmrun revertToSnapshot` 回滚到目标快照。
+11. 使用 `vmrun start` 启动 VM。
+12. 等待网络和 VM 内 HTTP 健康接口可用。
+13. 等待 runner 状态变为 `Runnable` 或 `Running`。
+14. 校验上报的 `workerId` 和 `profileId` 与预期 VM/profile 匹配。
+15. 上报成功并进入监控。
 
-Required stop API semantics:
+停止接口必须满足：
 
-- If runner is idle, stop task polling and close `runner.jar`.
-- If runner is executing a task, reject the stop request.
-- The Agent must not force-stop an executing runner.
+- 如果 runner 空闲，停止任务拉取并关闭 `runner.jar`。
+- 如果 runner 正在执行任务，拒绝停止请求。
+- Agent 不强制停止正在执行任务的 runner。
 
-## Runner Status Handling
+## Runner 状态处理
 
-The Agent keeps using the existing runner status codes:
+Agent 继续使用已有 runner 状态码：
 
 ```text
 0 New
@@ -215,26 +215,26 @@ The Agent keeps using the existing runner status codes:
 8 Offline
 ```
 
-Switch decisions:
+切换决策：
 
-- `Runnable`: candidate for switch if the current profile queue is empty and idle is stable.
-- `Running`: never switch.
-- `Upgrading`: never switch.
-- `New` or `Closed`: not a switch candidate in the scheduler; can be handled during ready wait or reported as not ready.
-- `RobotError`, `ClientError`, `UpgradeFailed`, `Offline`: report error and consider quarantine according to policy.
+- `Runnable`：如果当前 profile 队列为空且空闲状态稳定，可作为切换候选。
+- `Running`：永不切换。
+- `Upgrading`：永不切换。
+- `New` 或 `Closed`：不作为调度器中的切换候选，可在 ready 等待阶段处理或上报未 ready。
+- `RobotError`、`ClientError`、`UpgradeFailed`、`Offline`：上报异常，并按策略考虑隔离。
 
-Ready decisions after VM start:
+VM 启动后的 ready 判断：
 
-- `Runnable`: ready.
-- `Running`: ready and already consuming work.
-- `New`: wait until timeout, then report `RUNNER_NOT_READY`.
-- `Closed`: wait until timeout, then report `RUNNER_CLOSED`.
-- `Upgrading`: wait until upgrade timeout, then report `WORKER_UPGRADING_TIMEOUT`.
-- Error and offline states are reported immediately according to their error code.
+- `Runnable`：ready。
+- `Running`：ready，且说明已经开始消费任务。
+- `New`：等待直到超时，随后上报 `RUNNER_NOT_READY`。
+- `Closed`：等待直到超时，随后上报 `RUNNER_CLOSED`。
+- `Upgrading`：等待直到升级超时，随后上报 `WORKER_UPGRADING_TIMEOUT`。
+- 错误和离线状态按对应错误码立即上报。
 
-## Local State
+## 本地状态
 
-VM state fields:
+VM 状态字段：
 
 ```text
 vm_name
@@ -249,7 +249,7 @@ is_quarantined
 updated_at
 ```
 
-Switch transaction statuses:
+切换事务状态：
 
 ```text
 CREATED
@@ -264,7 +264,7 @@ FAILED
 NEED_MANUAL_CHECK
 ```
 
-Switch transaction fields:
+切换事务字段：
 
 ```text
 tx_id
@@ -285,36 +285,124 @@ updated_at
 finished_at
 ```
 
-## Recovery Rules
+## 恢复规则
 
-After service restart, `RecoveryService` scans incomplete transactions.
+服务重启后，`RecoveryService` 扫描未完成事务。
 
-- `CREATED`: if runner was not stopped, mark failed and allow future scheduling.
-- `STOP_RUNNER_DONE`: continue log backup if possible.
-- `LOG_BACKUP_DONE`: continue VM stop.
-- `VM_STOP_DONE`: continue snapshot revert.
-- `SNAPSHOT_REVERT_DONE`: continue VM start.
-- `VM_START_DONE`: continue ready wait.
-- `WORKER_READY_DONE`: report state and mark success.
-- `NEED_MANUAL_CHECK`: do not recover automatically.
+- `CREATED`：如果 runner 尚未停止，标记失败，并允许后续重新调度。
+- `STOP_RUNNER_DONE`：尽可能继续日志备份。
+- `LOG_BACKUP_DONE`：继续关闭 VM。
+- `VM_STOP_DONE`：继续快照回滚。
+- `SNAPSHOT_REVERT_DONE`：继续启动 VM。
+- `VM_START_DONE`：继续等待 ready。
+- `WORKER_READY_DONE`：补报状态并标记成功。
+- `NEED_MANUAL_CHECK`：不自动恢复。
 
-Failure handling:
+失败处理：
 
-- Stop runner failed or runner became `Running`: cancel this switch and find another VM later.
-- Log backup failed: block snapshot revert unless `ForceRevertWhenBackupFailed=true`.
-- VM stop, revert, or start failed: quarantine the VM.
-- VM starts with unexpected `workerId` or `profileId`: report `WORKER_PROFILE_MISMATCH` and quarantine the VM.
-- Manual unquarantine is allowed through the operations API and must write an audit record.
+- 停止 runner 失败或 runner 变为 `Running`：取消本次切换，后续再寻找其他 VM。
+- 日志备份失败：阻断快照回滚，除非 `ForceRevertWhenBackupFailed=true`。
+- VM stop、revert 或 start 失败：隔离该 VM。
+- VM 启动后出现非预期 `workerId` 或 `profileId`：上报 `WORKER_PROFILE_MISMATCH` 并隔离该 VM。
+- 允许通过运维 API 人工解除隔离，但必须写入审计记录。
 
-## Scheduler API
+## 云后台可观测模型
 
-Pending tasks are queried by `profileId`, not `workerId`.
+云后台与调度中心属于同一个后台系统。首版展示目标是“静态能力 + 当前运行状态”，不为每个未运行快照维护复杂生命周期。
+
+云后台应能看到：
+
+- 一台宿主机下有多少台 VM。
+- 每台 VM 的 `workerId`、VMX 路径、是否启用、是否隔离。
+- 每台 VM 支持哪些 `profileId/snapshotName`。
+- 每个配置快照是否通过 Agent 启动校验。
+- 每台 VM 当前运行的 `currentProfileId/currentSnapshotName`。
+- 当前 runner 状态、当前任务、最后心跳时间和最后切换时间。
+
+能力上报：
+
+- Agent 启动完成配置校验后上报一次。
+- 配置变化或人工刷新时上报一次。
+- 可配置低频周期上报，用于后台修复丢失数据。
+- 能力上报只描述“这台 VM 能运行什么”，不表示这些 profile 当前正在运行。
+
+能力上报示例：
+
+```json
+{
+  "hostId": "HOST-SR20-001",
+  "agentName": "SR20 Host Worker Agent",
+  "reportedAt": "2026-06-16 10:00:00",
+  "vms": [
+    {
+      "vmName": "VM-RPA-001",
+      "workerId": "rpa-sh-tax-etax-001",
+      "vmxPath": "D:\\VMs\\VM-RPA-001\\VM-RPA-001.vmx",
+      "enabled": true,
+      "profiles": [
+        {
+          "profileId": "rpa-sh-tax-etax",
+          "snapshotName": "rpa-sh-tax-etax-v20260615.1",
+          "city": "sh",
+          "business": "tax",
+          "system": "etax",
+          "enabled": true,
+          "snapshotExists": true,
+          "validationStatus": "READY"
+        }
+      ]
+    }
+  ]
+}
+```
+
+运行状态上报：
+
+- Agent 心跳时上报。
+- VM 状态、runner 状态、隔离状态或切换事务状态变化时立即上报。
+- 运行状态只描述“这台 VM 当前正在做什么”。
+
+运行状态上报示例：
+
+```json
+{
+  "hostId": "HOST-SR20-001",
+  "vmName": "VM-RPA-001",
+  "workerId": "rpa-sh-tax-etax-001",
+  "currentProfileId": "rpa-sh-tax-etax",
+  "currentSnapshotName": "rpa-sh-tax-etax-v20260615.1",
+  "agentVmStatus": "MONITORING",
+  "runnerStatusCode": 1,
+  "runnerStatusName": "Runnable",
+  "currentTaskId": null,
+  "isQuarantined": false,
+  "lastSwitchAt": "2026-06-16 09:50:00",
+  "lastHeartbeatTime": "2026-06-16 10:00:00"
+}
+```
+
+建议服务端模型：
+
+- `rpa_host_agent`：宿主机 Agent 心跳和版本信息。
+- `rpa_vm_instance`：每台 VM 的静态信息、当前 profile、当前快照和运行状态。
+- `rpa_vm_profile_capability`：每台 VM 支持的 profile/snapshot 能力清单。
+- `rpa_worker_switch_log`：快照切换事务记录。
+
+后台页面建议：
+
+- 宿主机列表：展示 Agent 在线状态、VM 数量、异常 VM 数量。
+- 宿主机详情：按 VM 展示当前 profile、runner 状态、任务、隔离状态和最后心跳。
+- VM 详情：展示该 VM 支持的所有 profile/snapshot，以及当前正在运行的 profile。
+
+## 调度中心 API
+
+待执行任务按 `profileId` 查询，而不是按 `workerId` 查询。
 
 ```http
 GET /api/rpa/profile-task/pending?profileId=rpa-sh-tax-etax
 ```
 
-Example response:
+响应示例：
 
 ```json
 {
@@ -328,7 +416,7 @@ Example response:
 }
 ```
 
-Status reporting includes both instance and profile identifiers:
+运行状态上报同时包含实例标识和画像标识：
 
 ```json
 {
@@ -345,11 +433,11 @@ Status reporting includes both instance and profile identifiers:
 }
 ```
 
-## Operations API
+## 本机运维 API
 
-The API listens on `127.0.0.1` and requires `X-Agent-Api-Key`.
+API 监听 `127.0.0.1`，并要求请求携带 `X-Agent-Api-Key`。
 
-Initial endpoints:
+首版接口：
 
 ```text
 GET  /api/agent/status
@@ -364,23 +452,24 @@ GET  /api/transactions
 GET  /api/transactions/{txId}
 ```
 
-Manual `switch-profile` uses the same safe switch flow as automatic scheduling.
+人工 `switch-profile` 使用与自动调度相同的安全切换流程。
 
-## Acceptance Criteria
+## 验收标准
 
-- The Agent runs as a Windows Service.
-- The Agent loads and validates multi-VM configuration.
-- Each VM can declare a different supported profile set.
-- The Agent validates configured snapshots using `vmrun listSnapshots`.
-- The Agent queries queues by `profileId`.
-- If a profile has pending tasks, the Agent can switch one compatible idle VM to that profile snapshot.
-- Over multiple cycles, the same profile can occupy multiple compatible VMs while tasks remain pending.
-- The Agent does not compute target capacity from task count.
-- `Running` and `Upgrading` runners are never switched.
-- The Agent stops `runner.jar` successfully before log backup and snapshot revert.
-- If runner starts a task during the stop attempt, the Agent cancels the switch.
-- Logs are backed up and a manifest is written before snapshot revert.
-- Switch transactions are persisted locally and can be recovered after service restart.
-- VM control failures quarantine the VM.
-- State reporting includes `hostId`, `vmName`, `workerId`, `profileId`, `snapshotName`, and runner status.
-- The localhost operations API can show state, pause/resume scheduling, quarantine/unquarantine a VM, and manually trigger a safe profile switch.
+- Agent 可作为 Windows Service 运行。
+- Agent 可加载并校验多 VM 配置。
+- 每台 VM 可声明不同的 profile 支持集合。
+- Agent 可使用 `vmrun listSnapshots` 校验配置快照。
+- Agent 按 `profileId` 查询队列。
+- 当某个 profile 有待执行任务时，Agent 可将一台兼容空闲 VM 切换到该 profile 快照。
+- 多轮调度后，同一个 profile 可在任务未清空期间占用多台兼容 VM。
+- Agent 不根据任务数计算目标容量。
+- `Running` 和 `Upgrading` runner 永不被切换。
+- Agent 在日志备份和快照回滚前成功停止 `runner.jar`。
+- 如果 runner 在停止尝试期间开始任务，Agent 会取消本次切换。
+- 快照回滚前完成日志备份并写入 manifest。
+- 切换事务本地持久化，并可在服务重启后恢复。
+- VM 控制失败会隔离 VM。
+- 状态上报包含 `hostId`、`vmName`、`workerId`、`profileId`、`snapshotName` 和 runner 状态。
+- 云后台可看到每台宿主机下的 VM 清单、每台 VM 支持的 profile/snapshot 能力，以及 VM 当前运行状态。
+- localhost 运维 API 可查看状态、暂停/恢复调度、隔离/解除隔离 VM，并可人工触发安全 profile 切换。
