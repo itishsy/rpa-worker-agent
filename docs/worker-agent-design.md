@@ -132,6 +132,46 @@ snapshotName = rpa-sh-tax-etax-v20260615.1
 
 Agent 不要求 `workerId` 与 `snapshotName` 相同。
 
+## 4.1 VM 镜像准备与基础快照命名
+
+在 Agent 启动之前，必须先完成 VM 镜像准备。Agent 不负责创建 VM、安装系统、安装客户端、制作快照；Agent 只校验这些前置资源是否存在，并在校验通过后进入调度。
+
+每一台 VM 必须有一个“纯净基础快照”，用于承载该 VM 的干净初始环境。纯净基础快照要求：
+
+- 快照名必须与 VM 名相同。
+- VM 名和纯净基础快照名建议遵循 `SR20-YYMM-XXXX` 命名规则。
+- 示例：VM 名为 `SR20-2026-6HQ8` 时，纯净基础快照名也必须为 `SR20-2026-6HQ8`。
+- 纯净基础快照中只包含操作系统、基础驱动、VMware Tools、通用安全配置和必要运行时。
+- 纯净基础快照不应包含城市、业务系统、CA、UKey、登录态、浏览器缓存、下载目录残留或任务执行现场。
+- 纯净基础快照一旦作为基线使用，不应直接修改；需要升级基础镜像时，应重新制作新 VM 或新基础快照，并经过人工确认。
+
+每台 VM 下所有定制 profile 快照都必须基于该 VM 的纯净基础快照制作。
+
+```text
+VM: SR20-2026-6HQ8
+  |
+  |-- Base Snapshot: SR20-2026-6HQ8
+          |
+          |-- Custom Snapshot: rpa-sh-tax-etax-v20260615.1
+          |-- Custom Snapshot: rpa-sh-social-portal-v20260615.1
+          |-- Custom Snapshot: rpa-bj-tax-etax-v20260615.1
+```
+
+定制 profile 快照要求：
+
+- 每个定制快照对应一个 `profileId` 的可运行环境版本。
+- 定制快照命名仍使用 `snapshotName = {profileId}-{version}`。
+- 定制快照必须从纯净基础快照派生，不允许从另一个业务定制快照继续派生，避免环境污染层层传递。
+- 定制快照内可以包含该 profile 所需的城市配置、业务系统配置、CA/UKey 驱动、浏览器配置、客户端配置和 runner 自启动配置。
+- 定制快照制作完成后，应启动验证 `rpa-client` / `rpa-runner` 能自动启动，并能正确上报 `workerId/profileId`。
+
+Agent 启动校验只校验：
+
+- 配置的 `BaseSnapshotName` 存在。
+- `BaseSnapshotName` 与 `VmName` 一致。
+- 配置的定制 `snapshotName` 存在。
+- 定制快照的来源关系已由镜像准备流程保证；如果当前 VMware / `vmrun` 无法可靠读取快照父子关系，Agent 只记录配置声明和校验结果，不强行推断快照树。
+
 ## 5. 总体架构
 
 ```text
@@ -165,13 +205,13 @@ Windows 宿主机
     |
     |-- VMware Workstation
             |
-            |-- VM-RPA-001
+            |-- SR20-2026-6HQ8
             |     |-- Snapshot: rpa-sh-tax-etax-v20260615.1
             |     |-- Snapshot: rpa-sh-social-portal-v20260615.1
             |     |-- rpa-client 自动启动
             |     |-- rpa-runner 自动启动
             |
-            |-- VM-RPA-002
+            |-- SR20-2026-7JK9
                   |-- Snapshot: rpa-sh-tax-etax-v20260615.1
                   |-- Snapshot: rpa-bj-tax-etax-v20260615.1
                   |-- rpa-client 自动启动
@@ -275,8 +315,9 @@ Seebot.WorkerAgent.sln
   },
   "VirtualMachines": [
     {
-      "VmName": "VM-RPA-001",
-      "VmxPath": "D:\\VMs\\VM-RPA-001\\VM-RPA-001.vmx",
+      "VmName": "SR20-2026-6HQ8",
+      "VmxPath": "D:\\VMs\\SR20-2026-6HQ8\\SR20-2026-6HQ8.vmx",
+      "BaseSnapshotName": "SR20-2026-6HQ8",
       "GuestIp": "192.168.100.101",
       "GuestUser": "Administrator",
       "GuestPasswordSecret": "encrypted-password",
@@ -319,14 +360,17 @@ Agent 启动时必须校验：
 3. `workerId` 在宿主机内是否唯一。
 4. `profileId` 是否符合命名规则。
 5. 同一 VM 内每个启用 `profileId` 是否只有一个快照映射。
-6. `snapshotName` 是否配置。
-7. `vmrun listSnapshots` 是否能查询到配置快照。
-8. 宿主机日志备份目录是否可写。
-9. 调度中心是否可访问。
-10. VM 内状态接口是否可访问。
-11. guest 账号密码是否可用于复制日志。
-12. `ForceRevertWhenBackupFailed` 是否明确配置。
-13. 本机运维 API 是否绑定到 `127.0.0.1`。
+6. `BaseSnapshotName` 是否配置。
+7. `BaseSnapshotName` 是否与 `VmName` 一致。
+8. `vmrun listSnapshots` 是否能查询到纯净基础快照。
+9. `snapshotName` 是否配置。
+10. `vmrun listSnapshots` 是否能查询到配置的定制快照。
+11. 宿主机日志备份目录是否可写。
+12. 调度中心是否可访问。
+13. VM 内状态接口是否可访问。
+14. guest 账号密码是否可用于复制日志。
+15. `ForceRevertWhenBackupFailed` 是否明确配置。
+16. 本机运维 API 是否绑定到 `127.0.0.1`。
 
 ## 9. 状态模型
 
@@ -447,17 +491,23 @@ Agent 必须兼容并直接使用原有 runner 0-8 状态：
 ### 11.1 Agent 启动流程
 
 ```text
+0. 人工完成 VM 镜像准备
+   - 创建 VM
+   - 制作与 VM 同名的纯净基础快照
+   - 基于纯净基础快照制作所有 profile 定制快照
+   - 验证定制快照内 rpa-client / rpa-runner 可自启动
 1. 加载配置
 2. 初始化日志
 3. 初始化 SQLite
 4. 校验 vmrun.exe
 5. 校验 VMX 文件
-6. 查询并校验 VM 快照
-7. 校验 workerId / profileId / snapshotName 映射
-8. 上报 VM 静态能力
-9. 恢复上次未完成切换事务
-10. 上报 Agent 心跳
-11. 进入 profile 调度轮询
+6. 查询并校验 VM 纯净基础快照
+7. 查询并校验 VM 定制 profile 快照
+8. 校验 workerId / profileId / snapshotName 映射
+9. 上报 VM 静态能力
+10. 恢复上次未完成切换事务
+11. 上报 Agent 心跳
+12. 进入 profile 调度轮询
 ```
 
 ### 11.2 profile 调度轮询
@@ -556,7 +606,7 @@ Agent 只等待 VM 内 runner 自启动并进入可监控状态。
 ### 12.1 查询快照
 
 ```bat
-vmrun listSnapshots "D:\VMs\VM-RPA-001\VM-RPA-001.vmx"
+vmrun listSnapshots "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx"
 ```
 
 ### 12.2 停止 VM
@@ -564,34 +614,34 @@ vmrun listSnapshots "D:\VMs\VM-RPA-001\VM-RPA-001.vmx"
 优先软关机：
 
 ```bat
-vmrun stop "D:\VMs\VM-RPA-001\VM-RPA-001.vmx" soft
+vmrun stop "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx" soft
 ```
 
 软关机失败后，按配置允许时使用强制关机：
 
 ```bat
-vmrun stop "D:\VMs\VM-RPA-001\VM-RPA-001.vmx" hard
+vmrun stop "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx" hard
 ```
 
 ### 12.3 回滚快照
 
 ```bat
-vmrun revertToSnapshot "D:\VMs\VM-RPA-001\VM-RPA-001.vmx" "rpa-sh-tax-etax-v20260615.1"
+vmrun revertToSnapshot "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx" "rpa-sh-tax-etax-v20260615.1"
 ```
 
 ### 12.4 启动 VM
 
 ```bat
-vmrun start "D:\VMs\VM-RPA-001\VM-RPA-001.vmx" nogui
+vmrun start "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx" nogui
 ```
 
 ### 12.5 从 VM 复制日志到宿主机
 
 ```bat
 vmrun -gu Administrator -gp "password" copyFileFromGuestToHost ^
-  "D:\VMs\VM-RPA-001\VM-RPA-001.vmx" ^
+  "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx" ^
   "C:\seebot\logs\runner.log" ^
-  "D:\seebot-vm-log-backup\HOST-SR20-001\VM-RPA-001\runner.log"
+  "D:\seebot-vm-log-backup\HOST-SR20-001\SR20-2026-6HQ8\runner.log"
 ```
 
 ### 12.6 vmrun 封装接口
@@ -787,9 +837,10 @@ POST /api/rpa/host-agent/capabilities
   "reportedAt": "2026-06-17 10:00:00",
   "vms": [
     {
-      "vmName": "VM-RPA-001",
+      "vmName": "SR20-2026-6HQ8",
       "workerId": "rpa-sh-tax-etax-001",
-      "vmxPath": "D:\\VMs\\VM-RPA-001\\VM-RPA-001.vmx",
+      "vmxPath": "D:\\VMs\\SR20-2026-6HQ8\\SR20-2026-6HQ8.vmx",
+      "baseSnapshotName": "SR20-2026-6HQ8",
       "enabled": true,
       "isQuarantined": false,
       "profiles": [
@@ -828,7 +879,7 @@ POST /api/rpa/vm/status
 ```json
 {
   "hostId": "HOST-SR20-001",
-  "vmName": "VM-RPA-001",
+  "vmName": "SR20-2026-6HQ8",
   "workerId": "rpa-sh-tax-etax-001",
   "currentProfileId": "rpa-sh-tax-etax",
   "currentSnapshotName": "rpa-sh-tax-etax-v20260615.1",
@@ -864,7 +915,7 @@ POST /api/rpa/worker/switch-log
 {
   "txId": "SWITCH-20260617-0001",
   "hostId": "HOST-SR20-001",
-  "vmName": "VM-RPA-001",
+  "vmName": "SR20-2026-6HQ8",
   "workerId": "rpa-sh-tax-etax-001",
   "fromProfileId": "rpa-sh-social-portal",
   "fromSnapshotName": "rpa-sh-social-portal-v20260615.1",
@@ -890,13 +941,13 @@ POST /api/rpa/worker/log-backup-result
 {
   "txId": "SWITCH-20260617-0001",
   "hostId": "HOST-SR20-001",
-  "vmName": "VM-RPA-001",
+  "vmName": "SR20-2026-6HQ8",
   "workerId": "rpa-sh-tax-etax-001",
   "fromProfileId": "rpa-sh-social-portal",
   "toProfileId": "rpa-sh-tax-etax",
   "firstTaskId": 123456,
   "success": true,
-  "backupPath": "D:\\seebot-vm-log-backup\\HOST-SR20-001\\VM-RPA-001\\...",
+  "backupPath": "D:\\seebot-vm-log-backup\\HOST-SR20-001\\SR20-2026-6HQ8\\...",
   "fileCount": 128,
   "totalBytes": 98234212
 }
@@ -1034,6 +1085,7 @@ CREATE TABLE rpa_vm_instance (
     vm_name VARCHAR(128) NOT NULL,
     worker_id VARCHAR(128) NOT NULL,
     vmx_path VARCHAR(1000),
+    base_snapshot_name VARCHAR(128),
     enabled TINYINT NOT NULL DEFAULT 1,
 
     current_profile_id VARCHAR(128),
@@ -1196,7 +1248,7 @@ CREATE TABLE rpa_worker_log_backup (
 ```text
 D:\seebot-vm-log-backup\
   └── HOST-SR20-001\
-      └── VM-RPA-001\
+      └── SR20-2026-6HQ8\
           └── rpa-sh-tax-etax\
               └── 20260617\
                   └── SWITCH-20260617-0001\
@@ -1213,7 +1265,7 @@ D:\seebot-vm-log-backup\
 {
   "txId": "SWITCH-20260617-0001",
   "hostId": "HOST-SR20-001",
-  "vmName": "VM-RPA-001",
+  "vmName": "SR20-2026-6HQ8",
   "workerId": "rpa-sh-tax-etax-001",
   "fromProfileId": "rpa-sh-social-portal",
   "fromSnapshotName": "rpa-sh-social-portal-v20260615.1",
@@ -1222,7 +1274,7 @@ D:\seebot-vm-log-backup\
   "firstTaskId": 123456,
   "backupTime": "2026-06-17 10:00:00",
   "sourcePath": "C:\\seebot\\logs",
-  "targetPath": "D:\\seebot-vm-log-backup\\HOST-SR20-001\\VM-RPA-001\\...",
+  "targetPath": "D:\\seebot-vm-log-backup\\HOST-SR20-001\\SR20-2026-6HQ8\\...",
   "fileCount": 128,
   "totalBytes": 98234212,
   "success": true
@@ -1599,6 +1651,9 @@ sc start Seebot.WorkerAgent.Service
 | 多 VM 配置 | 可加载并校验多台 VM |
 | 多 profile 配置 | 每台 VM 可声明多个 `profileId/snapshotName` |
 | 命名模型 | 支持 `profileId / workerId / snapshotName` 三层模型 |
+| 镜像准备前置 | Agent 启动前已完成 VM、纯净基础快照和定制 profile 快照准备 |
+| 纯净基础快照 | 每台 VM 存在一个与 VM 同名的 `BaseSnapshotName` |
+| 快照派生规则 | 每个定制 profile 快照均基于该 VM 的纯净基础快照制作 |
 | vmrun 控制 | 能 stop / revertToSnapshot / start VM |
 | 快照校验 | 能校验每个配置快照存在 |
 | 能力上报 | 云后台可看到每台 VM 支持的 profile/snapshot |
@@ -1645,9 +1700,15 @@ sc start Seebot.WorkerAgent.Service
 ```text
 Agent 启动
     ↓
+人工完成 VM 镜像准备
+    ↓
+制作与 VM 同名的纯净基础快照
+    ↓
+基于纯净基础快照制作所有 profile 定制快照
+    ↓
 加载 VM / profile / snapshot 配置
     ↓
-校验 vmrun、VMX、快照、workerId、profileId
+校验 vmrun、VMX、纯净基础快照、定制快照、workerId、profileId
     ↓
 上报 VM profile 静态能力
     ↓
