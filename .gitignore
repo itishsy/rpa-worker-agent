@@ -1,0 +1,10 @@
+.vs/
+.dotnet/
+.dotnet-appdata/
+.nuget/packages/
+bin/
+obj/
+TestResults/
+*.user
+*.suo
+*.rsuser

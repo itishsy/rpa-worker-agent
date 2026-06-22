@@ -34,7 +34,7 @@ Agent 负责：
 - 使用 `vmrun.exe` 完成 VM 关机、快照回滚、启动。
 - 等待 VM 内 `rpa-client` / `rpa-runner` 自启动并进入可监控状态。
 - 监控 runner 原有 0-8 状态。
-- 上报 Agent、VM、worker、profile、snapshot、runner、切换事务和日志备份状态。
+- 上报 Agent、VM、worker、profile、snapshot、runner、切换事务和目录备份状态。
 - 支持本地事务持久化、服务重启恢复、异常隔离和人工处理。
 - 提供仅监听 localhost 的本机运维 API。
 - 向云后台上报 VM 静态能力与当前运行状态。
@@ -42,6 +42,7 @@ Agent 负责：
 Agent 不负责：
 
 - 执行 RPA 业务。
+- 执行 RPA 所依赖的组件版本检查。
 - 启动 `runner.jar`。
 - 生成 runner 启动参数。
 - 接管 runner 任务拉取。
@@ -62,7 +63,7 @@ Agent 必须运行在 Windows 宿主机上，不能运行在 VM 内。
 
 - VM 回滚会导致 VM 内状态丢失。
 - VM 内 Agent 自己也会被回滚。
-- 快照切换事务、日志备份记录和错误记录必须保存在 VM 外。
+- 快照切换事务、目录备份记录和错误记录必须保存在 VM 外。
 - 宿主机 Agent 才能稳定控制 VM 生命周期。
 
 ### 3.2 Agent 只管 VM，不管业务执行
@@ -98,12 +99,14 @@ Agent 只等待和监控状态，不执行 runner 启动命令。
 
 快照回滚会清除 VM 内部变更。为避免日志、截图、执行现场丢失，快照切换前必须：
 
-1. 调用 VM 内停止接口停止 `runner.jar`。
-2. 若 runner 已经变为 `Running`，停止接口必须拒绝，Agent 取消本次切换。
+1. 调用 VM 内 `rpa-runner` 9090 kill 接口停止 `runner.jar`。
+2. 若 runner 已经变为 `Running`，9090 kill 接口必须拒绝，Agent 取消本次切换。
 3. 确认 `runner.jar` 已停止且 `currentTaskId` 为空。
-4. 复制 VM 日志到宿主机。
-5. 写入 `backup_manifest.json`。
-6. 再执行 VM 关机与快照回滚。
+4. flush runner 日志和执行现场。
+5. 将 VM 内相关目录复制到宿主机工作目录 `{work-path}/{vm-name}/{yyyyMMddHHmmss}/`。
+6. 备份目录必须至少包含 `cache`、`db`、`file`、`logs` 四类目录。
+7. 写入 `backup_manifest.json`。
+8. 再执行 VM 关机与快照回滚。
 
 ## 4. 命名模型
 
@@ -114,7 +117,6 @@ profileId    = rpa-{city}-{business}-{system}
 workerId     = {profileId}-{instance}
 snapshotName = {profileId}-{version}
 ```
-
 示例：
 
 ```text
@@ -150,11 +152,11 @@ Agent 不要求 `workerId` 与 `snapshotName` 相同。
 ```text
 VM: SR20-2026-6HQ8
   |
-  |-- Base Snapshot: SR20-2026-6HQ8
-          |
-          |-- Custom Snapshot: rpa-sh-tax-etax-v20260615.1
-          |-- Custom Snapshot: rpa-sh-social-portal-v20260615.1
-          |-- Custom Snapshot: rpa-bj-tax-etax-v20260615.1
+  |-- BaseClean Snapshot:
+          |-- General Snapshot: SR20-2026-6HQ8
+          |-- Private Snapshot: rpa-sh-tax-etax-v20260615.1
+          |-- Private Snapshot: rpa-sh-social-portal-v20260615.1
+          |-- Private Snapshot: rpa-bj-tax-etax-v20260615.1
 ```
 
 定制 profile 快照要求：
@@ -182,7 +184,7 @@ Seebot 云后台 / 调度中心
     |-- 接收 VM 静态能力
     |-- 接收 VM / worker / profile / runner 当前状态
     |-- 接收快照切换记录
-    |-- 接收日志备份结果
+    |-- 接收目录备份结果
     |
     v
 Windows 宿主机
@@ -193,7 +195,7 @@ Windows 宿主机
     |       |-- 调度中心任务查询
     |       |-- VM 空闲判断
     |       |-- runner 停止
-    |       |-- 日志备份
+    |       |-- 目录备份
     |       |-- vmrun stop
     |       |-- vmrun revertToSnapshot
     |       |-- vmrun start
@@ -205,36 +207,44 @@ Windows 宿主机
     |
     |-- VMware Workstation
             |
-            |-- SR20-2026-6HQ8
-            |     |-- Snapshot: rpa-sh-tax-etax-v20260615.1
-            |     |-- Snapshot: rpa-sh-social-portal-v20260615.1
-            |     |-- rpa-client 自动启动
-            |     |-- rpa-runner 自动启动
+            |-- VM: SR20-2026-6HQ8
+            |     |-- BaseClean
+            |         |-- SR20-2026-6HQ8
+            |         |-- rpa-sh-tax-etax-v20260615.1
+            |         |-- rpa-sh-social-portal-v20260615.1
+            |             |-- rpa-client 自动启动
+            |             |-- rpa-runner 自动启动
             |
-            |-- SR20-2026-7JK9
-                  |-- Snapshot: rpa-sh-tax-etax-v20260615.1
-                  |-- Snapshot: rpa-bj-tax-etax-v20260615.1
-                  |-- rpa-client 自动启动
-                  |-- rpa-runner 自动启动
+            |-- VM: SR20-2026-7JK9
+                  |-- BaseClean
+                      |-- SR20-2026-7JK9
+                      |-- rpa-sh-tax-etax-v20260615.1
+                      |-- rpa-bj-tax-etax-v20260615.1
+                          |-- rpa-client 自动启动
+                          |-- rpa-runner 自动启动
 ```
 
 ## 6. 技术选型
 
-| 模块 | 技术选型 | 说明 |
-|---|---|---|
-| 主服务 | C# / .NET Worker Service | 适合 Windows 宿主机常驻服务 |
-| 运行形态 | Windows Service | 开机自启 |
-| 本机 API | ASP.NET Core Minimal API / Controller | 仅监听 `127.0.0.1` |
-| VM 控制 | `vmrun.exe` | 本版本唯一 VM 控制方式 |
-| 本地状态 | SQLite | 保存 VM 状态、事务、恢复记录、审计 |
-| 服务端状态 | MySQL | 由 Seebot 云后台保存 |
-| 日志 | Serilog 或 NLog | 结构化日志 |
-| 配置 | `appsettings.json` | 管理 VM、profile、快照和接口地址 |
-| 调度通信 | HTTP REST + JSON | 查询队列和上报状态 |
-| VM 内辅助 | 已有 executor-control HTTP 服务 | 停止 runner、查看状态、flush 日志 |
-| runner | VM 内自启动 | Agent 不启动 runner |
+
+| 模块     | 技术选型                                  | 说明                                |
+| ------ | ------------------------------------- | --------------------------------- |
+| 主服务    | C# / .NET Worker Service              | 适合 Windows 宿主机常驻服务                |
+| 运行形态   | Windows Service                       | 开机自启                              |
+| 本机 API | ASP.NET Core Minimal API / Controller | 仅监听 `127.0.0.1`                   |
+| VM 控制  | `vmrun.exe`                           | 本版本唯一 VM 控制方式                     |
+| 本地状态   | SQLite                                | 保存 VM 状态、事务、恢复记录、审计               |
+| 服务端状态  | MySQL                                 | 由 Seebot 云后台保存                    |
+| 日志     | Serilog 或 NLog                        | 结构化日志                             |
+| 配置     | `appsettings.json`                    | 管理 VM、profile、快照和接口地址             |
+| 调度通信   | HTTP REST + JSON                      | 查询队列和上报状态                         |
+| VM 内控制 | rpa-runner 9090 HTTP 控制端口             | 查询 runner 状态、kill runner、flush 日志 |
+| runner | VM 内自启动                               | Agent 不启动 runner                  |
+
 
 ## 7. 工程结构
+
+### 7.1 代码工程模块
 
 ```text
 Seebot.WorkerAgent.sln
@@ -262,22 +272,177 @@ Seebot.WorkerAgent.sln
 
 核心模块职责：
 
-| 模块 | 职责 |
-|---|---|
-| `PoolSchedulerService` | 按 `profileId` 轮询调度队列，选择空闲 VM 并生成切换意图 |
-| `VmCoordinator` | 每台 VM 一个协调器，持有 VM 独占锁 |
-| `VmSwitchService` | 编排停止 runner、备份日志、关机、回滚、开机、ready 检查 |
-| `VmrunService` | 封装 `vmrun.exe` 命令 |
-| `GuestWorkerClient` | 调用 VM 内 executor-control / worker status 接口 |
-| `SchedulerClient` | 查询调度中心任务，上报状态、事务和备份结果 |
-| `CapabilityReporter` | 上报宿主机、VM、profile/snapshot 静态能力 |
-| `StateReporter` | 上报 Agent、VM、worker、profile、runner 当前状态 |
-| `LogBackupService` | 复制 VM 日志到宿主机并生成 manifest |
-| `LocalStore` | SQLite 本地状态持久化 |
-| `RecoveryService` | Agent 重启后的事务恢复 |
-| `WorkerStateEvaluator` | 统一判断 runner 0-8 状态和切换许可 |
+
+| 模块                     | 职责                                     |
+| ---------------------- | -------------------------------------- |
+| `PoolSchedulerService` | 按 `profileId` 轮询调度队列，选择空闲 VM 并生成切换意图   |
+| `VmCoordinator`        | 每台 VM 一个协调器，持有 VM 独占锁                  |
+| `VmSwitchService`      | 编排停止 runner、备份日志、关机、回滚、开机、ready 检查     |
+| `VmrunService`         | 封装 `vmrun.exe` 命令                      |
+| `GuestWorkerClient`    | 调用 VM 内 rpa-runner 9090 状态与 kill 接口    |
+| `SchedulerClient`      | 查询调度中心任务，上报状态、事务和备份结果                  |
+| `CapabilityReporter`   | 上报宿主机、VM、profile/snapshot 静态能力         |
+| `StateReporter`        | 上报 Agent、VM、worker、profile、runner 当前状态 |
+| `LogBackupService`     | 复制 VM 相关目录到宿主机并生成 manifest             |
+| `LocalStore`           | SQLite 本地状态持久化                         |
+| `RecoveryService`      | Agent 重启后的事务恢复                         |
+| `WorkerStateEvaluator` | 统一判断 runner 0-8 状态和切换许可                |
+
 
 不同 VM 可以并行操作。同一 VM 的自动调度、人工操作和恢复操作必须共用同一把 VM 锁。
+
+### 7.2 部署结构
+
+Worker Agent 部署在 Windows 宿主机上，VM 内只运行既有的 `rpa-client` 和 `rpa-runner`。`rpa-runner` 自身提供 9090 HTTP 控制端口，用于查询运行状态和 kill runner。云后台与调度中心是同一个后台系统，负责队列查询、状态展示、切换记录和备份结果留存。
+
+```text
+Seebot 云后台 / 调度中心
+  |
+  |-- profile 待执行任务查询
+  |-- Agent / VM / worker / runner 状态接收
+  |-- VM profile 能力接收
+  |-- 切换事务与目录备份结果接收
+  |
+  v
+Windows 宿主机：HOST-SR20-001
+  |
+  |-- Seebot.WorkerAgent.Service
+  |     |-- Windows Service
+  |     |-- localhost Operations API: http://127.0.0.1:18090
+  |     |-- SQLite: D:\seebot-agent\data\agent.db
+  |     |-- Logs: D:\seebot-agent\logs
+  |     |-- WorkPath: D:\seebot-agent\work
+  |
+  |-- VMware Workstation
+        |
+        |-- VM: SR20-2026-6HQ8
+        |     |-- Base Snapshot: SR20-2026-6HQ8
+        |     |-- Profile Snapshot: rpa-sh-tax-etax-v20260615.1
+        |     |-- Profile Snapshot: rpa-sh-social-portal-v20260615.1
+        |     |-- rpa-runner control: http://192.168.100.101:9090
+        |
+        |-- VM: SR20-2026-7JK9
+              |-- Base Snapshot: SR20-2026-7JK9
+              |-- Profile Snapshot: rpa-sh-tax-etax-v20260615.1
+              |-- Profile Snapshot: rpa-bj-tax-etax-v20260615.1
+              |-- rpa-runner control: http://192.168.100.102:9090
+```
+
+部署边界：
+
+- 宿主机 Agent 是唯一能调用 `vmrun.exe` 的组件。
+- 云后台不直接控制 VM，只向 Agent 提供调度数据并接收上报。
+- VM 内控制接口由 `rpa-runner` 提供，监听 9090 端口。`GET /api/robot/start/status` 用于查询运行状态；关闭 runner 通过 9090 端口提供的 kill 接口完成，具体路径由 `RunnerKillUrl` 配置。
+- VM 内 runner 自行从调度中心领取任务，Agent 不传递 `taskId`。
+- 本机运维 API 只监听 `127.0.0.1`，默认不暴露到局域网。
+
+宿主机目录建议：
+
+```text
+D:\rpa-worker-agent\
+  ├── Seebot.WorkerAgent.Service.exe
+  ├── appsettings.json
+  ├── logs\
+  ├── data\
+  │   └── agent.db
+  └── scripts\
+
+D:\seebot\
+  ├── {vm-name}\
+  │   └── {yyyyMMddHHmmss}\
+  │       ├── cache\
+  │       ├── db\
+  │       ├── file\
+  │       ├── logs\
+  │       └── backup_manifest.json
+  ├── {vm-name}\
+      └── {yyyyMMddHHmmss}\
+          ├── cache\
+          ├── db\
+          ├── file\
+          ├── logs\
+          └── backup_manifest.json
+```
+
+### 7.3 交互流程
+
+#### 7.3.1 启动与能力上报
+
+```text
+WorkerAgent.Service 启动
+  ↓
+加载 appsettings.json
+  ↓
+校验 vmrun.exe、VMX、BaseSnapshotName、profile snapshot
+  ↓
+初始化 SQLite、本地 VM 状态和事务恢复
+  ↓
+向云后台上报 host-agent heartbeat
+  ↓
+向云后台上报 VM profile capability
+  ↓
+进入 profile 调度轮询
+```
+
+#### 7.3.2 自动调度与快照切换
+
+```text
+Agent -> 云后台 检查tasks
+  │ Agent -> 云后台
+  │   GET /api/rpa/profile/pendingTasks
+  │   返回 hasTask / pendingCount / priority / oldestQueuedAt
+  ↓
+Agent -> Workstation 选择VM
+  │ 选择兼容且空闲的 VM
+  │   获取 VM 独占锁
+  │   创建 local_switch_transaction
+  ↓
+Agent -> VM 停止runner
+  │ GET /api/robot/start/status rpa-runner:9090
+  │   POST {RunnerKillUrl}
+  │   空闲则允许 kill runner
+  ↓
+Agent -> VM 切换Snapshot
+  │ 停止成功后复制 cache/db/file/logs 到 HostWorkPath
+  │   写 backup_manifest.json
+  │   vmrun stop
+  │   vmrun revertToSnapshot
+  │   vmrun start
+  │   等待 rpa-runner 9090 控制端口 / runner ready
+  ↓
+Agent -> 云后台 上报状态
+  上报 VM 当前状态、switch-log、backup-result
+```
+
+#### 7.3.3 VM 内 runner 执行任务
+
+```text
+VM 启动
+  ↓
+rpa-client / rpa-runner 自启动
+  ↓
+rpa-client 上报 workerId 心跳
+  ↓
+runner 根据workerId + profileId从调度中心领取任务
+  ↓
+runner 执行任务并维护原有 0-8 状态
+  ↓
+Agent 只读取状态并上报，不参与任务执行
+```
+
+#### 7.3.4 人工运维交互
+
+```text
+运维人员 / 本机脚本
+  ↓
+调用 http://127.0.0.1:18090 本机 API
+  ↓
+查询 Agent / VM / transaction 状态
+  ↓
+可暂停调度、恢复调度、隔离 VM、解除隔离 VM
+  ↓
+人工 switch-profile 仍走同一套安全切换流程
+```
 
 ## 8. 配置设计
 
@@ -286,7 +451,7 @@ Seebot.WorkerAgent.sln
 ```json
 {
   "Agent": {
-    "HostId": "HOST-SR20-001",
+    "HostId": "SB-VM-001",
     "AgentName": "SR20宿主机Agent",
     "PollIntervalSeconds": 10,
     "HeartbeatIntervalSeconds": 15,
@@ -317,31 +482,44 @@ Seebot.WorkerAgent.sln
     {
       "VmName": "SR20-2026-6HQ8",
       "VmxPath": "D:\\VMs\\SR20-2026-6HQ8\\SR20-2026-6HQ8.vmx",
-      "BaseSnapshotName": "SR20-2026-6HQ8",
+      "BaseSnapshotName": "BaseClean",
       "GuestIp": "192.168.100.101",
       "GuestUser": "Administrator",
       "GuestPasswordSecret": "encrypted-password",
-      "WorkerId": "rpa-sh-tax-etax-001",
-      "ExecutorStopUrl": "http://192.168.100.101:18080/executor/stop",
-      "ExecutorHealthUrl": "http://192.168.100.101:18080/executor/health",
-      "WorkerStatusUrl": "http://192.168.100.101:18080/worker/status",
-      "GuestLogPath": "C:\\seebot\\logs",
-      "HostBackupRoot": "D:\\seebot-vm-log-backup",
+      "WorkerId": "SR20-2026-6HQ8",
+      "RunnerControlBaseUrl": "http://192.168.100.101:9090",
+      "RunnerStatusUrl": "http://192.168.100.101:9090/api/robot/start/status",
+      "RunnerStopUrl": "http://192.168.100.101:9090/api/robot/stop",
+      "GuestBackupPaths": {
+        "Cache": "D:\\seebon\\rpa\\cache",
+        "Db": "D:\\seebon\\rpa\\db",
+        "File": "D:\\seebon\\rpa\\file",
+        "Logs": "D:\\seebon\\rpa\\logs"
+      },
+      "HostWorkPath": "D:\\seebot\\work",
       "Enabled": true,
       "Profiles": [
         {
-          "ProfileId": "rpa-sh-tax-etax",
-          "SnapshotName": "rpa-sh-tax-etax-v20260615.1",
-          "City": "sh",
-          "Business": "tax",
+          "ProfileId": "general",
+          "SnapshotName": "general-v20260615.1",
+          "City": "*",
+          "Business": "*",
+          "System": "*",
+          "Enabled": true
+        },
+        {
+          "ProfileId": "rpa-shanghai-tax-etax",
+          "SnapshotName": "rpa-shanghai-tax-etax-v20260615.1",
+          "City": "shanghai",
+          "Business": "acc",
           "System": "etax",
           "Enabled": true
         },
         {
-          "ProfileId": "rpa-sh-social-portal",
-          "SnapshotName": "rpa-sh-social-portal-v20260615.1",
-          "City": "sh",
-          "Business": "social",
+          "ProfileId": "rpa-beijing-social-portal",
+          "SnapshotName": "rpa-beijing-social-portal-v20260615.1",
+          "City": "beijing",
+          "Business": "soc",
           "System": "portal",
           "Enabled": true
         }
@@ -365,12 +543,13 @@ Agent 启动时必须校验：
 8. `vmrun listSnapshots` 是否能查询到纯净基础快照。
 9. `snapshotName` 是否配置。
 10. `vmrun listSnapshots` 是否能查询到配置的定制快照。
-11. 宿主机日志备份目录是否可写。
-12. 调度中心是否可访问。
-13. VM 内状态接口是否可访问。
-14. guest 账号密码是否可用于复制日志。
-15. `ForceRevertWhenBackupFailed` 是否明确配置。
-16. 本机运维 API 是否绑定到 `127.0.0.1`。
+11. VM 内 `GuestBackupPaths` 是否配置了 `cache`、`db`、`file`、`logs`。
+12. 宿主机 `HostWorkPath` 是否可写。
+13. 调度中心是否可访问。
+14. VM 内 `rpa-runner` 9090 控制端口是否可访问。
+15. guest 账号密码是否可用于复制 VM 目录。
+16. `ForceRevertWhenBackupFailed` 是否明确配置。
+17. 本机运维 API 是否绑定到 `127.0.0.1`。
 
 ## 9. 状态模型
 
@@ -424,31 +603,35 @@ QUARANTINED    隔离
 
 Agent 必须兼容并直接使用原有 runner 0-8 状态：
 
-| 状态码 | 状态名称 | 状态说明 |
-|---:|---|---|
-| 0 | New | 初始化状态、用户未登录 |
-| 1 | Runnable | 机器人已启动，准备就绪 |
-| 2 | Running | 机器人正在执行任务中 |
-| 3 | Closed | 关闭 |
-| 4 | RobotError | 机器人程序内部异常 |
-| 5 | ClientError | 客户端 rpa-client 内部异常 |
-| 6 | Upgrading | 执行器正在升级 |
-| 7 | UpgradeFailed | 执行器升级失败 |
-| 8 | Offline | 离线 |
+
+| 状态码 | 状态名称          | 状态说明                |
+| --- | ------------- | ------------------- |
+| 0   | New           | 初始化状态、用户未登录         |
+| 1   | Runnable      | 机器人已启动，准备就绪         |
+| 2   | Running       | 机器人正在执行任务中          |
+| 3   | Closed        | 关闭                  |
+| 4   | RobotError    | 机器人程序内部异常           |
+| 5   | ClientError   | 客户端 rpa-client 内部异常 |
+| 6   | Upgrading     | 执行器正在升级             |
+| 7   | UpgradeFailed | 执行器升级失败             |
+| 8   | Offline       | 离线                  |
+
 
 ### 9.5 runner 状态处理规则
 
-| runner 状态码 | 状态名称 | 是否执行中 | 切换快照前处理 | VM 启动后处理 |
-|---:|---|---|---|---|
-| 0 | New | 否 | 不作为自动切换候选 | 不算 ready，继续等待变为 Runnable 或 Running |
-| 1 | Runnable | 否 | 可作为空闲候选，但必须先停止 runner | 视为 ready |
-| 2 | Running | 是 | 禁止切换 | 视为 runner 已开始执行 |
-| 3 | Closed | 否 | 不作为自动切换候选 | 不算 ready，继续等待或报错 |
-| 4 | RobotError | 否 | 记录异常，按配置决定是否隔离 | 启动后出现则标记 worker 异常 |
-| 5 | ClientError | 否 | 记录异常，按配置决定是否隔离 | 启动后出现则标记 worker 异常 |
-| 6 | Upgrading | 特殊状态 | 禁止切换，避免打断升级 | 继续等待升级完成 |
-| 7 | UpgradeFailed | 否 | 记录异常，按配置决定是否隔离 | 启动后出现则标记 worker 异常 |
-| 8 | Offline | 不可确认 | 走异常处理 | 启动后仍 Offline 则 VM ready 失败 |
+
+| runner 状态码 | 状态名称          | 是否执行中 | 切换快照前处理               | VM 启动后处理                           |
+| ---------- | ------------- | ----- | --------------------- | ---------------------------------- |
+| 0          | New           | 否     | 不作为自动切换候选             | 不算 ready，继续等待变为 Runnable 或 Running |
+| 1          | Runnable      | 否     | 可作为空闲候选，但必须先停止 runner | 视为 ready                           |
+| 2          | Running       | 是     | 禁止切换                  | 视为 runner 已开始执行                    |
+| 3          | Closed        | 否     | 不作为自动切换候选             | 不算 ready，继续等待或报错                   |
+| 4          | RobotError    | 否     | 记录异常，按配置决定是否隔离        | 启动后出现则标记 worker 异常                 |
+| 5          | ClientError   | 否     | 记录异常，按配置决定是否隔离        | 启动后出现则标记 worker 异常                 |
+| 6          | Upgrading     | 特殊状态  | 禁止切换，避免打断升级           | 继续等待升级完成                           |
+| 7          | UpgradeFailed | 否     | 记录异常，按配置决定是否隔离        | 启动后出现则标记 worker 异常                 |
+| 8          | Offline       | 不可确认  | 走异常处理                 | 启动后仍 Offline 则 VM ready 失败         |
+
 
 核心判断原则：
 
@@ -530,16 +713,16 @@ Agent 必须兼容并直接使用原有 runner 0-8 状态：
 1. 获取 VM 锁
 2. 创建 switch_transaction
 3. 重新读取 VM runner 状态
-4. 调用 VM 内 executor-control 停止 runner.jar
-5. 如果 runner 已经 Running，停止接口拒绝，Agent 取消本次切换
+4. 调用 VM 内 `rpa-runner` 9090 http 接口停止 runner 获取任务
+5. 如果 runner 已经 Running，Agent 取消本次切换
 6. 确认 runner 已停止且 currentTaskId 为空
-7. 从 VM 复制日志到宿主机
+7. 从 VM 复制 `cache`、`db`、`file`、`logs` 目录到宿主机 `{work-path}/{vm-name}/{yyyyMMddHHmmss}/`
 8. 生成 backup_manifest.json
 9. 使用 vmrun stop 关闭 VM
 10. 使用 vmrun revertToSnapshot 回滚到目标快照
 11. 使用 vmrun start 启动 VM
 12. 等待 VM 网络可用
-13. 等待 VM 内 executor-control / rpa-client / rpa-runner 自启动
+13. 等待 VM 内 rpa-client / rpa-runner 自启动，并确认 9090 控制端口可访问
 14. 读取 runner 状态
 15. runner = Runnable / Running 时判定 ready
 16. 校验 VM 内 workerId / profileId 与预期一致
@@ -560,7 +743,7 @@ Agent 只等待 VM 内 runner 自启动并进入可监控状态。
 ```text
 1. vmrun start VM
 2. 等待 VM 网络可用
-3. 调用 ExecutorHealthUrl
+3. 调用 `RunnerStatusUrl`，即 `GET /api/robot/start/status`
 4. 读取 runnerStatusCode
 5. 如果 runnerStatusCode = 1 Runnable：
       判定 VM / runner ready
@@ -635,13 +818,22 @@ vmrun revertToSnapshot "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx" "rpa-sh-tax-et
 vmrun start "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx" nogui
 ```
 
-### 12.5 从 VM 复制日志到宿主机
+### 12.5 从 VM 复制目录到宿主机
 
 ```bat
 vmrun -gu Administrator -gp "password" copyFileFromGuestToHost ^
   "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx" ^
-  "C:\seebot\logs\runner.log" ^
-  "D:\seebot-vm-log-backup\HOST-SR20-001\SR20-2026-6HQ8\runner.log"
+  "C:\seebot\logs" ^
+  "D:\seebot-agent\work\SR20-2026-6HQ8\20260617100000\logs"
+```
+
+切换前必须至少复制以下目录：
+
+```text
+C:\seebot\cache -> {work-path}\{vm-name}\{yyyyMMddHHmmss}\cache
+C:\seebot\db    -> {work-path}\{vm-name}\{yyyyMMddHHmmss}\db
+C:\seebot\file  -> {work-path}\{vm-name}\{yyyyMMddHHmmss}\file
+C:\seebot\logs  -> {work-path}\{vm-name}\{yyyyMMddHHmmss}\logs
 ```
 
 ### 12.6 vmrun 封装接口
@@ -667,40 +859,19 @@ public interface IVmrunService
 }
 ```
 
-## 13. VM 内 executor-control 接口
+## 13. VM 内 rpa-runner 9090 控制接口
 
-本项目不新建 VM 内服务，默认 VM 内已有 HTTP 控制接口。
+本项目不新建 VM 内控制服务。VM 内控制接口由 `rpa-runner` 自身提供，监听 9090 端口。
 
-### 13.1 健康检查接口
+Agent 只依赖两类能力：
 
-```http
-GET /executor/health
-```
+- 通过 `GET /api/robot/start/status` 查询 runner 运行状态。
+- 通过 9090 端口提供的 kill 接口关闭 `runner.jar`，具体 URL 由 `RunnerKillUrl` 配置。
 
-响应示例：
-
-```json
-{
-  "success": true,
-  "workerId": "rpa-sh-tax-etax-001",
-  "profileId": "rpa-sh-tax-etax",
-  "runnerStatusCode": 1,
-  "runnerStatusName": "Runnable",
-  "runnerStatusDesc": "机器人已启动，准备就绪",
-  "currentTaskId": null,
-  "executionCode": null,
-  "javaProcessCount": 1,
-  "pythonProcessCount": 0,
-  "chromeProcessCount": 0,
-  "diskFreeGb": 45,
-  "timestamp": "2026-06-17 10:00:00"
-}
-```
-
-### 13.2 runner 状态接口
+### 13.1 runner 运行状态查询接口
 
 ```http
-GET /worker/status
+GET /api/robot/start/status
 ```
 
 响应示例：
@@ -715,14 +886,25 @@ GET /worker/status
   "runnerStatusDesc": "机器人正在执行任务中",
   "currentTaskId": 123456,
   "executionCode": "EXE202606170001",
-  "lastHeartbeatTime": "2026-06-17 10:00:00"
+  "javaProcessCount": 1,
+  "pythonProcessCount": 0,
+  "chromeProcessCount": 0,
+  "diskFreeGb": 45,
+  "lastHeartbeatTime": "2026-06-17 10:00:00",
+  "timestamp": "2026-06-17 10:00:00"
 }
 ```
 
-### 13.3 停止 runner 接口
+### 13.2 kill runner 接口
 
 ```http
-POST /executor/stop
+POST {RunnerKillUrl}
+```
+
+`RunnerKillUrl` 必须指向 VM 内 `rpa-runner` 9090 端口暴露的 kill 接口。示例：
+
+```text
+http://192.168.100.101:9090/api/robot/kill
 ```
 
 请求：
@@ -762,11 +944,11 @@ POST /executor/stop
 }
 ```
 
-停止接口必须满足：
+kill 接口必须满足：
 
 - 如果 runner 空闲，停止任务拉取并关闭 `runner.jar`。
-- 如果 runner 正在执行任务，拒绝停止请求。
-- 默认不允许强制停止正在执行任务的 runner。
+- 如果 runner 正在执行任务，拒绝 kill 请求。
+- 默认不允许强制 kill 正在执行任务的 runner。
 - 返回状态必须使用原有 0-8 runner 状态码。
 
 ## 14. 调度中心与云后台接口
@@ -929,7 +1111,7 @@ POST /api/rpa/worker/switch-log
 }
 ```
 
-### 14.6 上报日志备份结果
+### 14.6 上报目录备份结果
 
 ```http
 POST /api/rpa/worker/log-backup-result
@@ -947,7 +1129,8 @@ POST /api/rpa/worker/log-backup-result
   "toProfileId": "rpa-sh-tax-etax",
   "firstTaskId": 123456,
   "success": true,
-  "backupPath": "D:\\seebot-vm-log-backup\\HOST-SR20-001\\SR20-2026-6HQ8\\...",
+  "backupPath": "D:\\seebot-agent\\work\\SR20-2026-6HQ8\\20260617100000",
+  "backedUpDirectories": ["cache", "db", "file", "logs"],
   "fileCount": 128,
   "totalBytes": 98234212
 }
@@ -1044,17 +1227,19 @@ NEED_MANUAL_CHECK
 
 ### 16.4 事务恢复规则
 
-| 上次状态 | 恢复策略 |
-|---|---|
-| CREATED | 如果 runner 尚未停止，标记失败，允许后续重新调度 |
-| STOP_RUNNER_DONE | 尽可能继续日志备份 |
-| LOG_BACKUP_DONE | 继续关闭 VM |
-| VM_STOP_DONE | 继续回滚快照 |
-| SNAPSHOT_REVERT_DONE | 继续启动 VM |
-| VM_START_DONE | 继续等待 worker ready |
-| WORKER_READY_DONE | 补报状态并标记成功 |
-| FAILED | 上报失败 |
-| NEED_MANUAL_CHECK | 不自动恢复 |
+
+| 上次状态                 | 恢复策略                         |
+| -------------------- | ---------------------------- |
+| CREATED              | 如果 runner 尚未停止，标记失败，允许后续重新调度 |
+| STOP_RUNNER_DONE     | 尽可能继续目录备份                    |
+| LOG_BACKUP_DONE      | 继续关闭 VM                      |
+| VM_STOP_DONE         | 继续回滚快照                       |
+| SNAPSHOT_REVERT_DONE | 继续启动 VM                      |
+| VM_START_DONE        | 继续等待 worker ready            |
+| WORKER_READY_DONE    | 补报状态并标记成功                    |
+| FAILED               | 上报失败                         |
+| NEED_MANUAL_CHECK    | 不自动恢复                        |
+
 
 ## 17. 云后台数据模型建议
 
@@ -1176,7 +1361,7 @@ CREATE TABLE rpa_worker_switch_log (
 );
 ```
 
-### 17.5 日志备份记录表
+### 17.5 目录备份记录表
 
 ```sql
 CREATE TABLE rpa_worker_log_backup (
@@ -1239,24 +1424,34 @@ CREATE TABLE rpa_worker_log_backup (
 - 支持的所有 `profileId/snapshotName` 能力清单。
 - 每个快照的启动校验结果。
 - 最近切换记录。
-- 最近日志备份记录。
+- 最近目录备份记录。
 
-## 19. 日志备份设计
+## 19. 切换前目录备份设计
 
-### 19.1 备份目录
+### 19.1 备份目标目录
 
 ```text
-D:\seebot-vm-log-backup\
-  └── HOST-SR20-001\
-      └── SR20-2026-6HQ8\
-          └── rpa-sh-tax-etax\
-              └── 20260617\
-                  └── SWITCH-20260617-0001\
-                      ├── runner\
-                      ├── client\
-                      ├── screenshots\
-                      ├── agent\
-                      └── backup_manifest.json
+{work-path}\
+  └── {vm-name}\
+      └── {yyyyMMddHHmmss}\
+          ├── cache\
+          ├── db\
+          ├── file\
+          ├── logs\
+          └── backup_manifest.json
+```
+
+示例：
+
+```text
+D:\seebot-agent\work\
+  └── SR20-2026-6HQ8\
+      └── 20260617100000\
+          ├── cache\
+          ├── db\
+          ├── file\
+          ├── logs\
+          └── backup_manifest.json
 ```
 
 ### 19.2 backup_manifest.json
@@ -1273,8 +1468,15 @@ D:\seebot-vm-log-backup\
   "toSnapshotName": "rpa-sh-tax-etax-v20260615.1",
   "firstTaskId": 123456,
   "backupTime": "2026-06-17 10:00:00",
-  "sourcePath": "C:\\seebot\\logs",
-  "targetPath": "D:\\seebot-vm-log-backup\\HOST-SR20-001\\SR20-2026-6HQ8\\...",
+  "workPath": "D:\\seebot-agent\\work",
+  "targetPath": "D:\\seebot-agent\\work\\SR20-2026-6HQ8\\20260617100000",
+  "sources": {
+    "cache": "C:\\seebot\\cache",
+    "db": "C:\\seebot\\db",
+    "file": "C:\\seebot\\file",
+    "logs": "C:\\seebot\\logs"
+  },
+  "directories": ["cache", "db", "file", "logs"],
   "fileCount": 128,
   "totalBytes": 98234212,
   "success": true
@@ -1286,7 +1488,7 @@ D:\seebot-vm-log-backup\
 默认策略：
 
 ```text
-日志备份失败，不继续回滚快照。
+目录备份失败，不继续回滚快照。
 ```
 
 如果配置允许强制回滚：
@@ -1305,30 +1507,32 @@ LOG_BACKUP_FAILED_BUT_FORCE_REVERT
 
 ## 20. 错误码
 
-| 错误码 | 含义 |
-|---|---|
-| SCHEDULER_UNAVAILABLE | 调度中心不可用 |
-| VM_NOT_IDLE | VM 非空闲 |
-| WORKER_RUNNING | runner 状态为 Running，禁止切换 |
-| WORKER_UPGRADING | runner 状态为 Upgrading，禁止切换 |
-| EXECUTOR_STOP_FAILED | 停止 runner 失败 |
-| LOG_BACKUP_FAILED | 日志备份失败 |
-| LOG_BACKUP_FAILED_BUT_FORCE_REVERT | 日志备份失败但配置允许强制回滚 |
-| VM_STOP_FAILED | VM 关机失败 |
-| SNAPSHOT_NOT_FOUND | 快照不存在 |
-| SNAPSHOT_REVERT_FAILED | 快照回滚失败 |
-| VM_START_FAILED | VM 启动失败 |
-| VM_READY_TIMEOUT | VM ready 超时 |
-| RUNNER_NOT_READY | runner 长时间停留在 New |
-| RUNNER_CLOSED | runner 状态为 Closed，未自动恢复 |
-| ROBOT_ERROR | runner 状态为 RobotError |
-| CLIENT_ERROR | runner 状态为 ClientError |
-| WORKER_UPGRADING_TIMEOUT | runner 长时间处于 Upgrading |
-| UPGRADE_FAILED | runner 状态为 UpgradeFailed |
-| WORKER_OFFLINE | runner 状态为 Offline |
-| WORKER_PROFILE_MISMATCH | VM 内 workerId/profileId 与目标不一致 |
-| LOCAL_STATE_CORRUPTED | 本地状态异常 |
-| WORKER_QUARANTINED | Worker 或 VM 已隔离 |
+
+| 错误码                                | 含义                             |
+| ---------------------------------- | ------------------------------ |
+| SCHEDULER_UNAVAILABLE              | 调度中心不可用                        |
+| VM_NOT_IDLE                        | VM 非空闲                         |
+| WORKER_RUNNING                     | runner 状态为 Running，禁止切换        |
+| WORKER_UPGRADING                   | runner 状态为 Upgrading，禁止切换      |
+| EXECUTOR_STOP_FAILED               | 停止 runner 失败                   |
+| LOG_BACKUP_FAILED                  | 目录备份失败                         |
+| LOG_BACKUP_FAILED_BUT_FORCE_REVERT | 目录备份失败但配置允许强制回滚                |
+| VM_STOP_FAILED                     | VM 关机失败                        |
+| SNAPSHOT_NOT_FOUND                 | 快照不存在                          |
+| SNAPSHOT_REVERT_FAILED             | 快照回滚失败                         |
+| VM_START_FAILED                    | VM 启动失败                        |
+| VM_READY_TIMEOUT                   | VM ready 超时                    |
+| RUNNER_NOT_READY                   | runner 长时间停留在 New              |
+| RUNNER_CLOSED                      | runner 状态为 Closed，未自动恢复        |
+| ROBOT_ERROR                        | runner 状态为 RobotError          |
+| CLIENT_ERROR                       | runner 状态为 ClientError         |
+| WORKER_UPGRADING_TIMEOUT           | runner 长时间处于 Upgrading         |
+| UPGRADE_FAILED                     | runner 状态为 UpgradeFailed       |
+| WORKER_OFFLINE                     | runner 状态为 Offline             |
+| WORKER_PROFILE_MISMATCH            | VM 内 workerId/profileId 与目标不一致 |
+| LOCAL_STATE_CORRUPTED              | 本地状态异常                         |
+| WORKER_QUARANTINED                 | Worker 或 VM 已隔离                |
+
 
 ## 21. 异常处理规则
 
@@ -1531,8 +1735,8 @@ sc start Seebot.WorkerAgent.Service
 交付物：
 
 - `GuestWorkerClient`。
-- `/executor/health` 对接。
-- `/worker/status` 对接。
+- `/api/robot/start/status` 对接。
+- rpa-runner 9090 kill 接口对接。
 - 状态码映射逻辑。
 - 状态上报接口。
 
@@ -1544,15 +1748,15 @@ sc start Seebot.WorkerAgent.Service
 1. 停止 VM 内 runner.jar
 2. runner 正在执行任务时拒绝切换
 3. 确认 currentTaskId 为空
-4. 复制日志到宿主机
+4. 复制 cache/db/file/logs 到宿主机工作目录
 5. 生成 backup_manifest.json
-6. 日志备份失败时阻断回滚
+6. 目录备份失败时阻断回滚
 ```
 
 交付物：
 
 - `LogBackupService`。
-- executor stop 接口对接。
+- rpa-runner 9090 kill 接口对接。
 - 备份 manifest。
 - 备份记录表。
 - 错误码上报。
@@ -1614,7 +1818,7 @@ sc start Seebot.WorkerAgent.Service
 10. VM 空闲判断。
 11. Running / Upgrading 禁止切换。
 12. 停止 `runner.jar`。
-13. 日志备份。
+13. 目录备份。
 14. VM stop / revert / start。
 15. VM 启动后 Runnable / Running 状态判断。
 16. 本地事务表。
@@ -1645,55 +1849,59 @@ sc start Seebot.WorkerAgent.Service
 
 ### 25.1 技术验收
 
-| 验收项 | 标准 |
-|---|---|
-| Agent 服务 | 可作为 Windows Service 启动 |
-| 多 VM 配置 | 可加载并校验多台 VM |
-| 多 profile 配置 | 每台 VM 可声明多个 `profileId/snapshotName` |
-| 命名模型 | 支持 `profileId / workerId / snapshotName` 三层模型 |
-| 镜像准备前置 | Agent 启动前已完成 VM、纯净基础快照和定制 profile 快照准备 |
-| 纯净基础快照 | 每台 VM 存在一个与 VM 同名的 `BaseSnapshotName` |
-| 快照派生规则 | 每个定制 profile 快照均基于该 VM 的纯净基础快照制作 |
-| vmrun 控制 | 能 stop / revertToSnapshot / start VM |
-| 快照校验 | 能校验每个配置快照存在 |
-| 能力上报 | 云后台可看到每台 VM 支持的 profile/snapshot |
-| 当前状态上报 | 云后台可看到 VM 当前 profile、runner 状态、任务、隔离状态 |
-| 队列查询 | 能按 `profileId` 查询待执行任务 |
-| runner 状态兼容 | Agent 能识别 0-8 原有 runner 状态 |
-| Running 判断 | `runnerStatusCode = 2` 时禁止快照切换 |
-| Upgrading 判断 | `runnerStatusCode = 6` 时禁止快照切换 |
-| Runnable 判断 | `runnerStatusCode = 1` 时判定 VM ready |
-| Running 启动判断 | VM 启动后 `runnerStatusCode = 2` 时也视为自运行成功 |
-| New 超时 | 长时间为 0 New 时上报 `RUNNER_NOT_READY` |
-| Closed 超时 | 长时间为 3 Closed 时上报 `RUNNER_CLOSED` |
-| RobotError | 状态 4 能上报 `ROBOT_ERROR` |
-| ClientError | 状态 5 能上报 `CLIENT_ERROR` |
-| UpgradeFailed | 状态 7 能上报 `UPGRADE_FAILED` |
-| Offline | 状态 8 能上报 `WORKER_OFFLINE` |
-| runner 停止 | 切换前能停止 VM 内 `runner.jar` |
-| 执行中保护 | runner 正在执行任务时停止接口拒绝，Agent 取消切换 |
-| 日志备份 | 切换前能复制 VM 日志到宿主机 |
-| 快照回滚 | 能切换到目标 profile 对应快照 |
-| 事务恢复 | Agent 重启后能恢复未完成事务 |
-| 异常隔离 | 快照失败、VM ready 超时能隔离 VM |
-| 本机 API | localhost API 可查询状态、暂停恢复、隔离解除、人工切换 |
+
+| 验收项           | 标准                                                                                 |
+| ------------- | ---------------------------------------------------------------------------------- |
+| Agent 服务      | 可作为 Windows Service 启动                                                             |
+| 多 VM 配置       | 可加载并校验多台 VM                                                                        |
+| 多 profile 配置  | 每台 VM 可声明多个 `profileId/snapshotName`                                               |
+| 命名模型          | 支持 `profileId / workerId / snapshotName` 三层模型                                      |
+| 镜像准备前置        | Agent 启动前已完成 VM、纯净基础快照和定制 profile 快照准备                                             |
+| 纯净基础快照        | 每台 VM 存在一个与 VM 同名的 `BaseSnapshotName`                                              |
+| 快照派生规则        | 每个定制 profile 快照均基于该 VM 的纯净基础快照制作                                                   |
+| vmrun 控制      | 能 stop / revertToSnapshot / start VM                                               |
+| 快照校验          | 能校验每个配置快照存在                                                                        |
+| 能力上报          | 云后台可看到每台 VM 支持的 profile/snapshot                                                   |
+| 当前状态上报        | 云后台可看到 VM 当前 profile、runner 状态、任务、隔离状态                                             |
+| 队列查询          | 能按 `profileId` 查询待执行任务                                                             |
+| runner 状态兼容   | Agent 能识别 0-8 原有 runner 状态                                                         |
+| Running 判断    | `runnerStatusCode = 2` 时禁止快照切换                                                     |
+| Upgrading 判断  | `runnerStatusCode = 6` 时禁止快照切换                                                     |
+| Runnable 判断   | `runnerStatusCode = 1` 时判定 VM ready                                                |
+| Running 启动判断  | VM 启动后 `runnerStatusCode = 2` 时也视为自运行成功                                            |
+| New 超时        | 长时间为 0 New 时上报 `RUNNER_NOT_READY`                                                  |
+| Closed 超时     | 长时间为 3 Closed 时上报 `RUNNER_CLOSED`                                                  |
+| RobotError    | 状态 4 能上报 `ROBOT_ERROR`                                                             |
+| ClientError   | 状态 5 能上报 `CLIENT_ERROR`                                                            |
+| UpgradeFailed | 状态 7 能上报 `UPGRADE_FAILED`                                                          |
+| Offline       | 状态 8 能上报 `WORKER_OFFLINE`                                                          |
+| runner 停止     | 切换前能停止 VM 内 `runner.jar`                                                           |
+| 执行中保护         | runner 正在执行任务时 9090 kill 接口拒绝，Agent 取消切换                                           |
+| 目录备份          | 切换前能复制 VM 的 `cache`、`db`、`file`、`logs` 到 `{work-path}/{vm-name}/{yyyyMMddHHmmss}/` |
+| 快照回滚          | 能切换到目标 profile 对应快照                                                                |
+| 事务恢复          | Agent 重启后能恢复未完成事务                                                                  |
+| 异常隔离          | 快照失败、VM ready 超时能隔离 VM                                                             |
+| 本机 API        | localhost API 可查询状态、暂停恢复、隔离解除、人工切换                                                 |
+
 
 ### 25.2 业务验收
 
-| 验收项 | 标准 |
-|---|---|
-| profile 切换 | 至少 2 个 profile 快照可互相切换 |
-| 多 VM 协调 | 一台宿主机可管理多台 VM |
-| 同 profile 多 VM | 同一个 profile 可在多台兼容 VM 上运行 |
-| 自动执行链路 | 切换快照后 VM 内 rpa-client / rpa-runner 能自启动并执行任务 |
-| 正在执行保护 | 任务执行中不会被 Agent 强制切换快照 |
-| 升级保护 | 执行器升级中不会被 Agent 强制切换快照 |
-| 自启动验证 | VM 启动后 rpa-client / rpa-runner 自动进入 Runnable 或 Running |
-| 日志追溯 | 每次切换都有日志备份目录和 manifest |
-| 环境隔离 | 上一 profile 环境污染不会影响下一 profile |
-| 切换耗时 | 记录每次 stop / revert / start / ready 耗时 |
-| 异常可追溯 | RobotError / ClientError / UpgradeFailed / Offline 均能留存日志并上报 |
-| 状态一致性 | 云后台展示状态与 VM 内 runner 原有状态一致 |
+
+| 验收项            | 标准                                                           |
+| -------------- | ------------------------------------------------------------ |
+| profile 切换     | 至少 2 个 profile 快照可互相切换                                       |
+| 多 VM 协调        | 一台宿主机可管理多台 VM                                                |
+| 同 profile 多 VM | 同一个 profile 可在多台兼容 VM 上运行                                    |
+| 自动执行链路         | 切换快照后 VM 内 rpa-client / rpa-runner 能自启动并执行任务                 |
+| 正在执行保护         | 任务执行中不会被 Agent 强制切换快照                                        |
+| 升级保护           | 执行器升级中不会被 Agent 强制切换快照                                       |
+| 自启动验证          | VM 启动后 rpa-client / rpa-runner 自动进入 Runnable 或 Running       |
+| 执行现场追溯         | 每次切换都有 `cache`、`db`、`file`、`logs` 备份目录和 manifest             |
+| 环境隔离           | 上一 profile 环境污染不会影响下一 profile                                |
+| 切换耗时           | 记录每次 stop / revert / start / ready 耗时                        |
+| 异常可追溯          | RobotError / ClientError / UpgradeFailed / Offline 均能留存日志并上报 |
+| 状态一致性          | 云后台展示状态与 VM 内 runner 原有状态一致                                  |
+
 
 ## 26. 最终执行闭环
 
@@ -1724,13 +1932,13 @@ runner = Running / Upgrading？
     ├── 是：禁止切换，继续监控
     └── 否：进入切换前事务
             ↓
-        调用 VM 内停止接口关闭 runner.jar
+        调用 VM 内 `rpa-runner` 9090 kill 接口关闭 runner.jar
             ↓
         runner 已领取任务？
             ├── 是：取消切换，等待下一轮
             └── 否：继续
                     ↓
-                备份 VM 日志到宿主机
+                备份 VM 的 cache / db / file / logs 到宿主机工作目录
                     ↓
                 vmrun stop VM
                     ↓

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Seebot.WorkerAgent.Service</AssemblyName>
+    <RootNamespace>Seebot.WorkerAgent</RootNamespace>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.20" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="WorkerAgent.Designer.cs" />
+    <Compile Remove="tests\**\*.cs" />
+  </ItemGroup>
+</Project>
