@@ -86,6 +86,8 @@ var tests = new (string Name, Action Body)[]
     ("PoolSchedulerService skips Running VM candidates", PoolSchedulerServiceSkipsRunningVmCandidates),
     ("PoolSchedulerService does not preempt current profile with pending tasks", PoolSchedulerServiceDoesNotPreemptCurrentProfileWithPendingTasks),
     ("PoolSchedulerService handles higher priority profile first", PoolSchedulerServiceHandlesHigherPriorityProfileFirst),
+    ("PoolSchedulerService reverts to General when no pending tasks and VM is not on General", PoolSchedulerServiceRevertsToGeneralWhenNoPendingTasksAndVmIsNotGeneral),
+    ("PoolSchedulerService does not revert when VM already on General and no pending tasks", PoolSchedulerServiceDoesNotRevertWhenVmAlreadyOnGeneral),
     ("CapabilityReportService reports all VM profile capabilities", CapabilityReportServiceReportsAllVmProfileCapabilities),
     ("SnapshotNameGenerator generates first sequence number when no existing snapshot for today", SnapshotNameGeneratorGeneratesFirstSequenceNumber),
     ("SnapshotNameGenerator increments sequence when today snapshot already exists", SnapshotNameGeneratorIncrementsSequence),
@@ -1142,6 +1144,58 @@ static void PoolSchedulerServiceHandlesHigherPriorityProfileFirst()
     Assert.True(result.SwitchStarted, "Higher priority profile should be handled first even when another profile is older.");
     Assert.Equal("rpa-sh-social-portal", result.TargetProfileId, "Higher priority target should be selected.");
     Assert.Equal("rpa-sh-social-portal", switchService.Requests[0].TargetProfileId, "Switch request should use the selected higher priority profile.");
+}
+
+static void PoolSchedulerServiceRevertsToGeneralWhenNoPendingTasksAndVmIsNotGeneral()
+{
+    var now = DateTimeOffset.Parse("2026-06-20T10:00:00+08:00");
+    var scheduler = new RecordingSchedulerClient();
+    var switchService = new RecordingVmSwitchService();
+    var store = new RecordingLocalStore(new ActionRecorder())
+    {
+        VmStates = [SchedulerVmState("SR20-2026-6HQ8", "rpa-sh-social-portal", RunnerStatusCode.Runnable, now.AddSeconds(-60))]
+    };
+    var options = SchedulerWorkerOptions();
+    options.Agent.GeneralProfileId = "rpa-sh-general";
+    options.VirtualMachines[0].Profiles.Add(new ProfileOptions
+    {
+        ProfileId = "rpa-sh-general",
+        ProfileName = "General",
+        SnapshotName = "rpa-sh-general.v260624.1"
+    });
+
+    var result = NewPoolScheduler(scheduler, switchService, store, options, now)
+        .RunOneCycleAsync(CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.True(result.SwitchStarted, "No pending tasks with non-General VM should trigger revert to General.");
+    Assert.Equal("rpa-sh-general", result.TargetProfileId, "Revert target should be GeneralProfileId.");
+    Assert.Equal(1, switchService.Requests.Count, "Exactly one switch to General should be started.");
+    Assert.Equal("rpa-sh-general.v260624.1", switchService.Requests[0].TargetSnapshotName, "Snapshot should match the General profile.");
+}
+
+static void PoolSchedulerServiceDoesNotRevertWhenVmAlreadyOnGeneral()
+{
+    var now = DateTimeOffset.Parse("2026-06-20T10:00:00+08:00");
+    var scheduler = new RecordingSchedulerClient();
+    var switchService = new RecordingVmSwitchService();
+    var store = new RecordingLocalStore(new ActionRecorder())
+    {
+        VmStates = [SchedulerVmState("SR20-2026-6HQ8", "rpa-sh-general", RunnerStatusCode.Runnable, now.AddSeconds(-60))]
+    };
+    var options = SchedulerWorkerOptions();
+    options.Agent.GeneralProfileId = "rpa-sh-general";
+    options.VirtualMachines[0].Profiles.Add(new ProfileOptions
+    {
+        ProfileId = "rpa-sh-general",
+        ProfileName = "General",
+        SnapshotName = "rpa-sh-general.v260624.1"
+    });
+
+    var result = NewPoolScheduler(scheduler, switchService, store, options, now)
+        .RunOneCycleAsync(CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.False(result.SwitchStarted, "VM already on General should not trigger another revert.");
+    Assert.Equal(0, switchService.Requests.Count, "No switch should be started when all VMs are already on General.");
 }
 
 static void CapabilityReportServiceReportsAllVmProfileCapabilities()
