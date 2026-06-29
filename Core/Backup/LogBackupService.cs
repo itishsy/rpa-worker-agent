@@ -34,23 +34,22 @@ public sealed class LogBackupService : ILogBackupService
 
         try
         {
-            await _vmrunService.EnableSharedFoldersAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
-            try
-            {
-                await _vmrunService.RemoveSharedFolderAsync(vm.VmxPath, vm.Name, cancellationToken).ConfigureAwait(false);
-            }
-            catch (VmrunCommandException)
-            {
-                // 共享不存在时 removeSharedFolder 也返回 -1，忽略
-            }
-            await _vmrunService.AddSharedFolderAsync(vm.VmxPath, vm.Name, vm.HostSharedPath, cancellationToken).ConfigureAwait(false);
-
             foreach (var source in BuildSources(vm))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var hostSourcePath = GuestPathToHostShared(source.GuestPath, vm.GuestSharedPath, vm.HostSharedPath);
+
+                var hostStagingPath = GuestPathToHostShared(source.GuestPath, vm.GuestSharedPath, vm.HostSharedPath);
+
+                await _vmrunService.CopyFileFromGuestToHostAsync(
+                    vm.VmxPath,
+                    vm.GuestUser,
+                    vm.GuestPasswordSecret,
+                    source.GuestPath,
+                    hostStagingPath,
+                    cancellationToken).ConfigureAwait(false);
+
                 var hostDestPath = Path.Combine(targetPath, source.Name);
-                CopyDirectory(hostSourcePath, hostDestPath);
+                CopyDirectory(hostStagingPath, hostDestPath);
             }
 
             success = true;
@@ -105,8 +104,8 @@ public sealed class LogBackupService : ILogBackupService
     }
 
     // 将 Guest 路径转换为 Host 侧共享目录的对应路径
-    // 例：GuestSharedPath=D:\seebon\rpa  HostSharedPath=D:\seebon\rpa-worker-agent\work\shared
-    //     guestPath=D:\seebon\rpa\cache  → D:\seebon\rpa-worker-agent\work\shared\cache
+    // 例：GuestSharedPath=C:\seebot  HostSharedPath=D:\work\shared
+    //     guestPath=C:\seebot\cache  → D:\work\shared\cache
     private static string GuestPathToHostShared(string guestPath, string guestSharedPath, string hostSharedPath)
     {
         var guestNorm = guestSharedPath.TrimEnd('\\', '/');
@@ -129,12 +128,12 @@ public sealed class LogBackupService : ILogBackupService
 
     private static void CopyDirectory(string sourcePath, string destPath)
     {
-        Directory.CreateDirectory(destPath);
         if (!Directory.Exists(sourcePath))
         {
             return;
         }
 
+        Directory.CreateDirectory(destPath);
         foreach (var file in Directory.EnumerateFiles(sourcePath, "*", SearchOption.AllDirectories))
         {
             var relative = Path.GetRelativePath(sourcePath, file);

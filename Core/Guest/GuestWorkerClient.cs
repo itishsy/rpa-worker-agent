@@ -24,9 +24,8 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
             await EnsureSuccessAsync(response, "GetRunnerStatus", vm.RunnerStatusUrl, cancellationToken);
 
             var result = await ReadJsonAsync<ApiResult<int>>(response, "GetRunnerStatus", vm.RunnerStatusUrl, cancellationToken);
-            var statusCode = Enum.IsDefined(typeof(RunnerStatusCode), result.Data)
-                ? (RunnerStatusCode)result.Data
-                : RunnerStatusCode.Offline;
+            // data=0 表示可切换（Runnable），其他值表示不可切换
+            var statusCode = result.Data == 0 ? RunnerStatusCode.Runnable : RunnerStatusCode.Running;
 
             return new RunnerStatusResponse
             {

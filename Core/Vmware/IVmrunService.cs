@@ -18,6 +18,8 @@ public interface IVmrunService
 
     Task<VmrunCommandResult> RemoveSharedFolderAsync(string vmxPath, string shareName, CancellationToken cancellationToken);
 
+    Task<VmrunCommandResult> CopyFileFromGuestToHostAsync(string vmxPath, string guestUser, string guestPassword, string guestPath, string hostPath, CancellationToken cancellationToken);
+
     Task<VmrunCommandResult> CreateSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken);
 
     Task<VmrunCommandResult> DeleteSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken);
