@@ -42,7 +42,7 @@ VM 内的 `runner.jar` 继续按原有机制自行从调度中心拉取任务。
 ```text
 profileId    = rpa-{city}-{business}-{system}
 workerId     = {profileId}-{instance}
-snapshotName = {profileId}-{version}
+snapshotName = {profileId}.v{YYMMDD}.{No}
 ```
 
 示例：
@@ -50,7 +50,7 @@ snapshotName = {profileId}-{version}
 ```text
 profileId    = rpa-sh-tax-etax
 workerId     = rpa-sh-tax-etax-001
-snapshotName = rpa-sh-tax-etax-v20260615.1
+snapshotName = rpa-sh-tax-etax.v260624.1
 ```
 
 定义：
@@ -60,7 +60,7 @@ snapshotName = rpa-sh-tax-etax-v20260615.1
 - `snapshotName` 表示具体的 VM 环境版本。
 - `version` 建议使用可排序格式，例如 `vYYYYMMDD.N`。
 
-Agent 不要求 `workerId` 与 `snapshotName` 相同。
+Agent 要求 `snapshotName` 必填并以 `profileId` 为前缀；切换快照时使用配置的版本化 `SnapshotName`。
 
 ## 配置模型
 
@@ -103,7 +103,7 @@ Agent 不要求 `workerId` 与 `snapshotName` 相同。
       "Profiles": [
         {
           "ProfileId": "rpa-sh-tax-etax",
-          "SnapshotName": "rpa-sh-tax-etax-v20260615.1",
+          "SnapshotName": "rpa-sh-tax-etax.v260624.1",
           "City": "sh",
           "Business": "tax",
           "System": "etax",
@@ -122,7 +122,7 @@ Agent 不要求 `workerId` 与 `snapshotName` 相同。
 - `workerId` 在宿主机内唯一。
 - `profileId` 符合命名规则。
 - 每台 VM 内每个启用 profile 只能配置一个快照映射。
-- 每个配置的 `snapshotName` 都能通过 `vmrun listSnapshots` 查询到。
+- 每个配置的 `profileId` 都能通过 `vmrun listSnapshots` 查询到同名快照。
 - 日志备份根目录可写。
 - 本机运维 API 默认绑定到 `127.0.0.1`，除非后续版本明确调整。
 
@@ -314,9 +314,9 @@ finished_at
 
 - 一台宿主机下有多少台 VM。
 - 每台 VM 的 `workerId`、VMX 路径、是否启用、是否隔离。
-- 每台 VM 支持哪些 `profileId/snapshotName`。
+- 每台 VM 支持哪些 `profileId/snapshotName`，`snapshotName` 使用版本化格式。
 - 每个配置快照是否通过 Agent 启动校验。
-- 每台 VM 当前运行的 `currentProfileId/currentSnapshotName`。
+- 每台 VM 当前运行的 `currentProfileId/currentSnapshotName`，两者在 profile 快照场景中同值。
 - 当前 runner 状态、当前任务、最后心跳时间和最后切换时间。
 
 能力上报：
@@ -342,7 +342,7 @@ finished_at
       "profiles": [
         {
           "profileId": "rpa-sh-tax-etax",
-          "snapshotName": "rpa-sh-tax-etax-v20260615.1",
+          "snapshotName": "rpa-sh-tax-etax.v260624.1",
           "city": "sh",
           "business": "tax",
           "system": "etax",
@@ -370,7 +370,7 @@ finished_at
   "vmName": "VM-RPA-001",
   "workerId": "rpa-sh-tax-etax-001",
   "currentProfileId": "rpa-sh-tax-etax",
-  "currentSnapshotName": "rpa-sh-tax-etax-v20260615.1",
+  "currentSnapshotName": "rpa-sh-tax-etax.v260624.1",
   "agentVmStatus": "MONITORING",
   "runnerStatusCode": 1,
   "runnerStatusName": "Runnable",
@@ -410,7 +410,6 @@ GET /api/rpa/profile-task/pending?profileId=rpa-sh-tax-etax
   "profileId": "rpa-sh-tax-etax",
   "pendingCount": 100,
   "firstTaskId": 123456,
-  "executionCode": "EXE202606160001",
   "priority": 5,
   "oldestQueuedAt": "2026-06-16 09:30:00"
 }
@@ -424,7 +423,7 @@ GET /api/rpa/profile-task/pending?profileId=rpa-sh-tax-etax
   "vmName": "VM-RPA-001",
   "workerId": "rpa-sh-tax-etax-001",
   "profileId": "rpa-sh-tax-etax",
-  "snapshotName": "rpa-sh-tax-etax-v20260615.1",
+  "snapshotName": "rpa-sh-tax-etax.v260624.1",
   "agentVmStatus": "MONITORING",
   "runnerStatusCode": 1,
   "runnerStatusName": "Runnable",

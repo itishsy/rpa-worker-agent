@@ -19,6 +19,22 @@ public sealed class VmrunService : IVmrunService
         return ParseSnapshots(result.StandardOutput);
     }
 
+    public async Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        var arguments = new List<string> { "getCurrentSnapshot", vmxPath };
+        var result = await _processRunner.RunAsync(
+            new ProcessCommand(_vmrunPath, arguments, _commandTimeout, "getCurrentSnapshot"),
+            cancellationToken);
+
+        if (result.ExitCode != 0)
+        {
+            return null;
+        }
+
+        var snapshot = result.StandardOutput.Trim();
+        return string.IsNullOrEmpty(snapshot) ? null : snapshot;
+    }
+
     public Task<VmrunCommandResult> StopVmAsync(string vmxPath, VmStopMode mode, CancellationToken cancellationToken)
     {
         var modeArgument = mode == VmStopMode.Hard ? "hard" : "soft";
@@ -33,20 +49,6 @@ public sealed class VmrunService : IVmrunService
     public Task<VmrunCommandResult> StartVmAsync(string vmxPath, bool noGui, CancellationToken cancellationToken)
     {
         return RunVmrunAsync("start", noGui ? [vmxPath, "nogui"] : [vmxPath], cancellationToken);
-    }
-
-    public Task<VmrunCommandResult> CopyFileFromGuestToHostAsync(
-        string vmxPath,
-        string guestUser,
-        string guestPassword,
-        string guestPath,
-        string hostPath,
-        CancellationToken cancellationToken)
-    {
-        return RunVmrunWithArgumentsAsync(
-            "copyFileFromGuestToHost",
-            ["-gu", guestUser, "-gp", guestPassword, "copyFileFromGuestToHost", vmxPath, guestPath, hostPath],
-            cancellationToken);
     }
 
     private async Task<VmrunCommandResult> RunVmrunAsync(
@@ -69,21 +71,29 @@ public sealed class VmrunService : IVmrunService
         return result;
     }
 
-    private async Task<VmrunCommandResult> RunVmrunWithArgumentsAsync(
-        string commandName,
-        IReadOnlyList<string> arguments,
-        CancellationToken cancellationToken)
+    public Task<VmrunCommandResult> EnableSharedFoldersAsync(string vmxPath, CancellationToken cancellationToken)
     {
-        var result = await _processRunner.RunAsync(
-            new ProcessCommand(_vmrunPath, arguments, _commandTimeout, commandName),
-            cancellationToken);
+        return RunVmrunAsync("enableSharedFolders", [vmxPath], cancellationToken);
+    }
 
-        if (result.ExitCode != 0)
-        {
-            throw new VmrunCommandException(result);
-        }
+    public Task<VmrunCommandResult> AddSharedFolderAsync(string vmxPath, string shareName, string hostPath, CancellationToken cancellationToken)
+    {
+        return RunVmrunAsync("addSharedFolder", [vmxPath, shareName, hostPath], cancellationToken);
+    }
 
-        return result;
+    public Task<VmrunCommandResult> RemoveSharedFolderAsync(string vmxPath, string shareName, CancellationToken cancellationToken)
+    {
+        return RunVmrunAsync("removeSharedFolder", [vmxPath, shareName], cancellationToken);
+    }
+
+    public Task<VmrunCommandResult> CreateSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
+    {
+        return RunVmrunAsync("snapshot", [vmxPath, snapshotName], cancellationToken);
+    }
+
+    public Task<VmrunCommandResult> DeleteSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
+    {
+        return RunVmrunAsync("deleteSnapshot", [vmxPath, snapshotName], cancellationToken);
     }
 
     private static IReadOnlyList<string> ParseSnapshots(string standardOutput)

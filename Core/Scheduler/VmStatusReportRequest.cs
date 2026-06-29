@@ -12,7 +12,6 @@ public sealed class VmStatusReportRequest
     public string? RunnerStatusName { get; set; }
     public string? RunnerStatusDesc { get; set; }
     public string? CurrentTaskId { get; set; }
-    public string? ExecutionCode { get; set; }
     public bool IsQuarantined { get; set; }
     public string? LastSwitchAt { get; set; }
     public string LastHeartbeatTime { get; set; } = "";

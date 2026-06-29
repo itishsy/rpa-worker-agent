@@ -24,4 +24,10 @@ public static class ErrorCodes
     public const string WorkerProfileMismatch = "WORKER_PROFILE_MISMATCH";
     public const string LocalStateCorrupted = "LOCAL_STATE_CORRUPTED";
     public const string WorkerQuarantined = "WORKER_QUARANTINED";
+    public const string VmNotFound = "VM_NOT_FOUND";
+    public const string ProfileNotFound = "PROFILE_NOT_FOUND";
+    public const string SnapshotCreateFailed = "SNAPSHOT_CREATE_FAILED";
+    public const string SnapshotDeleteFailed = "SNAPSHOT_DELETE_FAILED";
+    public const string RunnerStatusCheckFailed = "RUNNER_STATUS_CHECK_FAILED";
+    public const string ConfigUpdateFailed = "CONFIG_UPDATE_FAILED";
 }

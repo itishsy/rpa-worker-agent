@@ -16,17 +16,25 @@ using Seebot.WorkerAgent.Core.Scheduler;
 using Seebot.WorkerAgent.Core.Scheduling;
 using Seebot.WorkerAgent.Core.Startup;
 using Seebot.WorkerAgent.Core.Storage;
+using Seebot.WorkerAgent.Core.Snapshot;
 using Seebot.WorkerAgent.Core.Switching;
 using Seebot.WorkerAgent.Core.Vmware;
+using Microsoft.AspNetCore.Builder;
 using AgentProgram = Seebot.WorkerAgent.Service.Program;
 
 var tests = new (string Name, Action Body)[]
 {
     ("Host registers core services and hosted services", HostRegistersCoreServicesAndHostedServices),
+    ("Project file copies appsettings to output", ProjectFileCopiesAppsettingsToOutput),
     ("Complete configuration validates successfully", CompleteConfigurationValidatesSuccessfully),
     ("Missing RunnerStatusUrl fails validation", MissingRunnerStatusUrlFailsValidation),
     ("RunnerStatusUrl must use port 9090", RunnerStatusUrlMustUsePort9090),
     ("Missing guest db backup path fails validation", MissingGuestDbBackupPathFailsValidation),
+    ("Missing SnapshotName fails validation", MissingSnapshotNameFailsValidation),
+    ("Configured snapshot name must use versioned ProfileId format", ConfiguredSnapshotNameMustUseVersionedProfileIdFormat),
+    ("SnapshotName matching versioned format passes validation", SnapshotNameMatchingVersionedFormatPassesValidation),
+    ("SnapshotName with wrong ProfileId prefix fails validation", SnapshotNameWithWrongProfileIdPrefixFailsValidation),
+    ("SnapshotName without date version suffix fails validation", SnapshotNameWithoutDateVersionSuffixFailsValidation),
     ("Duplicate profileId inside one VM fails validation", DuplicateProfileIdInsideVmFailsValidation),
     ("Duplicate workerId across host fails validation", DuplicateWorkerIdAcrossHostFailsValidation),
     ("RunnerStatusCode values match legacy runner contract", RunnerStatusCodeValuesMatchLegacyRunnerContract),
@@ -47,11 +55,12 @@ var tests = new (string Name, Action Body)[]
     ("VmrunService passes stop soft and hard arguments", VmrunServicePassesStopSoftAndHardArguments),
     ("VmrunService passes revertToSnapshot arguments", VmrunServicePassesRevertToSnapshotArguments),
     ("VmrunService passes start nogui arguments", VmrunServicePassesStartNoguiArguments),
-    ("VmrunService passes guest copy arguments", VmrunServicePassesGuestCopyArguments),
+    ("VmrunService passes shared folder arguments", VmrunServicePassesSharedFolderArguments),
     ("VmrunService exposes non-zero exit code as failure", VmrunServiceExposesNonZeroExitCodeAsFailure),
+    ("VmrunService passes snapshot arguments", VmrunServicePassesSnapshotArguments),
+    ("VmrunService passes deleteSnapshot arguments", VmrunServicePassesDeleteSnapshotArguments),
     ("SchedulerClient pending query includes profileId and bearer token", SchedulerClientPendingQueryIncludesProfileIdAndBearerToken),
-    ("SchedulerClient heartbeat request JSON fields are correct", SchedulerClientHeartbeatRequestJsonFieldsAreCorrect),
-    ("SchedulerClient capabilities include vms profiles and baseSnapshotName", SchedulerClientCapabilitiesIncludeVmsProfilesAndBaseSnapshotName),
+    ("SchedulerClient capabilities posts profile capability list", SchedulerClientCapabilitiesPostsProfileCapabilityList),
     ("SchedulerClient VM status includes current profile snapshot and runner status", SchedulerClientVmStatusIncludesCurrentProfileSnapshotAndRunnerStatus),
     ("SchedulerClient backup result includes backedUpDirectories", SchedulerClientBackupResultIncludesBackedUpDirectories),
     ("SchedulerClient non-success response exposes diagnostic error", SchedulerClientNonSuccessResponseExposesDiagnosticError),
@@ -77,10 +86,15 @@ var tests = new (string Name, Action Body)[]
     ("PoolSchedulerService skips Running VM candidates", PoolSchedulerServiceSkipsRunningVmCandidates),
     ("PoolSchedulerService does not preempt current profile with pending tasks", PoolSchedulerServiceDoesNotPreemptCurrentProfileWithPendingTasks),
     ("PoolSchedulerService handles higher priority profile first", PoolSchedulerServiceHandlesHigherPriorityProfileFirst),
-    ("HeartbeatBackgroundService reports heartbeat with VM counts", HeartbeatBackgroundServiceReportsHeartbeatWithVmCounts),
     ("CapabilityReportService reports all VM profile capabilities", CapabilityReportServiceReportsAllVmProfileCapabilities),
-    ("VmStatusReportService reports current VM status fields", VmStatusReportServiceReportsCurrentVmStatusFields),
-    ("Report services log scheduler failures and continue", ReportServicesLogSchedulerFailuresAndContinue),
+    ("SnapshotNameGenerator generates first sequence number when no existing snapshot for today", SnapshotNameGeneratorGeneratesFirstSequenceNumber),
+    ("SnapshotNameGenerator increments sequence when today snapshot already exists", SnapshotNameGeneratorIncrementsSequence),
+    ("SnapshotNameGenerator does not conflict with different profile on same date", SnapshotNameGeneratorIgnoresDifferentProfile),
+    ("SnapshotNameGenerator does not conflict with same profile on different date", SnapshotNameGeneratorIgnoresDifferentDate),
+    ("SnapshotNameGenerator picks max sequence when multiple exist for today", SnapshotNameGeneratorPicksMaxPlusOne),
+    ("SnapshotUpdateService success path executes steps in order", SnapshotUpdateServiceSuccessPathExecutesStepsInOrder),
+    ("SnapshotUpdateService fails at revert when snapshot not found", SnapshotUpdateServiceFailsAtRevert),
+    ("SnapshotUpdateService fails when runner is not ready after start", SnapshotUpdateServiceFailsWhenRunnerNotReady),
     ("P0 integration success closes config to switch and reporting loop", P0IntegrationSuccessClosesConfigToSwitchAndReportingLoop),
     ("P0 integration runner Running does not switch", P0IntegrationRunnerRunningDoesNotSwitch),
     ("P0 integration kill WORKER_RUNNING does not switch", P0IntegrationKillWorkerRunningDoesNotSwitch),
@@ -96,10 +110,27 @@ foreach (var test in tests)
 
 static void HostRegistersCoreServicesAndHostedServices()
 {
-    using IHost host = AgentProgram.CreateHostBuilder(Array.Empty<string>()).Build();
+    var builder = AgentProgram.CreateWebApplicationBuilder(Array.Empty<string>());
+    var app = builder.Build();
+    var hostedServices = app.Services.GetServices<IHostedService>().ToList();
 
-    Assert.NotNull(host.Services.GetRequiredService<IAgentCoreMarker>(), "Core marker service should be registered.");
-    Assert.NotEmpty(host.Services.GetServices<IHostedService>(), "At least one hosted service should be registered.");
+    Assert.NotNull(app.Services.GetRequiredService<IAgentCoreMarker>(), "Core marker service should be registered.");
+    Assert.NotEmpty(hostedServices, "At least one hosted service should be registered.");
+    Assert.True(
+        hostedServices.Any(service => service.GetType().Name == "LocalStoreInitializerService"),
+        "LocalStore initializer hosted service should run before reporting services read SQLite tables.");
+    Assert.False(
+        hostedServices.Any(service => service.GetType().Name == "HeartbeatBackgroundService"),
+        "WorkerAgent should not report host heartbeat because runner already reports heartbeat.");
+}
+
+static void ProjectFileCopiesAppsettingsToOutput()
+{
+    var projectXml = File.ReadAllText("rpa-worker-agent.csproj");
+
+    Assert.True(projectXml.Contains("appsettings.json", StringComparison.Ordinal), "Project should include appsettings.json.");
+    Assert.True(projectXml.Contains("CopyToOutputDirectory", StringComparison.Ordinal), "Project should copy appsettings.json to build output.");
+    Assert.True(projectXml.Contains("CopyToPublishDirectory", StringComparison.Ordinal), "Project should copy appsettings.json to publish output.");
 }
 
 static void CompleteConfigurationValidatesSuccessfully()
@@ -141,13 +172,64 @@ static void MissingGuestDbBackupPathFailsValidation()
     Assert.Contains(result.Errors, "GuestBackupPaths.Db");
 }
 
+static void MissingSnapshotNameFailsValidation()
+{
+    var options = ValidOptions();
+    options.VirtualMachines[0].Profiles[0].SnapshotName = "";
+
+    var result = WorkerAgentOptionsValidator.Validate(options);
+
+    Assert.Contains(result.Errors, "SnapshotName");
+}
+
+static void ConfiguredSnapshotNameMustUseVersionedProfileIdFormat()
+{
+    var options = ValidOptions();
+    options.VirtualMachines[0].Profiles[0].SnapshotName = "legacy-versioned-snapshot";
+
+    var result = WorkerAgentOptionsValidator.Validate(options);
+
+    Assert.Contains(result.Errors, "SnapshotName");
+}
+
+static void SnapshotNameMatchingVersionedFormatPassesValidation()
+{
+    var options = ValidOptions();
+    options.VirtualMachines[0].Profiles[0].SnapshotName = "rpa-sh-tax-etax.v260624.1";
+
+    var result = WorkerAgentOptionsValidator.Validate(options);
+
+    Assert.True(result.IsValid, "SnapshotName matching ProfileId.vYYMMDD.No format should pass validation.");
+}
+
+static void SnapshotNameWithWrongProfileIdPrefixFailsValidation()
+{
+    var options = ValidOptions();
+    options.VirtualMachines[0].Profiles[0].SnapshotName = "other-profile.v260624.1";
+
+    var result = WorkerAgentOptionsValidator.Validate(options);
+
+    Assert.Contains(result.Errors, "SnapshotName");
+}
+
+static void SnapshotNameWithoutDateVersionSuffixFailsValidation()
+{
+    var options = ValidOptions();
+    options.VirtualMachines[0].Profiles[0].SnapshotName = "rpa-sh-tax-etax";
+
+    var result = WorkerAgentOptionsValidator.Validate(options);
+
+    Assert.Contains(result.Errors, "SnapshotName");
+}
+
 static void DuplicateProfileIdInsideVmFailsValidation()
 {
     var options = ValidOptions();
     options.VirtualMachines[0].Profiles.Add(new ProfileOptions
     {
         ProfileId = options.VirtualMachines[0].Profiles[0].ProfileId,
-        SnapshotName = "rpa-sh-tax-etax-v20260615.2"
+        ProfileName = options.VirtualMachines[0].Profiles[0].ProfileName,
+        SnapshotName = "rpa-sh-tax-etax.v260624.2"
     });
 
     var result = WorkerAgentOptionsValidator.Validate(options);
@@ -315,7 +397,7 @@ static void LocalStoreUpsertsAndQueriesVmState()
         VmxPath = @"D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx",
         WorkerId = "rpa-sh-tax-etax-01",
         CurrentProfileId = "rpa-sh-tax-etax",
-        CurrentSnapshotName = "rpa-sh-tax-etax-v20260615.1",
+        CurrentSnapshotName = "rpa-sh-tax-etax",
         RunnerStatusCode = RunnerStatusCode.Runnable,
         VmStatus = AgentVmStatus.MONITORING,
         IdleSince = now.AddMinutes(-5),
@@ -389,7 +471,7 @@ static void VmrunServicePassesListSnapshotsArgumentsInOrderAndParsesOutput()
         StandardOutput: """
 Total snapshots: 2
 BaseClean
-rpa-sh-tax-etax-v20260615.1
+rpa-sh-tax-etax
 """,
         StandardError: "",
         Duration: TimeSpan.FromMilliseconds(25),
@@ -399,7 +481,7 @@ rpa-sh-tax-etax-v20260615.1
     var snapshots = service.ListSnapshotsAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.SequenceEqual(new[] { "listSnapshots", @"D:\VMs With Spaces\SR20\SR20.vmx" }, runner.LastCommand!.Arguments, "listSnapshots argument order should match vmrun contract.");
-    Assert.SequenceEqual(new[] { "BaseClean", "rpa-sh-tax-etax-v20260615.1" }, snapshots, "listSnapshots output should skip the Total snapshots line.");
+    Assert.SequenceEqual(new[] { "BaseClean", "rpa-sh-tax-etax" }, snapshots, "listSnapshots output should skip the Total snapshots line.");
 }
 
 static void VmrunServicePassesStopSoftAndHardArguments()
@@ -419,9 +501,9 @@ static void VmrunServicePassesRevertToSnapshotArguments()
     var runner = new FakeProcessRunner(SuccessResult("revertToSnapshot"));
     var service = NewVmrunService(runner);
 
-    service.RevertToSnapshotAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax-v20260615.1", CancellationToken.None).GetAwaiter().GetResult();
+    service.RevertToSnapshotAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.SequenceEqual(new[] { "revertToSnapshot", @"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax-v20260615.1" }, runner.LastCommand!.Arguments, "revertToSnapshot arguments should match vmrun contract.");
+    Assert.SequenceEqual(new[] { "revertToSnapshot", @"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax" }, runner.LastCommand!.Arguments, "revertToSnapshot arguments should match vmrun contract.");
 }
 
 static void VmrunServicePassesStartNoguiArguments()
@@ -434,23 +516,21 @@ static void VmrunServicePassesStartNoguiArguments()
     Assert.SequenceEqual(new[] { "start", @"D:\VMs With Spaces\SR20\SR20.vmx", "nogui" }, runner.LastCommand!.Arguments, "start nogui arguments should match vmrun contract.");
 }
 
-static void VmrunServicePassesGuestCopyArguments()
+static void VmrunServicePassesSharedFolderArguments()
 {
-    var runner = new FakeProcessRunner(SuccessResult("copyFileFromGuestToHost"));
+    var runner = new FakeProcessRunner(SuccessResult("addSharedFolder"));
     var service = NewVmrunService(runner);
 
-    service.CopyFileFromGuestToHostAsync(
+    service.AddSharedFolderAsync(
         @"D:\VMs With Spaces\SR20\SR20.vmx",
-        "Administrator",
-        "p a s s",
-        @"C:\seebot\logs",
-        @"D:\seebot work\SR20\logs",
+        "SR20-2026-6HQ8",
+        @"D:\seebot work\shared",
         CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.SequenceEqual(
-        new[] { "-gu", "Administrator", "-gp", "p a s s", "copyFileFromGuestToHost", @"D:\VMs With Spaces\SR20\SR20.vmx", @"C:\seebot\logs", @"D:\seebot work\SR20\logs" },
+        new[] { "addSharedFolder", @"D:\VMs With Spaces\SR20\SR20.vmx", "SR20-2026-6HQ8", @"D:\seebot work\shared" },
         runner.LastCommand!.Arguments,
-        "guest copy arguments should include credentials and paths as independent arguments.");
+        "shared folder arguments should include VMX path, share name, and host path as independent arguments.");
 }
 
 static void VmrunServiceExposesNonZeroExitCodeAsFailure()
@@ -470,89 +550,72 @@ static void VmrunServiceExposesNonZeroExitCodeAsFailure()
     Assert.Equal("snapshot not found", exception.Result.StandardError, "Standard error should be preserved.");
 }
 
+static void VmrunServicePassesSnapshotArguments()
+{
+    var runner = new FakeProcessRunner(SuccessResult("snapshot"));
+    var service = NewVmrunService(runner);
+
+    service.CreateSnapshotAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax.v260624.1", CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.SequenceEqual(new[] { "snapshot", @"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax.v260624.1" }, runner.LastCommand!.Arguments, "snapshot arguments should match vmrun contract.");
+}
+
+static void VmrunServicePassesDeleteSnapshotArguments()
+{
+    var runner = new FakeProcessRunner(SuccessResult("deleteSnapshot"));
+    var service = NewVmrunService(runner);
+
+    service.DeleteSnapshotAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax.v260624.1", CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.SequenceEqual(new[] { "deleteSnapshot", @"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax.v260624.1" }, runner.LastCommand!.Arguments, "deleteSnapshot arguments should match vmrun contract.");
+}
+
 static void SchedulerClientPendingQueryIncludesProfileIdAndBearerToken()
 {
     var handler = new FakeHttpMessageHandler(new HttpResponseMessage(HttpStatusCode.OK)
     {
-        Content = JsonContent("""{"hasTask":true,"profileId":"rpa-sh-tax-etax","pendingCount":100,"firstTaskId":123456,"executionCode":"EXE202606170001","priority":5,"oldestQueuedAt":"2026-06-17 09:30:00"}""")
+        Content = JsonContent("""{"code":0,"message":"ok","data":["rpa-sh-tax-etax"]}""")
     });
     var client = NewSchedulerClient(handler);
 
-    var response = client.QueryPendingTasksAsync("rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
+    var response = client.QueryPendingTasksAsync("rpa-sh-tax-etax-001", CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.Equal(true, response.HasTask, "Pending response should deserialize hasTask.");
-    Assert.Equal("rpa-sh-tax-etax", response.ProfileId, "Pending response should deserialize profileId.");
-    Assert.Equal("/api/rpa/profile-task/pending", handler.LastRequest!.RequestUri!.AbsolutePath, "Pending query path should match design.");
-    Assert.Contains(new[] { handler.LastRequest.RequestUri.Query }, "profileId=rpa-sh-tax-etax");
+    Assert.Equal(1, response.Count, "Pending response should deserialize profileId list.");
+    Assert.Equal(true, response[0].HasTask, "Pending profile should be treated as a task.");
+    Assert.Equal("rpa-sh-tax-etax", response[0].ProfileId, "Pending response should deserialize profileId.");
+    Assert.Equal("/robot/client/task/findTaskProfileCode/rpa-sh-tax-etax-001", handler.LastRequest!.RequestUri!.AbsolutePath, "Pending query path should match scheduler contract.");
     Assert.Equal("Bearer", handler.LastRequest.Headers.Authorization!.Scheme, "Authorization scheme should be Bearer.");
     Assert.Equal("scheduler-token", handler.LastRequest.Headers.Authorization.Parameter, "Authorization token should match scheduler AccessToken.");
 }
 
-static void SchedulerClientHeartbeatRequestJsonFieldsAreCorrect()
+static void SchedulerClientCapabilitiesPostsProfileCapabilityList()
 {
     var handler = new FakeHttpMessageHandler(OkResponse());
     var client = NewSchedulerClient(handler);
 
-    client.ReportHeartbeatAsync(new HostAgentHeartbeatRequest
-    {
-        HostId = "HOST-SR20-001",
-        AgentName = "SR20 Host Agent",
-        Status = "RUNNING",
-        VmCount = 5,
-        QuarantinedVmCount = 1,
-        Version = "1.0.0",
-        Timestamp = "2026-06-17 10:00:00"
-    }, CancellationToken.None).GetAwaiter().GetResult();
+    client.ReportCapabilitiesAsync(
+    [
+        new HostProfileCapabilityRequest
+        {
+            HostName = "SR20 Host Agent",
+            MachineCode = "rpa-sh-tax-etax-001",
+            ProfileId = "rpa-sh-tax-etax",
+            ProfileName = "上海税务电子税局",
+            SnapshotName = "rpa-sh-tax-etax.v260624.1"
+        }
+    ], CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.True(handler.LastRequestBody!.Contains("上海税务电子税局", StringComparison.Ordinal), "Capability profileName should be written as UTF-8 Chinese text in the request body.");
+    Assert.False(handler.LastRequestBody.Contains("\\u4e0a", StringComparison.OrdinalIgnoreCase), "Capability profileName should not be escaped as unicode sequences.");
 
     using var json = handler.LastJsonDocument();
-    Assert.Equal("HOST-SR20-001", json.RootElement.GetProperty("hostId").GetString(), "Heartbeat hostId should be serialized.");
-    Assert.Equal("RUNNING", json.RootElement.GetProperty("status").GetString(), "Heartbeat status should be serialized.");
-    Assert.Equal(5, json.RootElement.GetProperty("vmCount").GetInt32(), "Heartbeat vmCount should be serialized.");
-}
-
-static void SchedulerClientCapabilitiesIncludeVmsProfilesAndBaseSnapshotName()
-{
-    var handler = new FakeHttpMessageHandler(OkResponse());
-    var client = NewSchedulerClient(handler);
-
-    client.ReportCapabilitiesAsync(new HostAgentCapabilitiesRequest
-    {
-        HostId = "HOST-SR20-001",
-        AgentName = "SR20 Host Agent",
-        ReportedAt = "2026-06-17 10:00:00",
-        Vms =
-        [
-            new VmCapabilityDto
-            {
-                VmName = "SR20-2026-6HQ8",
-                WorkerId = "rpa-sh-tax-etax-001",
-                VmxPath = @"D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx",
-                BaseSnapshotName = "SR20-2026-6HQ8",
-                Enabled = true,
-                IsQuarantined = false,
-                Profiles =
-                [
-                    new ProfileCapabilityDto
-                    {
-                        ProfileId = "rpa-sh-tax-etax",
-                        SnapshotName = "rpa-sh-tax-etax-v20260615.1",
-                        City = "sh",
-                        Business = "tax",
-                        System = "etax",
-                        Enabled = true,
-                        SnapshotExists = true,
-                        ValidationStatus = "READY"
-                    }
-                ]
-            }
-        ]
-    }, CancellationToken.None).GetAwaiter().GetResult();
-
-    using var json = handler.LastJsonDocument();
-    var vm = json.RootElement.GetProperty("vms")[0];
-    Assert.Equal("SR20-2026-6HQ8", vm.GetProperty("vmName").GetString(), "Capability vmName should be serialized.");
-    Assert.Equal("SR20-2026-6HQ8", vm.GetProperty("baseSnapshotName").GetString(), "Capability baseSnapshotName should be serialized.");
-    Assert.Equal("rpa-sh-tax-etax", vm.GetProperty("profiles")[0].GetProperty("profileId").GetString(), "Capability profileId should be serialized.");
+    Assert.Equal(JsonValueKind.Array, json.RootElement.ValueKind, "Capability report should serialize as a JSON array.");
+    var item = json.RootElement[0];
+    Assert.Equal("SR20 Host Agent", item.GetProperty("hostName").GetString(), "Capability hostName should be serialized.");
+    Assert.Equal("rpa-sh-tax-etax-001", item.GetProperty("machineCode").GetString(), "Capability machineCode should be serialized.");
+    Assert.Equal("rpa-sh-tax-etax", item.GetProperty("profileId").GetString(), "Capability profileId should be serialized.");
+    Assert.Equal("上海税务电子税局", item.GetProperty("profileName").GetString(), "Capability profileName should be serialized.");
+    Assert.Equal("rpa-sh-tax-etax.v260624.1", item.GetProperty("snapshotName").GetString(), "Capability snapshotName should be serialized.");
 }
 
 static void SchedulerClientVmStatusIncludesCurrentProfileSnapshotAndRunnerStatus()
@@ -566,18 +629,18 @@ static void SchedulerClientVmStatusIncludesCurrentProfileSnapshotAndRunnerStatus
         VmName = "SR20-2026-6HQ8",
         WorkerId = "rpa-sh-tax-etax-001",
         CurrentProfileId = "rpa-sh-tax-etax",
-        CurrentSnapshotName = "rpa-sh-tax-etax-v20260615.1",
+        CurrentSnapshotName = "rpa-sh-tax-etax",
         AgentVmStatus = "MONITORING",
         RunnerStatusCode = 1,
         RunnerStatusName = "Runnable",
-        RunnerStatusDesc = "机器人已启动，准备就绪",
+        RunnerStatusDesc = "Runnable",
         IsQuarantined = false,
         LastHeartbeatTime = "2026-06-17 10:00:00"
     }, CancellationToken.None).GetAwaiter().GetResult();
 
     using var json = handler.LastJsonDocument();
     Assert.Equal("rpa-sh-tax-etax", json.RootElement.GetProperty("currentProfileId").GetString(), "VM status currentProfileId should be serialized.");
-    Assert.Equal("rpa-sh-tax-etax-v20260615.1", json.RootElement.GetProperty("currentSnapshotName").GetString(), "VM status currentSnapshotName should be serialized.");
+    Assert.Equal("rpa-sh-tax-etax", json.RootElement.GetProperty("currentSnapshotName").GetString(), "VM status currentSnapshotName should be serialized.");
     Assert.Equal(1, json.RootElement.GetProperty("runnerStatusCode").GetInt32(), "VM status runnerStatusCode should be serialized.");
 }
 
@@ -623,7 +686,7 @@ static void SchedulerClientNonSuccessResponseExposesDiagnosticError()
             VmName = "SR20-2026-6HQ8",
             WorkerId = "rpa-sh-tax-etax-001",
             ToProfileId = "rpa-sh-tax-etax",
-            ToSnapshotName = "rpa-sh-tax-etax-v20260615.1",
+            ToSnapshotName = "rpa-sh-tax-etax",
             Status = "FAILED",
             StartedAt = "2026-06-17 09:45:00"
         }, CancellationToken.None).GetAwaiter().GetResult());
@@ -636,7 +699,7 @@ static void GuestWorkerClientStatusCallsRunnerStatusUrlAndMapsRunning()
 {
     var handler = new FakeHttpMessageHandler(new HttpResponseMessage(HttpStatusCode.OK)
     {
-        Content = JsonContent("""{"success":true,"workerId":"rpa-sh-tax-etax-001","profileId":"rpa-sh-tax-etax","runnerStatusCode":2,"runnerStatusName":"Running","runnerStatusDesc":"机器人正在执行任务中","currentTaskId":123456,"executionCode":"EXE202606170001","javaProcessCount":1,"pythonProcessCount":0,"chromeProcessCount":0,"diskFreeGb":45,"lastHeartbeatTime":"2026-06-17 10:00:00","timestamp":"2026-06-17 10:00:00"}""")
+        Content = JsonContent("""{"code":200,"message":"ok","data":2}""")
     });
     var client = NewGuestWorkerClient(handler);
 
@@ -644,14 +707,13 @@ static void GuestWorkerClientStatusCallsRunnerStatusUrlAndMapsRunning()
 
     Assert.Equal("http://192.168.100.101:9090/api/robot/start/status", handler.LastRequest!.RequestUri!.ToString(), "Runner status should call RunnerStatusUrl.");
     Assert.Equal(RunnerStatusCode.Running, response.RunnerStatusCode, "runnerStatusCode 2 should map to RunnerStatusCode.Running.");
-    Assert.Equal(123456L, response.CurrentTaskId, "currentTaskId should deserialize.");
 }
 
 static void GuestWorkerClientKillSuccessResponseParsesRunnerDetails()
 {
     var handler = new FakeHttpMessageHandler(new HttpResponseMessage(HttpStatusCode.OK)
     {
-        Content = JsonContent("""{"success":true,"beforeRunnerStatusCode":1,"beforeRunnerStatusName":"Runnable","afterRunnerStatusCode":3,"afterRunnerStatusName":"Closed","currentTaskId":null,"logFlushed":true}""")
+        Content = JsonContent("""{"code":200,"message":"ok","data":0}""")
     });
     var client = NewGuestWorkerClient(handler);
 
@@ -663,25 +725,22 @@ static void GuestWorkerClientKillSuccessResponseParsesRunnerDetails()
     Assert.Equal("SWITCH-20260617-0001", json.RootElement.GetProperty("txId").GetString(), "Kill request should include txId.");
     Assert.Equal(30, json.RootElement.GetProperty("deadlineSeconds").GetInt32(), "Kill request should include deadlineSeconds.");
     Assert.True(response.Success, "Kill success should deserialize.");
-    Assert.Equal(RunnerStatusCode.Closed, response.AfterRunnerStatusCode, "afterRunnerStatusCode should map to enum.");
-    Assert.Equal(null, response.CurrentTaskId, "Successful idle kill should have no currentTaskId.");
-    Assert.True(response.LogFlushed, "logFlushed should deserialize.");
+    Assert.Equal(null, response.ErrorCode, "Successful kill should have no errorCode.");
 }
 
 static void GuestWorkerClientKillWorkerRunningReturnsExplicitFailure()
 {
     var handler = new FakeHttpMessageHandler(new HttpResponseMessage(HttpStatusCode.OK)
     {
-        Content = JsonContent("""{"success":false,"errorCode":"WORKER_RUNNING","beforeRunnerStatusCode":2,"beforeRunnerStatusName":"Running","currentTaskId":123456,"message":"runner is executing task"}""")
+        Content = JsonContent("""{"code":200,"message":"runner is executing task","data":1}""")
     });
     var client = NewGuestWorkerClient(handler);
 
     var response = client.KillRunnerAsync(GuestVm(), "SWITCH-20260617-0001", "SNAPSHOT_SWITCH", 30, CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.False(response.Success, "Running runner kill should return explicit failure.");
-    Assert.Equal(ErrorCodes.WorkerRunning, response.ErrorCode, "Running runner kill should expose WORKER_RUNNING.");
-    Assert.Equal(RunnerStatusCode.Running, response.BeforeRunnerStatusCode, "beforeRunnerStatusCode should map to Running.");
-    Assert.Equal(123456L, response.CurrentTaskId, "Running failure should expose currentTaskId.");
+    Assert.Equal(ErrorCodes.ExecutorStopFailed, response.ErrorCode, "Non-zero kill result should expose executor stop failure.");
+    Assert.Contains(new[] { response.Message ?? "" }, "data=1");
 }
 
 static void GuestWorkerClientTransportFailureExposesDiagnosticError()
@@ -702,17 +761,18 @@ static void LogBackupServiceCreatesTimestampedTargetDirectoriesAndCopiesFourFold
     var vmrun = new FakeVmrunService();
     var service = new LogBackupService(vmrun);
     var timestamp = DateTimeOffset.Parse("2026-06-19T10:11:12+08:00");
+    var vm = BackupVm(scope.DirectoryPath);
+    SeedBackupSource(vm.HostSharedPath);
 
-    var result = service.BackupAsync(BackupVm(scope.DirectoryPath), BackupTransaction(), timestamp, CancellationToken.None).GetAwaiter().GetResult();
+    var result = service.BackupAsync(vm, BackupTransaction(), timestamp, CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.True(result.Success, "Backup should succeed when all copies succeed.");
     Assert.Equal(Path.Combine(scope.DirectoryPath, "SR20-2026-6HQ8", "20260619101112"), result.TargetPath, "Backup target path should use yyyyMMddHHmmss.");
-    Assert.Equal(4, vmrun.CopyCalls.Count, "Backup should copy cache/db/file/logs.");
-    Assert.SequenceEqual(new[] { "cache", "db", "file", "logs" }, vmrun.CopyCalls.Select(call => Path.GetFileName(call.HostPath)), "Host copy targets should be cache/db/file/logs.");
     Assert.True(Directory.Exists(Path.Combine(result.TargetPath, "cache")), "cache directory should exist.");
     Assert.True(Directory.Exists(Path.Combine(result.TargetPath, "db")), "db directory should exist.");
     Assert.True(Directory.Exists(Path.Combine(result.TargetPath, "file")), "file directory should exist.");
     Assert.True(Directory.Exists(Path.Combine(result.TargetPath, "logs")), "logs directory should exist.");
+    Assert.True(File.Exists(Path.Combine(result.TargetPath, "db", "db.txt")), "db files should be copied from shared host path.");
 }
 
 static void LogBackupServiceWritesManifestWithRequiredDirectories()
@@ -720,8 +780,10 @@ static void LogBackupServiceWritesManifestWithRequiredDirectories()
     using var scope = TempDirectory();
     var service = new LogBackupService(new FakeVmrunService());
     var timestamp = DateTimeOffset.Parse("2026-06-19T10:11:12+08:00");
+    var vm = BackupVm(scope.DirectoryPath);
+    SeedBackupSource(vm.HostSharedPath);
 
-    var result = service.BackupAsync(BackupVm(scope.DirectoryPath), BackupTransaction(), timestamp, CancellationToken.None).GetAwaiter().GetResult();
+    var result = service.BackupAsync(vm, BackupTransaction(), timestamp, CancellationToken.None).GetAwaiter().GetResult();
 
     var manifestPath = Path.Combine(result.TargetPath, "backup_manifest.json");
     Assert.True(File.Exists(manifestPath), "backup_manifest.json should be written.");
@@ -739,14 +801,16 @@ static void LogBackupServiceWritesManifestWithRequiredDirectories()
 static void LogBackupServiceReturnsFailureWhenDirectoryCopyFails()
 {
     using var scope = TempDirectory();
-    var vmrun = new FakeVmrunService(failOnGuestPath: @"C:\seebot\db");
+    var vm = BackupVm(scope.DirectoryPath);
+    vm.GuestBackupPaths.Db = @"D:\outside\db";
+    var vmrun = new FakeVmrunService();
     var service = new LogBackupService(vmrun);
 
-    var result = service.BackupAsync(BackupVm(scope.DirectoryPath), BackupTransaction(), DateTimeOffset.Parse("2026-06-19T10:11:12+08:00"), CancellationToken.None).GetAwaiter().GetResult();
+    var result = service.BackupAsync(vm, BackupTransaction(), DateTimeOffset.Parse("2026-06-19T10:11:12+08:00"), CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.False(result.Success, "Backup should fail when any directory copy fails.");
     Assert.Equal(ErrorCodes.LogBackupFailed, result.ErrorCode, "Failure should use LOG_BACKUP_FAILED.");
-    Assert.Equal(2, vmrun.CopyCalls.Count, "Backup should stop after the failed directory copy.");
+    Assert.Contains(new[] { result.ErrorMessage ?? "" }, "Guest path");
     using var json = JsonDocument.Parse(File.ReadAllText(Path.Combine(result.TargetPath, "backup_manifest.json")));
     Assert.False(json.RootElement.GetProperty("success").GetBoolean(), "Manifest success should be false on copy failure.");
 }
@@ -755,7 +819,7 @@ static void StartupValidatorFailsWhenBaseSnapshotIsMissing()
 {
     using var scope = TempDirectory();
     var options = StartupOptions(scope.DirectoryPath);
-    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["rpa-sh-tax-etax-v20260615.1"]));
+    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["rpa-sh-tax-etax.v260624.1"]));
 
     var result = validator.ValidateAndBuildCapabilitiesAsync(options, "2026-06-19 10:00:00", CancellationToken.None).GetAwaiter().GetResult();
 
@@ -768,7 +832,7 @@ static void StartupValidatorFailsWhenBaseSnapshotNameDiffersFromVmName()
     using var scope = TempDirectory();
     var options = StartupOptions(scope.DirectoryPath);
     options.VirtualMachines[0].BaseSnapshotName = "BaseClean";
-    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["BaseClean", "rpa-sh-tax-etax-v20260615.1"]));
+    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["BaseClean", "rpa-sh-tax-etax.v260624.1"]));
 
     var result = validator.ValidateAndBuildCapabilitiesAsync(options, "2026-06-19 10:00:00", CancellationToken.None).GetAwaiter().GetResult();
 
@@ -794,7 +858,7 @@ static void StartupValidatorMarksAllProfilesReadyWhenSnapshotsExist()
 {
     using var scope = TempDirectory();
     var options = StartupOptions(scope.DirectoryPath);
-    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax-v20260615.1", "rpa-sh-social-portal-v20260615.1"]));
+    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1", "rpa-sh-social-portal.v260624.1"]));
 
     var result = validator.ValidateAndBuildCapabilitiesAsync(options, "2026-06-19 10:00:00", CancellationToken.None).GetAwaiter().GetResult();
 
@@ -952,7 +1016,6 @@ static void PoolSchedulerServiceDoesNotSwitchWhenNoPendingTasks()
 
     Assert.False(result.SwitchStarted, "No pending profile tasks should not start a switch.");
     Assert.Equal(0, switchService.Requests.Count, "Switch service should not be called when no profiles have pending work.");
-    Assert.Equal(1, scheduler.ReportedVmStatuses.Count, "No-task cycle should still report current VM state.");
 }
 
 static void PoolSchedulerServiceSwitchesCompatibleIdleVmWhenPending()
@@ -978,7 +1041,7 @@ static void PoolSchedulerServiceSwitchesCompatibleIdleVmWhenPending()
     Assert.Equal("rpa-sh-tax-etax", result.TargetProfileId, "Result should expose selected target profile.");
     Assert.Equal(1, switchService.Requests.Count, "Exactly one switch should be started.");
     Assert.Equal("SR20-2026-6HQ8", switchService.Requests[0].Vm.Name, "Compatible VM should be selected.");
-    Assert.Equal("rpa-sh-tax-etax-v20260615.1", switchService.Requests[0].TargetSnapshotName, "Target snapshot should come from VM profile config.");
+    Assert.Equal("rpa-sh-tax-etax.v260624.1", switchService.Requests[0].TargetSnapshotName, "Target snapshot should come from profile SnapshotName.");
 }
 
 static void PoolSchedulerServiceStartsAtMostOneSwitchPerCycle()
@@ -1080,98 +1143,153 @@ static void PoolSchedulerServiceHandlesHigherPriorityProfileFirst()
     Assert.Equal("rpa-sh-social-portal", switchService.Requests[0].TargetProfileId, "Switch request should use the selected higher priority profile.");
 }
 
-static void HeartbeatBackgroundServiceReportsHeartbeatWithVmCounts()
-{
-    var now = DateTimeOffset.Parse("2026-06-20T10:00:00+08:00");
-    var scheduler = new RecordingSchedulerClient();
-    var store = new RecordingLocalStore(new ActionRecorder())
-    {
-        VmStates =
-        [
-            SchedulerVmState("SR20-2026-6HQ8", "rpa-sh-tax-etax", RunnerStatusCode.Runnable, now.AddSeconds(-60)),
-            SchedulerVmState("SR20-2026-7JK9", "rpa-sh-tax-etax", RunnerStatusCode.Runnable, now.AddSeconds(-60))
-        ]
-    };
-    store.VmStates[1].IsQuarantined = true;
-
-    var service = new HeartbeatBackgroundService(
-        scheduler,
-        store,
-        SchedulerWorkerOptions(),
-        new ListLogger<HeartbeatBackgroundService>(),
-        new FixedTimeProvider(now));
-
-    service.ReportOnceAsync(CancellationToken.None).GetAwaiter().GetResult();
-
-    Assert.Equal(1, scheduler.ReportedHeartbeats.Count, "Heartbeat should be reported once.");
-    Assert.Equal("HOST-SR20-001", scheduler.ReportedHeartbeats[0].HostId, "Heartbeat should include hostId.");
-    Assert.Equal("RUNNING", scheduler.ReportedHeartbeats[0].Status, "Heartbeat should report RUNNING.");
-    Assert.Equal(2, scheduler.ReportedHeartbeats[0].VmCount, "Heartbeat should include configured VM count.");
-    Assert.Equal(1, scheduler.ReportedHeartbeats[0].QuarantinedVmCount, "Heartbeat should include quarantined VM count.");
-}
-
 static void CapabilityReportServiceReportsAllVmProfileCapabilities()
 {
-    var now = DateTimeOffset.Parse("2026-06-20T10:00:00+08:00");
     var scheduler = new RecordingSchedulerClient();
     var options = SchedulerWorkerOptions();
     var service = new CapabilityReportService(
         scheduler,
-        new RecordingStartupValidator(options),
         options,
-        new ListLogger<CapabilityReportService>(),
-        new FixedTimeProvider(now));
+        new ListLogger<CapabilityReportService>());
 
     service.ReportOnceAsync(CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.Equal(1, scheduler.ReportedCapabilities.Count, "Capabilities should be reported once.");
-    Assert.Equal(2, scheduler.ReportedCapabilities[0].Vms.Count, "Capability report should include all configured VMs.");
-    Assert.Equal("SR20-2026-6HQ8", scheduler.ReportedCapabilities[0].Vms[0].VmName, "Capability should include VM name.");
-    Assert.Equal(2, scheduler.ReportedCapabilities[0].Vms[0].Profiles.Count, "Capability should include VM profiles.");
-    Assert.Equal("rpa-sh-tax-etax", scheduler.ReportedCapabilities[0].Vms[0].Profiles[0].ProfileId, "Capability should include profileId.");
+    Assert.Equal(4, scheduler.ReportedCapabilities[0].Count, "Capability report should include all configured VM profiles.");
+    Assert.Equal("SR20 Host Agent", scheduler.ReportedCapabilities[0][0].HostName, "Capability should include hostName.");
+    Assert.Equal("rpa-sh-tax-etax-01", scheduler.ReportedCapabilities[0][0].MachineCode, "Capability should include machineCode.");
+    Assert.Equal("rpa-sh-tax-etax", scheduler.ReportedCapabilities[0][0].ProfileId, "Capability should include profileId.");
+    Assert.Equal("Shanghai Tax", scheduler.ReportedCapabilities[0][0].ProfileName, "Capability should include profileName.");
+    Assert.Equal("rpa-sh-tax-etax.v260624.1", scheduler.ReportedCapabilities[0][0].SnapshotName, "Capability should include snapshotName.");
 }
 
-static void VmStatusReportServiceReportsCurrentVmStatusFields()
+static void SnapshotNameGeneratorGeneratesFirstSequenceNumber()
 {
-    var now = DateTimeOffset.Parse("2026-06-20T10:00:00+08:00");
-    var scheduler = new RecordingSchedulerClient();
-    var store = new RecordingLocalStore(new ActionRecorder())
-    {
-        VmStates = [SchedulerVmState("SR20-2026-6HQ8", "rpa-sh-tax-etax", RunnerStatusCode.Runnable, now.AddSeconds(-60))]
-    };
-    var service = new VmStatusReportService(
-        scheduler,
-        store,
-        SchedulerWorkerOptions(),
-        new ListLogger<VmStatusReportService>(),
-        new FixedTimeProvider(now));
+    var name = SnapshotNameGenerator.Generate("DongGuan-CA", DateOnly.Parse("2026-06-24"), []);
 
-    service.ReportOnceAsync(CancellationToken.None).GetAwaiter().GetResult();
-
-    Assert.Equal(1, scheduler.ReportedVmStatuses.Count, "VM status should be reported once.");
-    Assert.Equal("rpa-sh-tax-etax", scheduler.ReportedVmStatuses[0].CurrentProfileId, "VM status should include currentProfileId.");
-    Assert.Equal("rpa-sh-tax-etax-v20260615.1", scheduler.ReportedVmStatuses[0].CurrentSnapshotName, "VM status should include currentSnapshotName.");
-    Assert.Equal(1, scheduler.ReportedVmStatuses[0].RunnerStatusCode, "VM status should include runnerStatusCode.");
+    Assert.Equal("DongGuan-CA.v260624.1", name, "First snapshot for today should get sequence number 1.");
 }
 
-static void ReportServicesLogSchedulerFailuresAndContinue()
+static void SnapshotNameGeneratorIncrementsSequence()
 {
-    var now = DateTimeOffset.Parse("2026-06-20T10:00:00+08:00");
-    var scheduler = new RecordingSchedulerClient
+    var name = SnapshotNameGenerator.Generate("DongGuan-CA", DateOnly.Parse("2026-06-24"), ["DongGuan-CA.v260624.1"]);
+
+    Assert.Equal("DongGuan-CA.v260624.2", name, "Existing snapshot for today should increment to the next sequence number.");
+}
+
+static void SnapshotNameGeneratorIgnoresDifferentProfile()
+{
+    var name = SnapshotNameGenerator.Generate("DongGuan-CA", DateOnly.Parse("2026-06-24"), ["SuZhou-CA.v260624.1"]);
+
+    Assert.Equal("DongGuan-CA.v260624.1", name, "Snapshot for a different profile should not affect the sequence number.");
+}
+
+static void SnapshotNameGeneratorIgnoresDifferentDate()
+{
+    var name = SnapshotNameGenerator.Generate("DongGuan-CA", DateOnly.Parse("2026-06-24"), ["DongGuan-CA.v260623.3"]);
+
+    Assert.Equal("DongGuan-CA.v260624.1", name, "Snapshot for a different date should not affect today's sequence number.");
+}
+
+static void SnapshotNameGeneratorPicksMaxPlusOne()
+{
+    var name = SnapshotNameGenerator.Generate("DongGuan-CA", DateOnly.Parse("2026-06-24"),
+        ["DongGuan-CA.v260624.1", "DongGuan-CA.v260624.3"]);
+
+    Assert.Equal("DongGuan-CA.v260624.4", name, "Generator should pick max existing sequence + 1, not a simple count.");
+}
+
+static void SnapshotUpdateServiceSuccessPathExecutesStepsInOrder()
+{
+    var recorder = new ActionRecorder();
+    var vmrunService = new RecordingSnapshotUpdateVmrunService(recorder, nextSnapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1"]);
+    var guest = new RecordingGuestWorkerClient(recorder)
     {
-        ThrowOnHeartbeatReport = true
+        StatusResponses = [RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Runnable)],
+        KillResponse = KillSuccess()
     };
-    var logger = new ListLogger<HeartbeatBackgroundService>();
-    var service = new HeartbeatBackgroundService(
-        scheduler,
-        new RecordingLocalStore(new ActionRecorder()),
-        SchedulerWorkerOptions(),
-        logger,
-        new FixedTimeProvider(now));
+    var configUpdater = new RecordingConfigFileUpdater(recorder);
+    var options = SnapshotUpdateOptions();
+    var service = new SnapshotUpdateService(vmrunService, guest, configUpdater, options, new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")));
 
-    service.ReportOnceAsync(CancellationToken.None).GetAwaiter().GetResult();
+    var result = service.UpdateSnapshotAsync("SR20-2026-6HQ8", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.True(logger.Messages.Any(message => message.Contains("heartbeat", StringComparison.OrdinalIgnoreCase)), "Report failures should be logged.");
+    Assert.True(result.Success, "Snapshot update should succeed when all steps complete.");
+    Assert.Equal("rpa-sh-tax-etax.v260624.2", result.NewSnapshotName, "New snapshot name should increment sequence from existing.");
+    Assert.SequenceEqual(
+        new[] { "vmrun-revert", "vmrun-start", "get-status", "vmrun-stop", "list-snapshots", "vmrun-create", "vmrun-delete", "config-update" },
+        recorder.Actions,
+        "Steps should execute in the correct order.");
+}
+
+static void SnapshotUpdateServiceFailsAtRevert()
+{
+    var recorder = new ActionRecorder();
+    var vmrunService = new RecordingSnapshotUpdateVmrunService(recorder, nextSnapshots: []);
+    vmrunService.FailOnRevert = true;
+    var guest = new RecordingGuestWorkerClient(recorder)
+    {
+        StatusResponses = [],
+        KillResponse = KillSuccess()
+    };
+    var configUpdater = new RecordingConfigFileUpdater(recorder);
+    var options = SnapshotUpdateOptions();
+    var service = new SnapshotUpdateService(vmrunService, guest, configUpdater, options);
+
+    var result = service.UpdateSnapshotAsync("SR20-2026-6HQ8", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.False(result.Success, "Snapshot update should fail when revert fails.");
+    Assert.Equal(ErrorCodes.SnapshotRevertFailed, result.ErrorCode, "Error code should be SNAPSHOT_REVERT_FAILED.");
+    Assert.SequenceEqual(new[] { "vmrun-revert" }, recorder.Actions, "Only revert should be attempted before failure.");
+}
+
+static void SnapshotUpdateServiceFailsWhenRunnerNotReady()
+{
+    var recorder = new ActionRecorder();
+    var vmrunService = new RecordingSnapshotUpdateVmrunService(recorder, nextSnapshots: []);
+    var guest = new RecordingGuestWorkerClient(recorder)
+    {
+        StatusResponses = [RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Closed)],
+        KillResponse = KillSuccess()
+    };
+    var configUpdater = new RecordingConfigFileUpdater(recorder);
+    var options = SnapshotUpdateOptions();
+    var service = new SnapshotUpdateService(vmrunService, guest, configUpdater, options, new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")));
+
+    var result = service.UpdateSnapshotAsync("SR20-2026-6HQ8", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.False(result.Success, "Snapshot update should fail when runner is not ready.");
+    Assert.Equal(ErrorCodes.RunnerNotReady, result.ErrorCode, "Error code should be RUNNER_NOT_READY.");
+    Assert.SequenceEqual(new[] { "vmrun-revert", "vmrun-start", "get-status" }, recorder.Actions, "Stop should not execute when runner is not ready.");
+}
+
+static WorkerAgentOptions SnapshotUpdateOptions()
+{
+    return new WorkerAgentOptions
+    {
+        Agent = new AgentOptions { HostId = "HOST-SR20-001" },
+        Vmrun = new VmrunOptions { DefaultStartNoGui = true },
+        VirtualMachines =
+        [
+            new VirtualMachineOptions
+            {
+                Name = "SR20-2026-6HQ8",
+                VmxPath = @"D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx",
+                WorkerId = "rpa-sh-tax-etax-001",
+                RunnerStatusUrl = "http://192.168.100.101:9090/api/robot/start/status",
+                RunnerKillUrl = "http://192.168.100.101:9090/api/robot/kill",
+                Profiles =
+                [
+                    new ProfileOptions
+                    {
+                        ProfileId = "rpa-sh-tax-etax",
+                        ProfileName = "Shanghai Tax",
+                        SnapshotName = "rpa-sh-tax-etax.v260624.1"
+                    }
+                ]
+            }
+        ]
+    };
 }
 
 static void P0IntegrationSuccessClosesConfigToSwitchAndReportingLoop()
@@ -1182,14 +1300,12 @@ static void P0IntegrationSuccessClosesConfigToSwitchAndReportingLoop()
     var configValidation = WorkerAgentOptionsValidator.Validate(options);
     Assert.True(configValidation.IsValid, "Loaded integration configuration should pass model validation.");
 
-    var startup = new StartupValidator(new FakeVmrunService(snapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax-v20260615.1", "rpa-sh-social-portal-v20260615.1"]));
+    var startup = new StartupValidator(new FakeVmrunService(snapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1", "rpa-sh-social-portal.v260624.1"]));
     var capabilityScheduler = new RecordingSchedulerClient();
     new CapabilityReportService(
         capabilityScheduler,
-        startup,
         options,
-        new ListLogger<CapabilityReportService>(),
-        new FixedTimeProvider(now))
+        new ListLogger<CapabilityReportService>())
         .ReportOnceAsync(CancellationToken.None).GetAwaiter().GetResult();
     Assert.Equal(1, capabilityScheduler.ReportedCapabilities.Count, "Startup capability should be reported.");
 
@@ -1206,7 +1322,7 @@ static void P0IntegrationSuccessClosesConfigToSwitchAndReportingLoop()
         VmStates = [SchedulerVmState("SR20-2026-6HQ8", "rpa-sh-social-portal", RunnerStatusCode.Runnable, now.AddSeconds(-60))]
     };
     var switchService = NewVmSwitchService(ReadyGuest(recorder), new RecordingBackupService(recorder), new RecordingSwitchVmrunService(recorder), store);
-    var result = new PoolSchedulerService(scheduler, switchService, store, options, new FixedTimeProvider(now))
+    var result = new PoolSchedulerService(scheduler, ReadyGuest(recorder), new RecordingVmStateRefreshService(), switchService, store, options, new FixedTimeProvider(now))
         .RunOneCycleAsync(CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.True(result.SwitchStarted, "Pending profile should start the integrated switch.");
@@ -1214,7 +1330,6 @@ static void P0IntegrationSuccessClosesConfigToSwitchAndReportingLoop()
         new[] { "create-tx", "get-status", "kill", "update:STOP_RUNNER_DONE", "backup", "update:LOG_BACKUP_DONE", "vmrun-stop", "update:VM_STOP_DONE", "vmrun-revert", "update:SNAPSHOT_REVERT_DONE", "vmrun-start", "update:VM_START_DONE", "get-status", "update:WORKER_READY_DONE", "update:SUCCESS" },
         recorder.Actions,
         "Integrated success path should stop runner, backup, vmrun stop/revert/start, wait ready, then succeed.");
-    Assert.Equal(1, scheduler.ReportedVmStatuses.Count, "Scheduler cycle should report VM current status.");
 }
 
 static void P0IntegrationRunnerRunningDoesNotSwitch()
@@ -1305,7 +1420,7 @@ static PoolSchedulerService NewPoolScheduler(
     WorkerAgentOptions options,
     DateTimeOffset now)
 {
-    return new PoolSchedulerService(scheduler, switchService, store, options, new FixedTimeProvider(now));
+    return new PoolSchedulerService(scheduler, ReadyGuest(new ActionRecorder()), new RecordingVmStateRefreshService(), switchService, store, options, new FixedTimeProvider(now));
 }
 
 static VmCurrentState SchedulerVmState(string vmName, string currentProfileId, RunnerStatusCode runnerStatus, DateTimeOffset idleSince)
@@ -1317,7 +1432,7 @@ static VmCurrentState SchedulerVmState(string vmName, string currentProfileId, R
         VmxPath = $@"D:\VMs\{vmName}\{vmName}.vmx",
         VmStatus = AgentVmStatus.MONITORING,
         CurrentProfileId = currentProfileId,
-        CurrentSnapshotName = $"{currentProfileId}-v20260615.1",
+        CurrentSnapshotName = currentProfileId,
         RunnerStatusCode = runnerStatus,
         IdleSince = idleSince,
         UpdatedAt = idleSince
@@ -1332,7 +1447,6 @@ static ProfilePendingTaskResponse Pending(string profileId, int priority, string
         ProfileId = profileId,
         PendingCount = 100,
         FirstTaskId = 123456,
-        ExecutionCode = "EXE202606200001",
         Priority = priority,
         OldestQueuedAt = oldestQueuedAt
     };
@@ -1347,7 +1461,8 @@ static WorkerAgentOptions SchedulerWorkerOptions()
     options.VirtualMachines[1].Profiles.Add(new ProfileOptions
     {
         ProfileId = "rpa-sh-social-portal",
-        SnapshotName = "rpa-sh-social-portal-v20260615.1"
+        ProfileName = "Social Portal",
+        SnapshotName = "rpa-sh-social-portal.v260624.1"
     });
     return options;
 }
@@ -1414,9 +1529,9 @@ static VmSwitchRequest SwitchRequest()
         HostId = "HOST-SR20-001",
         Vm = BackupVm(Path.Combine(Path.GetTempPath(), "rpa-worker-agent-switch-tests")),
         FromProfileId = "rpa-sh-social-portal",
-        FromSnapshotName = "rpa-sh-social-portal-v20260615.1",
+        FromSnapshotName = "rpa-sh-social-portal.v260624.1",
         TargetProfileId = "rpa-sh-tax-etax",
-        TargetSnapshotName = "rpa-sh-tax-etax-v20260615.1",
+        TargetSnapshotName = "rpa-sh-tax-etax.v260624.1",
         FirstTaskId = 123456,
         Timestamp = DateTimeOffset.Parse("2026-06-19T10:11:12+08:00")
     };
@@ -1491,12 +1606,14 @@ static WorkerAgentOptions StartupOptions(string root)
                     new ProfileOptions
                     {
                         ProfileId = "rpa-sh-tax-etax",
-                        SnapshotName = "rpa-sh-tax-etax-v20260615.1"
+                        ProfileName = "Shanghai Tax",
+                        SnapshotName = "rpa-sh-tax-etax.v260624.1"
                     },
                     new ProfileOptions
                     {
                         ProfileId = "rpa-sh-social-portal",
-                        SnapshotName = "rpa-sh-social-portal-v20260615.1"
+                        ProfileName = "Social Portal",
+                        SnapshotName = "rpa-sh-social-portal.v260624.1"
                     }
                 ]
             }
@@ -1514,6 +1631,8 @@ static VirtualMachineOptions BackupVm(string hostWorkPath)
         GuestUser = "Administrator",
         GuestPasswordSecret = "password",
         HostWorkPath = hostWorkPath,
+        HostSharedPath = Path.Combine(hostWorkPath, "shared"),
+        GuestSharedPath = @"C:\seebot",
         GuestBackupPaths = new GuestBackupPathsOptions
         {
             Cache = @"C:\seebot\cache",
@@ -1522,6 +1641,16 @@ static VirtualMachineOptions BackupVm(string hostWorkPath)
             Logs = @"C:\seebot\logs"
         }
     };
+}
+
+static void SeedBackupSource(string hostSharedPath)
+{
+    foreach (var directoryName in new[] { "cache", "db", "file", "logs" })
+    {
+        var directoryPath = Path.Combine(hostSharedPath, directoryName);
+        Directory.CreateDirectory(directoryPath);
+        File.WriteAllText(Path.Combine(directoryPath, $"{directoryName}.txt"), directoryName);
+    }
 }
 
 static SwitchTransaction BackupTransaction()
@@ -1533,9 +1662,9 @@ static SwitchTransaction BackupTransaction()
         VmName = "SR20-2026-6HQ8",
         WorkerId = "rpa-sh-tax-etax-001",
         FromProfileId = "rpa-sh-social-portal",
-        FromSnapshotName = "rpa-sh-social-portal-v20260615.1",
+        FromSnapshotName = "rpa-sh-social-portal",
         TargetProfileId = "rpa-sh-tax-etax",
-        TargetSnapshotName = "rpa-sh-tax-etax-v20260615.1",
+        TargetSnapshotName = "rpa-sh-tax-etax",
         FirstTaskId = 123456,
         CreatedAt = DateTimeOffset.Parse("2026-06-19T10:00:00+08:00")
     };
@@ -1581,7 +1710,7 @@ static HttpResponseMessage OkResponse()
 {
     return new HttpResponseMessage(HttpStatusCode.OK)
     {
-        Content = JsonContent("""{"success":true}""")
+        Content = JsonContent("""{"code":200,"message":"ok"}""")
     };
 }
 
@@ -1608,9 +1737,9 @@ static SwitchTransaction SampleTransaction(string txId, SwitchTransactionStatus 
         VmName = "SR20-2026-6HQ8",
         WorkerId = "rpa-sh-tax-etax-01",
         FromProfileId = "rpa-sh-social-portal",
-        FromSnapshotName = "rpa-sh-social-portal-v20260615.1",
+        FromSnapshotName = "rpa-sh-social-portal",
         TargetProfileId = "rpa-sh-tax-etax",
-        TargetSnapshotName = "rpa-sh-tax-etax-v20260615.1",
+        TargetSnapshotName = "rpa-sh-tax-etax",
         FirstTaskId = 1001,
         TriggerReason = "pending-profile-task",
         Status = status,
@@ -1653,7 +1782,6 @@ static WorkerAgentOptions ValidOptions()
             HostId = "SB-VM-001",
             AgentName = "SR20 Host Agent",
             PollIntervalSeconds = 10,
-            HeartbeatIntervalSeconds = 15,
             CapabilityReportIntervalSeconds = 300,
             SwitchTimeoutSeconds = 300,
             WaitVmReadyTimeoutSeconds = 180,
@@ -1704,12 +1832,14 @@ static WorkerAgentOptions ValidOptions()
                     new ProfileOptions
                     {
                         ProfileId = "rpa-sh-tax-etax",
-                        SnapshotName = "rpa-sh-tax-etax-v20260615.1"
+                        ProfileName = "Shanghai Tax",
+                        SnapshotName = "rpa-sh-tax-etax.v260624.1"
                     },
                     new ProfileOptions
                     {
                         ProfileId = "rpa-sh-social-portal",
-                        SnapshotName = "rpa-sh-social-portal-v20260615.1"
+                        ProfileName = "Social Portal",
+                        SnapshotName = "rpa-sh-social-portal.v260624.1"
                     }
                 ]
             },
@@ -1735,7 +1865,8 @@ static WorkerAgentOptions ValidOptions()
                     new ProfileOptions
                     {
                         ProfileId = "rpa-sh-tax-etax",
-                        SnapshotName = "rpa-sh-tax-etax-v20260615.1"
+                        ProfileName = "Shanghai Tax",
+                        SnapshotName = "rpa-sh-tax-etax.v260624.1"
                     }
                 ]
             }
@@ -1868,6 +1999,11 @@ internal sealed class FakeVmrunService : IVmrunService
         return Task.FromResult(_snapshots);
     }
 
+    public Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        return Task.FromResult<string?>(_snapshots.FirstOrDefault());
+    }
+
     public Task<VmrunCommandResult> StopVmAsync(string vmxPath, VmStopMode mode, CancellationToken cancellationToken)
     {
         throw new NotSupportedException();
@@ -1881,6 +2017,21 @@ internal sealed class FakeVmrunService : IVmrunService
     public Task<VmrunCommandResult> StartVmAsync(string vmxPath, bool noGui, CancellationToken cancellationToken)
     {
         throw new NotSupportedException();
+    }
+
+    public Task<VmrunCommandResult> EnableSharedFoldersAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "enableSharedFolders"));
+    }
+
+    public Task<VmrunCommandResult> AddSharedFolderAsync(string vmxPath, string shareName, string hostPath, CancellationToken cancellationToken)
+    {
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "addSharedFolder"));
+    }
+
+    public Task<VmrunCommandResult> RemoveSharedFolderAsync(string vmxPath, string shareName, CancellationToken cancellationToken)
+    {
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "removeSharedFolder"));
     }
 
     public Task<VmrunCommandResult> CopyFileFromGuestToHostAsync(
@@ -1898,6 +2049,16 @@ internal sealed class FakeVmrunService : IVmrunService
         }
 
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "copyFileFromGuestToHost"));
+    }
+
+    public Task<VmrunCommandResult> CreateSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException();
+    }
+
+    public Task<VmrunCommandResult> DeleteSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException();
     }
 }
 
@@ -2005,6 +2166,11 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
         throw new NotSupportedException();
     }
 
+    public Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        return Task.FromResult<string?>(null);
+    }
+
     public Task<VmrunCommandResult> StopVmAsync(string vmxPath, VmStopMode mode, CancellationToken cancellationToken)
     {
         _recorder.Actions.Add("vmrun-stop");
@@ -2028,6 +2194,24 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "start"));
     }
 
+    public Task<VmrunCommandResult> EnableSharedFoldersAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-enable-shared-folders");
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "enableSharedFolders"));
+    }
+
+    public Task<VmrunCommandResult> AddSharedFolderAsync(string vmxPath, string shareName, string hostPath, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-add-shared-folder");
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "addSharedFolder"));
+    }
+
+    public Task<VmrunCommandResult> RemoveSharedFolderAsync(string vmxPath, string shareName, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-remove-shared-folder");
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "removeSharedFolder"));
+    }
+
     public Task<VmrunCommandResult> CopyFileFromGuestToHostAsync(
         string vmxPath,
         string guestUser,
@@ -2035,6 +2219,16 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
         string guestPath,
         string hostPath,
         CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException();
+    }
+
+    public Task<VmrunCommandResult> CreateSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException();
+    }
+
+    public Task<VmrunCommandResult> DeleteSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
     {
         throw new NotSupportedException();
     }
@@ -2059,6 +2253,12 @@ internal sealed class RecordingLocalStore : ILocalStore
         return Task.CompletedTask;
     }
 
+    public Task SeedVmStatesAsync(string hostId, IReadOnlyList<VmCurrentState> initialStates, CancellationToken cancellationToken = default)
+    {
+        VmStates = initialStates;
+        return Task.CompletedTask;
+    }
+
     public Task UpsertVmStateAsync(string hostId, VmCurrentState state, CancellationToken cancellationToken = default)
     {
         UpsertedVmStates.Add(state);
@@ -2068,6 +2268,12 @@ internal sealed class RecordingLocalStore : ILocalStore
     public Task<IReadOnlyList<VmCurrentState>> GetVmStatesAsync(string hostId, CancellationToken cancellationToken = default)
     {
         return Task.FromResult(VmStates);
+    }
+
+    public Task<VmCurrentState?> GetVmStateAsync(string hostId, string vmName, CancellationToken cancellationToken = default)
+    {
+        var state = VmStates.FirstOrDefault(item => string.Equals(item.VmName, vmName, StringComparison.OrdinalIgnoreCase));
+        return Task.FromResult(state);
     }
 
     public Task CreateSwitchTransactionAsync(SwitchTransaction transaction, CancellationToken cancellationToken = default)
@@ -2108,6 +2314,12 @@ internal sealed class RecordingLocalStore : ILocalStore
         return Task.FromResult<IReadOnlyList<SwitchTransaction>>([]);
     }
 
+    public Task DeleteSwitchTransactionAsync(string txId, CancellationToken cancellationToken = default)
+    {
+        _transactions.Remove(txId);
+        return Task.CompletedTask;
+    }
+
     public Task<SwitchTransaction?> GetSwitchTransactionAsync(string txId, CancellationToken cancellationToken = default)
     {
         _transactions.TryGetValue(txId, out var transaction);
@@ -2121,41 +2333,19 @@ internal sealed class RecordingSchedulerClient : ISchedulerClient
 
     public List<string> QueriedProfileIds { get; } = [];
 
-    public List<HostAgentHeartbeatRequest> ReportedHeartbeats { get; } = [];
-
-    public List<HostAgentCapabilitiesRequest> ReportedCapabilities { get; } = [];
+    public List<IReadOnlyList<HostProfileCapabilityRequest>> ReportedCapabilities { get; } = [];
 
     public List<VmStatusReportRequest> ReportedVmStatuses { get; } = [];
 
-    public bool ThrowOnHeartbeatReport { get; set; }
+    public bool ThrowOnVmStatusReport { get; set; }
 
-    public Task<ProfilePendingTaskResponse> QueryPendingTasksAsync(string profileId, CancellationToken cancellationToken)
+    public Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingTasksAsync(string workerId, CancellationToken cancellationToken)
     {
-        QueriedProfileIds.Add(profileId);
-        if (Pending.TryGetValue(profileId, out var response))
-        {
-            return Task.FromResult(response);
-        }
-
-        return Task.FromResult(new ProfilePendingTaskResponse
-        {
-            HasTask = false,
-            ProfileId = profileId
-        });
+        QueriedProfileIds.Add(workerId);
+        return Task.FromResult<IReadOnlyList<ProfilePendingTaskResponse>>(Pending.Values.ToList());
     }
 
-    public Task ReportHeartbeatAsync(HostAgentHeartbeatRequest request, CancellationToken cancellationToken)
-    {
-        if (ThrowOnHeartbeatReport)
-        {
-            throw new InvalidOperationException("heartbeat failed");
-        }
-
-        ReportedHeartbeats.Add(request);
-        return Task.CompletedTask;
-    }
-
-    public Task ReportCapabilitiesAsync(HostAgentCapabilitiesRequest request, CancellationToken cancellationToken)
+    public Task ReportCapabilitiesAsync(IReadOnlyList<HostProfileCapabilityRequest> request, CancellationToken cancellationToken)
     {
         ReportedCapabilities.Add(request);
         return Task.CompletedTask;
@@ -2163,6 +2353,11 @@ internal sealed class RecordingSchedulerClient : ISchedulerClient
 
     public Task ReportVmStatusAsync(VmStatusReportRequest request, CancellationToken cancellationToken)
     {
+        if (ThrowOnVmStatusReport)
+        {
+            throw new InvalidOperationException("vm status failed");
+        }
+
         ReportedVmStatuses.Add(request);
         return Task.CompletedTask;
     }
@@ -2242,6 +2437,115 @@ internal sealed class ListLogger<T> : ILogger<T>
         Func<TState, Exception?, string> formatter)
     {
         Messages.Add(formatter(state, exception));
+    }
+}
+
+internal sealed class RecordingSnapshotUpdateVmrunService : IVmrunService
+{
+    private readonly ActionRecorder _recorder;
+    private readonly IReadOnlyList<string> _nextSnapshots;
+
+    public RecordingSnapshotUpdateVmrunService(ActionRecorder recorder, IReadOnlyList<string> nextSnapshots)
+    {
+        _recorder = recorder;
+        _nextSnapshots = nextSnapshots;
+    }
+
+    public bool FailOnRevert { get; set; }
+
+    public Task<IReadOnlyList<string>> ListSnapshotsAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("list-snapshots");
+        return Task.FromResult(_nextSnapshots);
+    }
+
+    public Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        return Task.FromResult<string?>(_nextSnapshots.FirstOrDefault());
+    }
+
+    public Task<VmrunCommandResult> StopVmAsync(string vmxPath, VmStopMode mode, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-stop");
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "stop"));
+    }
+
+    public Task<VmrunCommandResult> RevertToSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-revert");
+        if (FailOnRevert)
+        {
+            throw new InvalidOperationException("revert failed");
+        }
+
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "revertToSnapshot"));
+    }
+
+    public Task<VmrunCommandResult> StartVmAsync(string vmxPath, bool noGui, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-start");
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "start"));
+    }
+
+    public Task<VmrunCommandResult> EnableSharedFoldersAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-enable-shared-folders");
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "enableSharedFolders"));
+    }
+
+    public Task<VmrunCommandResult> AddSharedFolderAsync(string vmxPath, string shareName, string hostPath, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-add-shared-folder");
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "addSharedFolder"));
+    }
+
+    public Task<VmrunCommandResult> RemoveSharedFolderAsync(string vmxPath, string shareName, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-remove-shared-folder");
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "removeSharedFolder"));
+    }
+
+    public Task<VmrunCommandResult> CopyFileFromGuestToHostAsync(
+        string vmxPath, string guestUser, string guestPassword,
+        string guestPath, string hostPath, CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException();
+    }
+
+    public Task<VmrunCommandResult> CreateSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-create");
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "snapshot"));
+    }
+
+    public Task<VmrunCommandResult> DeleteSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-delete");
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "deleteSnapshot"));
+    }
+}
+
+internal sealed class RecordingConfigFileUpdater : IConfigFileUpdater
+{
+    private readonly ActionRecorder _recorder;
+
+    public RecordingConfigFileUpdater(ActionRecorder recorder)
+    {
+        _recorder = recorder;
+    }
+
+    public Task UpdateSnapshotNameAsync(string vmName, string profileId, string newSnapshotName, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("config-update");
+        return Task.CompletedTask;
+    }
+}
+
+internal sealed class RecordingVmStateRefreshService : IVmStateRefreshService
+{
+    public Task RefreshAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        return Task.CompletedTask;
     }
 }
 

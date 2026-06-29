@@ -34,20 +34,30 @@ public sealed class LogBackupService : ILogBackupService
 
         try
         {
+            await _vmrunService.EnableSharedFoldersAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _vmrunService.RemoveSharedFolderAsync(vm.VmxPath, vm.Name, cancellationToken).ConfigureAwait(false);
+            }
+            catch (VmrunCommandException)
+            {
+                // 共享不存在时 removeSharedFolder 也返回 -1，忽略
+            }
+            await _vmrunService.AddSharedFolderAsync(vm.VmxPath, vm.Name, vm.HostSharedPath, cancellationToken).ConfigureAwait(false);
+
             foreach (var source in BuildSources(vm))
             {
-                var hostPath = Path.Combine(targetPath, source.Name);
-                Directory.CreateDirectory(hostPath);
-                await _vmrunService.CopyFileFromGuestToHostAsync(
-                    vm.VmxPath,
-                    vm.GuestUser,
-                    vm.GuestPasswordSecret,
-                    source.GuestPath,
-                    hostPath,
-                    cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                var hostSourcePath = GuestPathToHostShared(source.GuestPath, vm.GuestSharedPath, vm.HostSharedPath);
+                var hostDestPath = Path.Combine(targetPath, source.Name);
+                CopyDirectory(hostSourcePath, hostDestPath);
             }
 
             success = true;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception exception)
         {
@@ -92,6 +102,46 @@ public sealed class LogBackupService : ILogBackupService
             new BackupSource("file", vm.GuestBackupPaths.File),
             new BackupSource("logs", vm.GuestBackupPaths.Logs)
         ];
+    }
+
+    // 将 Guest 路径转换为 Host 侧共享目录的对应路径
+    // 例：GuestSharedPath=D:\seebon\rpa  HostSharedPath=D:\seebon\rpa-worker-agent\work\shared
+    //     guestPath=D:\seebon\rpa\cache  → D:\seebon\rpa-worker-agent\work\shared\cache
+    private static string GuestPathToHostShared(string guestPath, string guestSharedPath, string hostSharedPath)
+    {
+        var guestNorm = guestSharedPath.TrimEnd('\\', '/');
+        var pathNorm = guestPath.TrimEnd('\\', '/');
+
+        if (!pathNorm.StartsWith(guestNorm, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Guest path '{guestPath}' is not under GuestSharedPath '{guestSharedPath}'.");
+        }
+
+        var relative = pathNorm.Length > guestNorm.Length
+            ? pathNorm[(guestNorm.Length + 1)..]
+            : "";
+
+        return string.IsNullOrEmpty(relative)
+            ? hostSharedPath
+            : Path.Combine(hostSharedPath, relative);
+    }
+
+    private static void CopyDirectory(string sourcePath, string destPath)
+    {
+        Directory.CreateDirectory(destPath);
+        if (!Directory.Exists(sourcePath))
+        {
+            return;
+        }
+
+        foreach (var file in Directory.EnumerateFiles(sourcePath, "*", SearchOption.AllDirectories))
+        {
+            var relative = Path.GetRelativePath(sourcePath, file);
+            var destFile = Path.Combine(destPath, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(destFile)!);
+            File.Copy(file, destFile, overwrite: true);
+        }
     }
 
     private static async Task WriteManifestAsync(

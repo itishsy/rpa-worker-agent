@@ -9,6 +9,7 @@ using Seebot.WorkerAgent.Core.Scheduler;
 using Seebot.WorkerAgent.Core.Scheduling;
 using Seebot.WorkerAgent.Core.Startup;
 using Seebot.WorkerAgent.Core.Storage;
+using Seebot.WorkerAgent.Core.Snapshot;
 using Seebot.WorkerAgent.Core.Switching;
 using Seebot.WorkerAgent.Core.Vmware;
 
@@ -61,19 +62,36 @@ public static class ServiceCollectionExtensions
             }
         });
         services.AddHttpClient<IGuestWorkerClient, GuestWorkerClient>();
-        services.AddSingleton<ILocalStore>(_ =>
+        services.AddSingleton<ILocalStore>(provider =>
         {
-            var dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
-            Directory.CreateDirectory(dataDirectory);
-            return new LocalStore(Path.Combine(dataDirectory, "agent.db"));
+            var agentOptions = provider.GetRequiredService<WorkerAgentOptions>().Agent;
+            string dbPath;
+            if (string.IsNullOrWhiteSpace(agentOptions.LocalDbPath))
+            {
+                dbPath = Path.Combine(AppContext.BaseDirectory, "data", "agent.db");
+            }
+            else if (string.Equals(Path.GetExtension(agentOptions.LocalDbPath), ".db", StringComparison.OrdinalIgnoreCase))
+            {
+                dbPath = agentOptions.LocalDbPath;
+            }
+            else
+            {
+                dbPath = Path.Combine(agentOptions.LocalDbPath, "agent.db");
+            }
+            Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+            return new LocalStore(dbPath);
         });
+        services.AddHostedService<LocalStoreInitializerService>();
         services.AddSingleton<ILogBackupService, LogBackupService>();
         services.AddSingleton<Startup.IStartupValidator, StartupValidator>();
         services.AddSingleton<IVmSwitchService, VmSwitchService>();
+        services.AddSingleton<IVmStateRefreshService, VmStateRefreshService>();
         services.AddSingleton<IPoolSchedulerService, PoolSchedulerService>();
-        services.AddHostedService<HeartbeatBackgroundService>();
-        services.AddHostedService<CapabilityReportService>();
-        services.AddHostedService<VmStatusReportService>();
+        services.AddSingleton<IConfigFileUpdater>(_ =>
+            new ConfigFileUpdater(Path.Combine(AppContext.BaseDirectory, "appsettings.json")));
+        services.AddSingleton<ISnapshotUpdateService, SnapshotUpdateService>();
+        services.AddSingleton<CapabilityReportService>();
+        services.AddHostedService(sp => sp.GetRequiredService<CapabilityReportService>());
 
         return services;
     }

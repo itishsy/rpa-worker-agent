@@ -1,7 +1,6 @@
-using System.Globalization;
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Domain;
-using Seebot.WorkerAgent.Core.Reporting;
+using Seebot.WorkerAgent.Core.Guest;
 using Seebot.WorkerAgent.Core.Scheduler;
 using Seebot.WorkerAgent.Core.Storage;
 using Seebot.WorkerAgent.Core.Switching;
@@ -11,6 +10,8 @@ namespace Seebot.WorkerAgent.Core.Scheduling;
 public sealed class PoolSchedulerService : IPoolSchedulerService
 {
     private readonly ISchedulerClient _schedulerClient;
+    private readonly IGuestWorkerClient _guestWorkerClient;
+    private readonly IVmStateRefreshService _vmStateRefreshService;
     private readonly IVmSwitchService _vmSwitchService;
     private readonly ILocalStore _localStore;
     private readonly WorkerAgentOptions _options;
@@ -18,12 +19,16 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
 
     public PoolSchedulerService(
         ISchedulerClient schedulerClient,
+        IGuestWorkerClient guestWorkerClient,
+        IVmStateRefreshService vmStateRefreshService,
         IVmSwitchService vmSwitchService,
         ILocalStore localStore,
         WorkerAgentOptions options,
         TimeProvider? timeProvider = null)
     {
         _schedulerClient = schedulerClient;
+        _guestWorkerClient = guestWorkerClient;
+        _vmStateRefreshService = vmStateRefreshService;
         _vmSwitchService = vmSwitchService;
         _localStore = localStore;
         _options = options;
@@ -32,34 +37,35 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
 
     public async Task<PoolSchedulerCycleResult> RunOneCycleAsync(CancellationToken cancellationToken)
     {
-        var profileIds = GetConfiguredProfileIds();
-        if (profileIds.Count == 0)
+        if (_options.VirtualMachines.Count == 0)
         {
-            return NoSwitch("No configured profiles.");
+            return NoSwitch("No configured VMs.");
         }
 
-        var pendingByProfile = await QueryPendingProfilesAsync(profileIds, cancellationToken).ConfigureAwait(false);
-        var targetProfiles = pendingByProfile.Values
-            .Where(response => response.HasTask)
-            .OrderByDescending(response => response.Priority)
-            .ThenBy(response => ParseOldestQueuedAt(response.OldestQueuedAt))
-            .ThenBy(response => response.ProfileId, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        var targetProfiles = await QueryPendingProfilesAsync(cancellationToken).ConfigureAwait(false);
+
+        var now = _timeProvider.GetUtcNow();
+        await _vmStateRefreshService.RefreshAsync(now, cancellationToken).ConfigureAwait(false);
 
         var vmStates = await _localStore.GetVmStatesAsync(_options.Agent.HostId, cancellationToken).ConfigureAwait(false);
-        var now = _timeProvider.GetUtcNow();
-        await ReportVmStatesAsync(vmStates, now, cancellationToken).ConfigureAwait(false);
+        var activeTxVmNames = await GetActiveSwitchVmNamesAsync(cancellationToken).ConfigureAwait(false);
 
         if (targetProfiles.Count == 0)
         {
             return NoSwitch("No pending profile tasks.");
         }
 
+        var pendingProfileIds = targetProfiles.Select(r => r.ProfileId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var s in vmStates)
+        {
+            s.HasActiveSwitchTransaction = activeTxVmNames.Contains(s.VmName);
+        }
+
         var stateByVmName = vmStates.ToDictionary(state => state.VmName, StringComparer.OrdinalIgnoreCase);
 
         foreach (var target in targetProfiles)
         {
-            var candidate = FindCandidate(target.ProfileId, pendingByProfile, stateByVmName, now);
+            var candidate = FindCandidate(target.ProfileId, pendingProfileIds, stateByVmName, now);
             if (candidate is null)
             {
                 continue;
@@ -90,41 +96,32 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
         return NoSwitch("No compatible idle VM candidate.");
     }
 
-    private async Task ReportVmStatesAsync(
-        IReadOnlyList<VmCurrentState> vmStates,
-        DateTimeOffset now,
+    private async Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingProfilesAsync(
         CancellationToken cancellationToken)
     {
-        foreach (var state in vmStates)
-        {
-            await _schedulerClient
-                .ReportVmStatusAsync(VmStatusReportBuilder.Build(_options, state, now), cancellationToken)
-                .ConfigureAwait(false);
-        }
-    }
+        var workerIds = _options.VirtualMachines
+            .Select(vm => vm.WorkerId)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
-    private async Task<Dictionary<string, ProfilePendingTaskResponse>> QueryPendingProfilesAsync(
-        IReadOnlyList<string> profileIds,
-        CancellationToken cancellationToken)
-    {
-        var pendingByProfile = new Dictionary<string, ProfilePendingTaskResponse>(StringComparer.OrdinalIgnoreCase);
-        foreach (var profileId in profileIds)
+        var results = new List<ProfilePendingTaskResponse>();
+        foreach (var workerId in workerIds)
         {
-            var response = await _schedulerClient.QueryPendingTasksAsync(profileId, cancellationToken).ConfigureAwait(false);
-            if (string.IsNullOrWhiteSpace(response.ProfileId))
-            {
-                response.ProfileId = profileId;
-            }
-
-            pendingByProfile[profileId] = response;
+            var profiles = await _schedulerClient.QueryPendingTasksAsync(workerId, cancellationToken).ConfigureAwait(false);
+            results.AddRange(profiles);
         }
 
-        return pendingByProfile;
+        return results
+            .Where(profile => profile.HasTask && !string.IsNullOrWhiteSpace(profile.ProfileId))
+            .OrderByDescending(profile => profile.Priority)
+            .ThenBy(profile => profile.OldestQueuedAt, StringComparer.Ordinal)
+            .ToList();
     }
 
     private (VirtualMachineOptions Vm, VmCurrentState State, ProfileOptions Profile)? FindCandidate(
         string targetProfileId,
-        IReadOnlyDictionary<string, ProfilePendingTaskResponse> pendingByProfile,
+        IReadOnlySet<string> pendingProfileIds,
         IReadOnlyDictionary<string, VmCurrentState> stateByVmName,
         DateTimeOffset now)
     {
@@ -142,12 +139,14 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
                 continue;
             }
 
-            if (string.Equals(state.CurrentProfileId, targetProfileId, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(state.CurrentProfileId, targetProfileId, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(state.CurrentSnapshotName, profile.SnapshotName, StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
 
-            var currentProfilePending = IsCurrentProfilePending(state.CurrentProfileId, pendingByProfile);
+            var currentProfilePending = !string.IsNullOrWhiteSpace(state.CurrentProfileId)
+                && pendingProfileIds.Contains(state.CurrentProfileId);
             var evaluation = WorkerStateEvaluator.EvaluateSwitchCandidate(
                 state,
                 currentProfilePending,
@@ -162,36 +161,56 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
         return null;
     }
 
-    private static bool IsCurrentProfilePending(
-        string? currentProfileId,
-        IReadOnlyDictionary<string, ProfilePendingTaskResponse> pendingByProfile)
+    private async Task<HashSet<string>> GetActiveSwitchVmNamesAsync(CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(currentProfileId))
+        var txList = await _localStore.GetIncompleteSwitchTransactionsAsync(_options.Agent.HostId, cancellationToken).ConfigureAwait(false);
+        if (txList.Count == 0)
         {
-            return false;
+            return [];
         }
 
-        return pendingByProfile.TryGetValue(currentProfileId, out var pending) && pending.HasTask;
-    }
+        var now = _timeProvider.GetUtcNow();
+        var activeVmNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-    private IReadOnlyList<string> GetConfiguredProfileIds()
-    {
-        return _options.VirtualMachines
-            .SelectMany(vm => vm.Profiles)
-            .Select(profile => profile.ProfileId)
-            .Where(profileId => !string.IsNullOrWhiteSpace(profileId))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-    }
-
-    private static DateTimeOffset ParseOldestQueuedAt(string? oldestQueuedAt)
-    {
-        if (DateTimeOffset.TryParse(oldestQueuedAt, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var parsed))
+        foreach (var tx in txList)
         {
-            return parsed;
+            var elapsed = now - (tx.UpdatedAt ?? tx.CreatedAt);
+            if (elapsed < TimeSpan.FromSeconds(20))
+            {
+                activeVmNames.Add(tx.VmName);
+                continue;
+            }
+
+            var vm = _options.VirtualMachines.FirstOrDefault(v =>
+                string.Equals(v.Name, tx.VmName, StringComparison.OrdinalIgnoreCase));
+            if (vm is null)
+            {
+                activeVmNames.Add(tx.VmName);
+                continue;
+            }
+
+            bool runnerResponded;
+            try
+            {
+                var status = await _guestWorkerClient.GetRunnerStatusAsync(vm, cancellationToken).ConfigureAwait(false);
+                runnerResponded = status.Success;
+            }
+            catch (Exception)
+            {
+                runnerResponded = false;
+            }
+
+            if (runnerResponded)
+            {
+                await _localStore.DeleteSwitchTransactionAsync(tx.TransactionId, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                activeVmNames.Add(tx.VmName);
+            }
         }
 
-        return DateTimeOffset.MaxValue;
+        return activeVmNames;
     }
 
     private static PoolSchedulerCycleResult NoSwitch(string reason)

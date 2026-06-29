@@ -12,6 +12,8 @@ public sealed class VirtualMachineOptions
     public string RunnerStatusUrl { get; set; } = "";
     public string RunnerKillUrl { get; set; } = "";
     public string HostWorkPath { get; set; } = "";
+    public string HostSharedPath { get; set; } = "";
+    public string GuestSharedPath { get; set; } = "";
     public GuestBackupPathsOptions GuestBackupPaths { get; set; } = new();
     public List<ProfileOptions> Profiles { get; set; } = [];
 }

@@ -313,7 +313,7 @@ Agent 启动时必须校验：
 1. `vmrun.exe` 是否存在；
 2. VMX 文件是否存在；
 3. workerId 是否重复；
-4. snapshotName 是否配置；
+4. SnapshotName 是否必填，且是否符合 ProfileId.vYYMMDD.No；
 5. VM 快照是否存在；
 6. 宿主机日志备份目录是否可写；
 7. 调度中心是否可访问；
@@ -462,7 +462,6 @@ GET /api/rpa/worker-task/pending?workerId=SR20-2606-POC1
   "workerId": "SR20-2606-POC1",
   "pendingCount": 3,
   "firstTaskId": 123456,
-  "executionCode": "EXE202606110001",
   "priority": 5
 }
 ```
@@ -690,7 +689,6 @@ GET /executor/health
   "runnerStatusName": "Runnable",
   "runnerStatusDesc": "机器人已启动，准备就绪",
   "currentTaskId": null,
-  "executionCode": null,
   "javaProcessCount": 1,
   "pythonProcessCount": 0,
   "chromeProcessCount": 0,
@@ -715,7 +713,6 @@ GET /worker/status
   "runnerStatusName": "Running",
   "runnerStatusDesc": "机器人正在执行任务中",
   "currentTaskId": 123456,
-  "executionCode": "EXE202606110001",
   "lastHeartbeatTime": "2026-06-11 14:30:00"
 }
 ```
@@ -773,7 +770,6 @@ GET /api/rpa/worker-task/pending?workerId=SR20-2606-POC1
   "workerId": "SR20-2606-POC1",
   "pendingCount": 3,
   "firstTaskId": 123456,
-  "executionCode": "EXE202606110001",
   "priority": 5
 }
 ```
@@ -815,7 +811,6 @@ POST /api/rpa/worker/status
   "runnerStatusName": "Running",
   "runnerStatusDesc": "机器人正在执行任务中",
   "currentTaskId": 123456,
-  "executionCode": "EXE202606110001",
   "lastHeartbeatTime": "2026-06-11 14:30:00"
 }
 ```
@@ -1507,4 +1502,3 @@ runner = Running / Upgrading？
     ↓
 上报状态和异常
 ```
-

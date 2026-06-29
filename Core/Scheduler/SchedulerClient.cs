@@ -1,5 +1,6 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using Seebot.WorkerAgent.Core.Configuration;
 
@@ -7,7 +8,10 @@ namespace Seebot.WorkerAgent.Core.Scheduler;
 
 public sealed class SchedulerClient : ISchedulerClient
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+    };
 
     private readonly HttpClient _httpClient;
     private readonly SchedulerOptions _options;
@@ -23,25 +27,24 @@ public sealed class SchedulerClient : ISchedulerClient
         }
     }
 
-    public async Task<ProfilePendingTaskResponse> QueryPendingTasksAsync(string profileId, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingTasksAsync(string workerId, CancellationToken cancellationToken)
     {
-        var url = BuildUri($"profile-task/pending?profileId={Uri.EscapeDataString(profileId)}");
-        using var request = CreateRequest(HttpMethod.Get, url);
+        var url = BuildUri($"/robot/client/task/findTaskProfileCode/{Uri.EscapeDataString(workerId)}");
+        using var request = CreateRequest(HttpMethod.Post, url);
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         await EnsureSuccessAsync(response, "QueryPendingTasks", cancellationToken);
 
-        var body = await response.Content.ReadFromJsonAsync<ProfilePendingTaskResponse>(JsonOptions, cancellationToken);
-        return body ?? new ProfilePendingTaskResponse();
+        var result = await response.Content.ReadFromJsonAsync<ApiResult<string[]>>(JsonOptions, cancellationToken);
+        var profileIds = result?.Data;
+        return profileIds is null ? [] : profileIds
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => new ProfilePendingTaskResponse { ProfileId = id, HasTask = true })
+            .ToList();
     }
 
-    public Task ReportHeartbeatAsync(HostAgentHeartbeatRequest request, CancellationToken cancellationToken)
+    public Task ReportCapabilitiesAsync(IReadOnlyList<HostProfileCapabilityRequest> request, CancellationToken cancellationToken)
     {
-        return PostAsync("host-agent/heartbeat", request, "ReportHeartbeat", cancellationToken);
-    }
-
-    public Task ReportCapabilitiesAsync(HostAgentCapabilitiesRequest request, CancellationToken cancellationToken)
-    {
-        return PostAsync("host-agent/capabilities", request, "ReportCapabilities", cancellationToken);
+        return PostAsync("/robot/vmProfile/reportSave", request, "ReportCapabilities", cancellationToken);
     }
 
     public Task ReportVmStatusAsync(VmStatusReportRequest request, CancellationToken cancellationToken)
@@ -65,6 +68,25 @@ public sealed class SchedulerClient : ISchedulerClient
         request.Content = JsonContent.Create(payload, options: JsonOptions);
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         await EnsureSuccessAsync(response, operationName, cancellationToken);
+        await EnsureApiSuccessAsync(response, operationName, cancellationToken);
+    }
+
+    private static async Task EnsureApiSuccessAsync(HttpResponseMessage response, string operationName, CancellationToken cancellationToken)
+    {
+        ApiResult<object>? result;
+        try
+        {
+            result = await response.Content.ReadFromJsonAsync<ApiResult<object>>(JsonOptions, cancellationToken);
+        }
+        catch
+        {
+            return;
+        }
+
+        if (result is not null && result.Code != 200)
+        {
+            throw new SchedulerClientException(operationName, response.StatusCode, result.Message ?? $"code={result.Code}");
+        }
     }
 
     private HttpRequestMessage CreateRequest(HttpMethod method, Uri uri)

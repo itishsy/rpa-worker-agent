@@ -1,24 +1,36 @@
-using Seebot.WorkerAgent.Core;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Seebot.WorkerAgent.Core;
+using Seebot.WorkerAgent.Core.Operations;
 
 namespace Seebot.WorkerAgent.Service;
 
 public static class Program
 {
-    public static Task Main(string[] args)
+    public static async Task Main(string[] args)
     {
-        return CreateHostBuilder(args).Build().RunAsync();
+        var builder = CreateWebApplicationBuilder(args);
+        var app = builder.Build();
+        app.MapOperationsApi();
+        await app.RunAsync();
     }
 
-    public static IHostBuilder CreateHostBuilder(string[] args)
+    public static WebApplicationBuilder CreateWebApplicationBuilder(string[] args)
     {
-        return Host.CreateDefaultBuilder(args)
-            .ConfigureServices((context, services) =>
-            {
-                services.AddWorkerAgentConfiguration(context.Configuration);
-                services.AddWorkerAgentCore();
-                services.AddHostedService<WorkerAgent>();
-            });
+        var builder = WebApplication.CreateBuilder(args);
+
+        var listenUrl = builder.Configuration["OperationsApi:ListenUrl"];
+        if (!string.IsNullOrWhiteSpace(listenUrl))
+        {
+            builder.WebHost.UseUrls([listenUrl]);
+        }
+
+        builder.Services.AddWorkerAgentConfiguration(builder.Configuration);
+        builder.Services.AddWorkerAgentCore();
+        builder.Services.AddHostedService<WorkerAgent>();
+
+        return builder;
     }
 }

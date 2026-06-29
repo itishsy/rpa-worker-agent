@@ -67,6 +67,56 @@ CREATE TABLE IF NOT EXISTS local_switch_transaction (
 """, cancellationToken);
     }
 
+    public async Task SeedVmStatesAsync(string hostId, IReadOnlyList<VmCurrentState> initialStates, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        foreach (var state in initialStates)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+INSERT INTO local_vm_state (
+    host_id,
+    vm_name,
+    worker_id,
+    current_profile_id,
+    current_snapshot_name,
+    runner_status_code,
+    runner_status_name,
+    agent_vm_status,
+    last_idle_at,
+    last_switch_at,
+    is_quarantined,
+    error_code,
+    error_message,
+    updated_at
+) VALUES (
+    $host_id,
+    $vm_name,
+    $worker_id,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    $agent_vm_status,
+    NULL,
+    NULL,
+    0,
+    NULL,
+    NULL,
+    $updated_at
+)
+ON CONFLICT(host_id, vm_name) DO NOTHING;
+""";
+            Add(command, "$host_id", hostId);
+            Add(command, "$vm_name", state.VmName);
+            Add(command, "$worker_id", state.WorkerId);
+            Add(command, "$agent_vm_status", AgentVmStatus.UNKNOWN.ToString());
+            Add(command, "$updated_at", Format(state.UpdatedAt));
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
     public async Task UpsertVmStateAsync(string hostId, VmCurrentState state, CancellationToken cancellationToken = default)
     {
         await using var connection = CreateConnection();
@@ -184,6 +234,52 @@ ORDER BY vm_name;
         return states;
     }
 
+    public async Task<VmCurrentState?> GetVmStateAsync(string hostId, string vmName, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+SELECT
+    vm_name,
+    worker_id,
+    current_profile_id,
+    current_snapshot_name,
+    runner_status_code,
+    agent_vm_status,
+    last_idle_at,
+    is_quarantined,
+    error_code,
+    error_message,
+    updated_at
+FROM local_vm_state
+WHERE host_id = $host_id AND vm_name = $vm_name;
+""";
+        Add(command, "$host_id", hostId);
+        Add(command, "$vm_name", vmName);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return new VmCurrentState
+        {
+            VmName = reader.GetString(0),
+            WorkerId = reader.GetString(1),
+            CurrentProfileId = ReadNullableString(reader, 2),
+            CurrentSnapshotName = ReadNullableString(reader, 3),
+            RunnerStatusCode = ReadNullableRunnerStatus(reader, 4),
+            VmStatus = Enum.Parse<AgentVmStatus>(reader.GetString(5)),
+            IdleSince = ReadNullableDateTimeOffset(reader, 6),
+            IsQuarantined = reader.GetInt32(7) == 1,
+            ErrorCode = ReadNullableString(reader, 8),
+            ErrorMessage = ReadNullableString(reader, 9),
+            UpdatedAt = DateTimeOffset.Parse(reader.GetString(10))
+        };
+    }
+
     public async Task CreateSwitchTransactionAsync(SwitchTransaction transaction, CancellationToken cancellationToken = default)
     {
         await using var connection = CreateConnection();
@@ -298,6 +394,16 @@ ORDER BY started_at;
         Add(command, "$host_id", hostId);
 
         return await ReadTransactionsAsync(command, cancellationToken);
+    }
+
+    public async Task DeleteSwitchTransactionAsync(string txId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM local_switch_transaction WHERE tx_id = $tx_id;";
+        Add(command, "$tx_id", txId);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task<SwitchTransaction?> GetSwitchTransactionAsync(string txId, CancellationToken cancellationToken = default)

@@ -19,4 +19,15 @@
     <Compile Remove="WorkerAgent.Designer.cs" />
     <Compile Remove="tests\**\*.cs" />
   </ItemGroup>
+
+  <ItemGroup>
+    <None Include="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EditorConfigFiles Remove="D:\Sourcecode\git\rpa\rpa-worker-agent\rpa-worker-agent\.editorconfig" />
+  </ItemGroup>
 </Project>

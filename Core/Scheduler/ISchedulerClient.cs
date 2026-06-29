@@ -2,11 +2,9 @@ namespace Seebot.WorkerAgent.Core.Scheduler;
 
 public interface ISchedulerClient
 {
-    Task<ProfilePendingTaskResponse> QueryPendingTasksAsync(string profileId, CancellationToken cancellationToken);
+    Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingTasksAsync(string workerId, CancellationToken cancellationToken);
 
-    Task ReportHeartbeatAsync(HostAgentHeartbeatRequest request, CancellationToken cancellationToken);
-
-    Task ReportCapabilitiesAsync(HostAgentCapabilitiesRequest request, CancellationToken cancellationToken);
+    Task ReportCapabilitiesAsync(IReadOnlyList<HostProfileCapabilityRequest> request, CancellationToken cancellationToken);
 
     Task ReportVmStatusAsync(VmStatusReportRequest request, CancellationToken cancellationToken);
 

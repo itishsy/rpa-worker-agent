@@ -12,7 +12,7 @@
 
 - 调度维度使用 `profileId`，不再按 `workerId` 查询任务队列。
 - `workerId` 表示 VM 内 runner 实例身份。
-- `snapshotName` 表示可回滚的 VM 环境版本。
+- `snapshotName` 是必填的版本化 VM profile 快照名，格式为 `ProfileId.vYYMMDD.No`。
 - 一台宿主机可管理多台 VM。
 - 一台 VM 可配置多个 profile 快照。
 - 云后台展示“静态能力 + 当前运行状态”。
@@ -26,7 +26,7 @@
 Agent 负责：
 
 - 管理单台宿主机上的多台 VM。
-- 维护 VM 与 `workerId`、`profileId`、`snapshotName` 的关系。
+- 维护 VM 与 `workerId`、`profileId`、`snapshotName` 的关系，`snapshotName` 必须是 `ProfileId.vYYMMDD.No`。
 - 按 `profileId` 查询云调度队列。
 - 在某个 profile 存在待执行任务时，选择兼容且空闲的 VM。
 - 切换前停止 VM 内 `runner.jar`。
@@ -115,24 +115,24 @@ Agent 只等待和监控状态，不执行 runner 启动命令。
 ```text
 profileId    = rpa-{city}-{business}-{system}
 workerId     = {profileId}-{instance}
-snapshotName = {profileId}-{version}
+snapshotName = {profileId}.v{YYMMDD}.{No}
 ```
 示例：
 
 ```text
 profileId    = rpa-sh-tax-etax
 workerId     = rpa-sh-tax-etax-001
-snapshotName = rpa-sh-tax-etax-v20260615.1
+snapshotName = rpa-sh-tax-etax.v260624.1
 ```
 
 定义：
 
 - `profileId`：任务所需的环境能力画像，例如城市、业务、系统组合。
 - `workerId`：VM 内 runner 实例身份，在宿主机内必须唯一。
-- `snapshotName`：具体的 VM 环境版本。
+- `snapshotName`：VM 快照名，必须配置为 `ProfileId.vYYMMDD.No` 版本化格式。
 - `version`：建议使用 `vYYYYMMDD.N`，便于排序、回滚和审计。
 
-Agent 不要求 `workerId` 与 `snapshotName` 相同。
+Agent 要求 `snapshotName` 必填并以 `profileId` 为前缀；切换快照时使用配置的版本化 `SnapshotName`。
 
 ## 4.1 VM 镜像准备与基础快照命名
 
@@ -154,15 +154,15 @@ VM: SR20-2026-6HQ8
   |
   |-- BaseClean Snapshot:
           |-- General Snapshot: SR20-2026-6HQ8
-          |-- Private Snapshot: rpa-sh-tax-etax-v20260615.1
-          |-- Private Snapshot: rpa-sh-social-portal-v20260615.1
-          |-- Private Snapshot: rpa-bj-tax-etax-v20260615.1
+          |-- Private Snapshot: rpa-sh-tax-etax
+          |-- Private Snapshot: rpa-sh-social-portal
+          |-- Private Snapshot: rpa-bj-tax-etax
 ```
 
 定制 profile 快照要求：
 
 - 每个定制快照对应一个 `profileId` 的可运行环境版本。
-- 定制快照命名仍使用 `snapshotName = {profileId}-{version}`。
+- 定制快照命名必须使用 `snapshotName = ProfileId.vYYMMDD.No`。
 - 定制快照必须从纯净基础快照派生，不允许从另一个业务定制快照继续派生，避免环境污染层层传递。
 - 定制快照内可以包含该 profile 所需的城市配置、业务系统配置、CA/UKey 驱动、浏览器配置、客户端配置和 runner 自启动配置。
 - 定制快照制作完成后，应启动验证 `rpa-client` / `rpa-runner` 能自动启动，并能正确上报 `workerId/profileId`。
@@ -171,7 +171,7 @@ Agent 启动校验只校验：
 
 - 配置的 `BaseSnapshotName` 存在。
 - `BaseSnapshotName` 与 `VmName` 一致。
-- 配置的定制 `snapshotName` 存在。
+- 配置的 `profileId` 同名快照存在。
 - 定制快照的来源关系已由镜像准备流程保证；如果当前 VMware / `vmrun` 无法可靠读取快照父子关系，Agent 只记录配置声明和校验结果，不强行推断快照树。
 
 ## 5. 总体架构
@@ -180,7 +180,7 @@ Agent 启动校验只校验：
 Seebot 云后台 / 调度中心
     |
     |-- 按 profileId 查询待执行任务
-    |-- 接收 Agent 心跳
+    |-- 接收 runner 心跳
     |-- 接收 VM 静态能力
     |-- 接收 VM / worker / profile / runner 当前状态
     |-- 接收快照切换记录
@@ -209,17 +209,17 @@ Windows 宿主机
             |
             |-- VM: SR20-2026-6HQ8
             |     |-- BaseClean
-            |         |-- SR20-2026-6HQ8
-            |         |-- rpa-sh-tax-etax-v20260615.1
-            |         |-- rpa-sh-social-portal-v20260615.1
+            |         |-- General
+            |         |-- DongGuan-CA
+            |         |-- QingDao-CA
             |             |-- rpa-client 自动启动
             |             |-- rpa-runner 自动启动
             |
             |-- VM: SR20-2026-7JK9
                   |-- BaseClean
-                      |-- SR20-2026-7JK9
-                      |-- rpa-sh-tax-etax-v20260615.1
-                      |-- rpa-bj-tax-etax-v20260615.1
+                      |-- General
+                      |-- DongGuan-CA
+                      |-- rpa-bj-tax-etax
                           |-- rpa-client 自动启动
                           |-- rpa-runner 自动启动
 ```
@@ -317,14 +317,14 @@ Windows 宿主机：HOST-SR20-001
         |
         |-- VM: SR20-2026-6HQ8
         |     |-- Base Snapshot: SR20-2026-6HQ8
-        |     |-- Profile Snapshot: rpa-sh-tax-etax-v20260615.1
-        |     |-- Profile Snapshot: rpa-sh-social-portal-v20260615.1
+        |     |-- Profile Snapshot: rpa-sh-tax-etax
+        |     |-- Profile Snapshot: rpa-sh-social-portal
         |     |-- rpa-runner control: http://192.168.100.101:9090
         |
         |-- VM: SR20-2026-7JK9
               |-- Base Snapshot: SR20-2026-7JK9
-              |-- Profile Snapshot: rpa-sh-tax-etax-v20260615.1
-              |-- Profile Snapshot: rpa-bj-tax-etax-v20260615.1
+              |-- Profile Snapshot: rpa-sh-tax-etax
+              |-- Profile Snapshot: rpa-bj-tax-etax
               |-- rpa-runner control: http://192.168.100.102:9090
 ```
 
@@ -377,7 +377,7 @@ WorkerAgent.Service 启动
   ↓
 初始化 SQLite、本地 VM 状态和事务恢复
   ↓
-向云后台上报 host-agent heartbeat
+runner 负责上报 worker heartbeat
   ↓
 向云后台上报 VM profile capability
   ↓
@@ -454,7 +454,6 @@ Agent 只读取状态并上报，不参与任务执行
     "HostId": "SB-VM-001",
     "AgentName": "SR20宿主机Agent",
     "PollIntervalSeconds": 10,
-    "HeartbeatIntervalSeconds": 15,
     "CapabilityReportIntervalSeconds": 300,
     "SwitchTimeoutSeconds": 300,
     "WaitVmReadyTimeoutSeconds": 180,
@@ -501,7 +500,7 @@ Agent 只读取状态并上报，不参与任务执行
       "Profiles": [
         {
           "ProfileId": "general",
-          "SnapshotName": "general-v20260615.1",
+          "SnapshotName": "general.v260624.1",
           "City": "*",
           "Business": "*",
           "System": "*",
@@ -509,7 +508,7 @@ Agent 只读取状态并上报，不参与任务执行
         },
         {
           "ProfileId": "rpa-shanghai-tax-etax",
-          "SnapshotName": "rpa-shanghai-tax-etax-v20260615.1",
+          "SnapshotName": "rpa-shanghai-tax-etax.v260624.1",
           "City": "shanghai",
           "Business": "acc",
           "System": "etax",
@@ -517,7 +516,7 @@ Agent 只读取状态并上报，不参与任务执行
         },
         {
           "ProfileId": "rpa-beijing-social-portal",
-          "SnapshotName": "rpa-beijing-social-portal-v20260615.1",
+          "SnapshotName": "rpa-beijing-social-portal.v260624.1",
           "City": "beijing",
           "Business": "soc",
           "System": "portal",
@@ -541,7 +540,7 @@ Agent 启动时必须校验：
 6. `BaseSnapshotName` 是否配置。
 7. `BaseSnapshotName` 是否与 `VmName` 一致。
 8. `vmrun listSnapshots` 是否能查询到纯净基础快照。
-9. `snapshotName` 是否配置。
+9. `SnapshotName` 是否必填，且是否符合 `ProfileId.vYYMMDD.No`。
 10. `vmrun listSnapshots` 是否能查询到配置的定制快照。
 11. VM 内 `GuestBackupPaths` 是否配置了 `cache`、`db`、`file`、`logs`。
 12. 宿主机 `HostWorkPath` 是否可写。
@@ -686,10 +685,10 @@ Agent 必须兼容并直接使用原有 runner 0-8 状态：
 5. 校验 VMX 文件
 6. 查询并校验 VM 纯净基础快照
 7. 查询并校验 VM 定制 profile 快照
-8. 校验 workerId / profileId / snapshotName 映射
+8. 校验 workerId / profileId / snapshotName 映射，snapshotName 使用版本化格式
 9. 上报 VM 静态能力
 10. 恢复上次未完成切换事务
-11. 上报 Agent 心跳
+11. 上报 VM 当前状态
 12. 进入 profile 调度轮询
 ```
 
@@ -809,7 +808,7 @@ vmrun stop "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx" hard
 ### 12.3 回滚快照
 
 ```bat
-vmrun revertToSnapshot "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx" "rpa-sh-tax-etax-v20260615.1"
+vmrun revertToSnapshot "D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx" "rpa-sh-tax-etax"
 ```
 
 ### 12.4 启动 VM
@@ -885,7 +884,6 @@ GET /api/robot/start/status
   "runnerStatusName": "Running",
   "runnerStatusDesc": "机器人正在执行任务中",
   "currentTaskId": 123456,
-  "executionCode": "EXE202606170001",
   "javaProcessCount": 1,
   "pythonProcessCount": 0,
   "chromeProcessCount": 0,
@@ -967,7 +965,6 @@ GET /api/rpa/profile-task/pending?profileId=rpa-sh-tax-etax
   "profileId": "rpa-sh-tax-etax",
   "pendingCount": 100,
   "firstTaskId": 123456,
-  "executionCode": "EXE202606170001",
   "priority": 5,
   "oldestQueuedAt": "2026-06-17 09:30:00"
 }
@@ -980,25 +977,9 @@ GET /api/rpa/profile-task/pending?profileId=rpa-sh-tax-etax
 - 实际任务拉取仍由 VM 内 `rpa-runner` 完成。
 - 调度中心需保证同一 profile 下多 runner 并发领取任务不会重复消费。
 
-### 14.2 上报 Agent 心跳
+### 14.2 runner 心跳说明
 
-```http
-POST /api/rpa/host-agent/heartbeat
-```
-
-请求：
-
-```json
-{
-  "hostId": "HOST-SR20-001",
-  "agentName": "SR20宿主机Agent",
-  "status": "RUNNING",
-  "vmCount": 5,
-  "quarantinedVmCount": 1,
-  "version": "1.0.0",
-  "timestamp": "2026-06-17 10:00:00"
-}
-```
+WorkerAgent 不上报宿主机 heartbeat。VM 内 `rpa-runner` 已负责 worker 心跳上报，云后台在线状态应以 runner 心跳为准。WorkerAgent 只上报 VM profile 能力、VM 当前状态、切换记录和目录备份结果。
 
 ### 14.3 上报 VM profile 能力
 
@@ -1007,40 +988,30 @@ POST /api/rpa/host-agent/heartbeat
 能力上报描述“这台 VM 能运行什么”，不表示这些 profile 当前正在运行。
 
 ```http
-POST /api/rpa/host-agent/capabilities
+POST robot/vmProfile/reportSave
 ```
 
 请求：
 
 ```json
-{
-  "hostId": "HOST-SR20-001",
-  "agentName": "SR20宿主机Agent",
-  "reportedAt": "2026-06-17 10:00:00",
-  "vms": [
-    {
-      "vmName": "SR20-2026-6HQ8",
-      "workerId": "rpa-sh-tax-etax-001",
-      "vmxPath": "D:\\VMs\\SR20-2026-6HQ8\\SR20-2026-6HQ8.vmx",
-      "baseSnapshotName": "SR20-2026-6HQ8",
-      "enabled": true,
-      "isQuarantined": false,
-      "profiles": [
-        {
-          "profileId": "rpa-sh-tax-etax",
-          "snapshotName": "rpa-sh-tax-etax-v20260615.1",
-          "city": "sh",
-          "business": "tax",
-          "system": "etax",
-          "enabled": true,
-          "snapshotExists": true,
-          "validationStatus": "READY"
-        }
-      ]
-    }
-  ]
-}
+[
+  {
+    "hostName": "SR20宿主机Agent",
+    "machineCode": "rpa-sh-tax-etax-001",
+    "profileId": "rpa-sh-tax-etax",
+    "profileName": "上海税务电子税局",
+    "snapshotName": "rpa-sh-tax-etax.v260624.1"
+  }
+]
 ```
+
+字段说明：
+
+- `hostName`：宿主机名称，来自 `Agent.AgentName`，为空时回退 `Agent.HostId`。
+- `machineCode`：盒子编码，来自 VM `WorkerId`，为空时回退 VM `Name`。
+- `profileId`：环境画像 Id。
+- `profileName`：环境画像名称，来自 `ProfileName`。
+- `snapshotName`：对应快照名称，必须为 `ProfileId.vYYMMDD.No` 格式。
 
 触发时机：
 
@@ -1064,13 +1035,12 @@ POST /api/rpa/vm/status
   "vmName": "SR20-2026-6HQ8",
   "workerId": "rpa-sh-tax-etax-001",
   "currentProfileId": "rpa-sh-tax-etax",
-  "currentSnapshotName": "rpa-sh-tax-etax-v20260615.1",
+  "currentSnapshotName": "rpa-sh-tax-etax.v260624.1",
   "agentVmStatus": "MONITORING",
   "runnerStatusCode": 1,
   "runnerStatusName": "Runnable",
   "runnerStatusDesc": "机器人已启动，准备就绪",
   "currentTaskId": null,
-  "executionCode": null,
   "isQuarantined": false,
   "lastSwitchAt": "2026-06-17 09:50:00",
   "lastHeartbeatTime": "2026-06-17 10:00:00"
@@ -1079,9 +1049,8 @@ POST /api/rpa/vm/status
 
 触发时机：
 
-- Agent 心跳时上报。
-- VM 状态变化时立即上报。
-- runner 状态变化时立即上报。
+- WorkerAgent 不处理 heartbeat 或周期 VM 状态心跳上报。
+- worker 心跳与 runner 状态变化由 VM 内 runner 上报。
 - 隔离状态变化时立即上报。
 - 切换事务状态变化时立即上报。
 
@@ -1100,9 +1069,9 @@ POST /api/rpa/worker/switch-log
   "vmName": "SR20-2026-6HQ8",
   "workerId": "rpa-sh-tax-etax-001",
   "fromProfileId": "rpa-sh-social-portal",
-  "fromSnapshotName": "rpa-sh-social-portal-v20260615.1",
+  "fromSnapshotName": "rpa-sh-social-portal.v260624.1",
   "toProfileId": "rpa-sh-tax-etax",
-  "toSnapshotName": "rpa-sh-tax-etax-v20260615.1",
+  "toSnapshotName": "rpa-sh-tax-etax.v260624.1",
   "firstTaskId": 123456,
   "status": "SUCCESS",
   "startedAt": "2026-06-17 09:45:00",
@@ -1421,7 +1390,7 @@ CREATE TABLE rpa_worker_log_backup (
 
 - VM 基础信息。
 - 当前运行状态。
-- 支持的所有 `profileId/snapshotName` 能力清单。
+- 支持的所有 `profileId/snapshotName` 能力清单，`snapshotName` 使用版本化格式。
 - 每个快照的启动校验结果。
 - 最近切换记录。
 - 最近目录备份记录。
@@ -1463,9 +1432,9 @@ D:\seebot-agent\work\
   "vmName": "SR20-2026-6HQ8",
   "workerId": "rpa-sh-tax-etax-001",
   "fromProfileId": "rpa-sh-social-portal",
-  "fromSnapshotName": "rpa-sh-social-portal-v20260615.1",
+  "fromSnapshotName": "rpa-sh-social-portal.v260624.1",
   "toProfileId": "rpa-sh-tax-etax",
-  "toSnapshotName": "rpa-sh-tax-etax-v20260615.1",
+  "toSnapshotName": "rpa-sh-tax-etax.v260624.1",
   "firstTaskId": 123456,
   "backupTime": "2026-06-17 10:00:00",
   "workPath": "D:\\seebot-agent\\work",
@@ -1690,7 +1659,7 @@ sc start Seebot.WorkerAgent.Service
 ```text
 1. 支持多 VM 配置
 2. 支持每台 VM 多 profile/snapshot 配置
-3. 校验 workerId/profileId/snapshotName
+3. 校验 workerId/profileId/snapshotName，snapshotName 使用版本化格式
 4. 上报 VM profile 静态能力
 5. 上报 VM 当前运行状态
 ```
@@ -1710,14 +1679,13 @@ sc start Seebot.WorkerAgent.Service
 1. Agent 能按 profileId 查询待执行任务
 2. 有任务时触发 VM 空闲判断
 3. 无任务时继续监控
-4. 能上报 Agent 心跳
+4. 能上报 VM 当前状态
 ```
 
 交付物：
 
 - `SchedulerClient`。
 - profile pending 查询接口。
-- Agent 心跳接口。
 - VM 状态上报接口。
 
 ### 阶段 4：runner 状态监控
@@ -1808,7 +1776,7 @@ sc start Seebot.WorkerAgent.Service
 
 1. `appsettings.json` 配置加载。
 2. 多 VM 配置模型。
-3. `profileId / workerId / snapshotName` 三层模型。
+3. `profileId / workerId / snapshotName` 模型，`snapshotName` 使用版本化格式。
 4. `vmrun` 命令封装。
 5. 快照存在性校验。
 6. VM profile 能力上报。
@@ -1854,8 +1822,8 @@ sc start Seebot.WorkerAgent.Service
 | ------------- | ---------------------------------------------------------------------------------- |
 | Agent 服务      | 可作为 Windows Service 启动                                                             |
 | 多 VM 配置       | 可加载并校验多台 VM                                                                        |
-| 多 profile 配置  | 每台 VM 可声明多个 `profileId/snapshotName`                                               |
-| 命名模型          | 支持 `profileId / workerId / snapshotName` 三层模型                                      |
+| 多 profile 配置  | 每台 VM 可声明多个 `profileId/snapshotName`，`snapshotName` 使用版本化格式                                               |
+| 命名模型          | 支持 `profileId / workerId / snapshotName` 模型，`snapshotName` 使用版本化格式                                      |
 | 镜像准备前置        | Agent 启动前已完成 VM、纯净基础快照和定制 profile 快照准备                                             |
 | 纯净基础快照        | 每台 VM 存在一个与 VM 同名的 `BaseSnapshotName`                                              |
 | 快照派生规则        | 每个定制 profile 快照均基于该 VM 的纯净基础快照制作                                                   |

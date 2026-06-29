@@ -66,16 +66,18 @@ public sealed class StartupValidator : IStartupValidator
 
             foreach (var profile in vm.Profiles)
             {
-                var snapshotExists = ContainsSnapshot(snapshots, profile.SnapshotName);
+                var snapshotName = profile.SnapshotName;
+                var snapshotExists = ContainsSnapshot(snapshots, snapshotName);
                 if (!snapshotExists)
                 {
-                    errors.Add($"Profile snapshot does not exist for VM {vm.Name}, profile {profile.ProfileId}: {profile.SnapshotName}");
+                    errors.Add($"Profile snapshot does not exist for VM {vm.Name}, profile {profile.ProfileId}: {snapshotName}");
                 }
 
                 vmCapability.Profiles.Add(new ProfileCapabilityDto
                 {
                     ProfileId = profile.ProfileId,
-                    SnapshotName = profile.SnapshotName,
+                    ProfileName = profile.ProfileName,
+                    SnapshotName = snapshotName,
                     Enabled = true,
                     SnapshotExists = snapshotExists,
                     ValidationStatus = snapshotExists ? Ready : Missing,

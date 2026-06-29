@@ -1,6 +1,7 @@
 using System.Net.Http.Json;
 using System.Text.Json;
 using Seebot.WorkerAgent.Core.Configuration;
+using Seebot.WorkerAgent.Core.Domain;
 
 namespace Seebot.WorkerAgent.Core.Guest;
 
@@ -21,7 +22,17 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
         {
             using var response = await _httpClient.GetAsync(vm.RunnerStatusUrl, cancellationToken);
             await EnsureSuccessAsync(response, "GetRunnerStatus", vm.RunnerStatusUrl, cancellationToken);
-            return await ReadJsonAsync<RunnerStatusResponse>(response, "GetRunnerStatus", vm.RunnerStatusUrl, cancellationToken);
+
+            var result = await ReadJsonAsync<ApiResult<int>>(response, "GetRunnerStatus", vm.RunnerStatusUrl, cancellationToken);
+            var statusCode = Enum.IsDefined(typeof(RunnerStatusCode), result.Data)
+                ? (RunnerStatusCode)result.Data
+                : RunnerStatusCode.Offline;
+
+            return new RunnerStatusResponse
+            {
+                Success = true,
+                RunnerStatusCode = statusCode
+            };
         }
         catch (GuestWorkerClientException)
         {
@@ -51,7 +62,14 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
 
             using var response = await _httpClient.PostAsync(vm.RunnerKillUrl, request, cancellationToken);
             await EnsureSuccessAsync(response, "KillRunner", vm.RunnerKillUrl, cancellationToken);
-            return await ReadJsonAsync<KillRunnerResponse>(response, "KillRunner", vm.RunnerKillUrl, cancellationToken);
+
+            var result = await ReadJsonAsync<ApiResult<int>>(response, "KillRunner", vm.RunnerKillUrl, cancellationToken);
+            return new KillRunnerResponse
+            {
+                Success = result.Data == 0,
+                ErrorCode = result.Data == 0 ? null : ErrorCodes.ExecutorStopFailed,
+                Message = result.Data == 0 ? result.Message : $"Kill runner failed, data={result.Data}"
+            };
         }
         catch (GuestWorkerClientException)
         {
@@ -97,5 +115,12 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
         }
 
         return body;
+    }
+
+    private sealed class ApiResult<T>
+    {
+        public int Code { get; set; }
+        public string? Message { get; set; }
+        public T Data { get; set; } = default!;
     }
 }

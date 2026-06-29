@@ -1,49 +1,32 @@
-using System.Globalization;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Scheduler;
-using Seebot.WorkerAgent.Core.Startup;
 
 namespace Seebot.WorkerAgent.Core.Reporting;
 
 public sealed class CapabilityReportService : BackgroundService
 {
     private readonly ISchedulerClient _schedulerClient;
-    private readonly IStartupValidator _startupValidator;
     private readonly WorkerAgentOptions _options;
     private readonly ILogger<CapabilityReportService> _logger;
-    private readonly TimeProvider _timeProvider;
 
     public CapabilityReportService(
         ISchedulerClient schedulerClient,
-        IStartupValidator startupValidator,
         WorkerAgentOptions options,
-        ILogger<CapabilityReportService> logger,
-        TimeProvider? timeProvider = null)
+        ILogger<CapabilityReportService> logger)
     {
         _schedulerClient = schedulerClient;
-        _startupValidator = startupValidator;
         _options = options;
         _logger = logger;
-        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public async Task ReportOnceAsync(CancellationToken cancellationToken)
     {
         try
         {
-            var reportedAt = _timeProvider.GetUtcNow().ToString("O", CultureInfo.InvariantCulture);
-            var validation = await _startupValidator
-                .ValidateAndBuildCapabilitiesAsync(_options, reportedAt, cancellationToken)
-                .ConfigureAwait(false);
-
-            if (!validation.IsValid)
-            {
-                _logger.LogWarning("Startup capability validation completed with errors: {Errors}", string.Join("; ", validation.Errors));
-            }
-
-            await _schedulerClient.ReportCapabilitiesAsync(validation.Capabilities, cancellationToken).ConfigureAwait(false);
+            var capabilities = BuildProfileCapabilities();
+            await _schedulerClient.ReportCapabilitiesAsync(capabilities, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -60,7 +43,14 @@ public sealed class CapabilityReportService : BackgroundService
         while (!stoppingToken.IsCancellationRequested)
         {
             await ReportOnceAsync(stoppingToken).ConfigureAwait(false);
-            await Task.Delay(GetInterval(), _timeProvider, stoppingToken).ConfigureAwait(false);
+            try
+            {
+                await Task.Delay(GetInterval(), stoppingToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
         }
     }
 
@@ -70,5 +60,30 @@ public sealed class CapabilityReportService : BackgroundService
             ? _options.Agent.CapabilityReportIntervalSeconds
             : 300;
         return TimeSpan.FromSeconds(seconds);
+    }
+
+    private IReadOnlyList<HostProfileCapabilityRequest> BuildProfileCapabilities()
+    {
+        var hostName = FirstNonEmpty(_options.Agent.AgentName, _options.Agent.HostId);
+
+        return _options.VirtualMachines
+            .SelectMany(vm =>
+            {
+                var machineCode = FirstNonEmpty(vm.WorkerId, vm.Name);
+                return vm.Profiles.Select(profile => new HostProfileCapabilityRequest
+                {
+                    HostName = hostName,
+                    MachineCode = machineCode,
+                    ProfileId = profile.ProfileId,
+                    ProfileName = FirstNonEmpty(profile.ProfileName, profile.ProfileId),
+                    SnapshotName = profile.SnapshotName
+                });
+            })
+            .ToList();
+    }
+
+    private static string FirstNonEmpty(params string[] values)
+    {
+        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "";
     }
 }

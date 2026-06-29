@@ -11,7 +11,6 @@ public sealed class RunnerStatusResponse
     public string RunnerStatusName { get; set; } = "";
     public string? RunnerStatusDesc { get; set; }
     public long? CurrentTaskId { get; set; }
-    public string? ExecutionCode { get; set; }
     public int JavaProcessCount { get; set; }
     public int PythonProcessCount { get; set; }
     public int ChromeProcessCount { get; set; }

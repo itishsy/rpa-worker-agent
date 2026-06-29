@@ -106,8 +106,7 @@ public sealed class VmSwitchService : IVmSwitchService
 
         await UpdateAsync(tx, SwitchTransactionStatus.VM_START_DONE, "vm-start-done", null, null, request.Timestamp, cancellationToken);
 
-        var readyStatus = await _guestWorkerClient.GetRunnerStatusAsync(request.Vm, cancellationToken);
-        var ready = WorkerStateEvaluator.EvaluateReadyAfterVmStart(readyStatus.RunnerStatusCode);
+        var (readyStatus, ready) = await WaitUntilRunnerReadyAsync(request.Vm, cancellationToken);
         if (ready.Kind != WorkerReadyEvaluationKind.Ready)
         {
             return await FailAsync(tx, ready.ErrorCode ?? ErrorCodes.VmReadyTimeout, "Runner was not ready after VM start.", request.Timestamp, cancellationToken);
@@ -119,6 +118,18 @@ public sealed class VmSwitchService : IVmSwitchService
         }
 
         await UpdateAsync(tx, SwitchTransactionStatus.WORKER_READY_DONE, "worker-ready-done", null, null, request.Timestamp, cancellationToken);
+
+        await _localStore.UpsertVmStateAsync(request.HostId, new VmCurrentState
+        {
+            VmName = request.Vm.Name,
+            WorkerId = request.Vm.WorkerId,
+            VmStatus = AgentVmStatus.MONITORING,
+            CurrentProfileId = request.TargetProfileId,
+            CurrentSnapshotName = request.TargetSnapshotName,
+            RunnerStatusCode = readyStatus.RunnerStatusCode,
+            UpdatedAt = request.Timestamp
+        }, cancellationToken);
+
         await UpdateAsync(tx, SwitchTransactionStatus.SUCCESS, "success", null, null, request.Timestamp, cancellationToken);
 
         return new VmSwitchResult
@@ -147,6 +158,32 @@ public sealed class VmSwitchService : IVmSwitchService
             CreatedAt = request.Timestamp,
             UpdatedAt = request.Timestamp
         };
+    }
+
+    private async Task<(RunnerStatusResponse Status, WorkerReadyEvaluation Evaluation)> WaitUntilRunnerReadyAsync(
+        VirtualMachineOptions vm,
+        CancellationToken cancellationToken)
+    {
+        var timeoutSeconds = _options.Agent.WaitVmReadyTimeoutSeconds > 0 ? _options.Agent.WaitVmReadyTimeoutSeconds : 180;
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(timeoutSeconds);
+
+        while (true)
+        {
+            var status = await _guestWorkerClient.GetRunnerStatusAsync(vm, cancellationToken).ConfigureAwait(false);
+            var evaluation = WorkerStateEvaluator.EvaluateReadyAfterVmStart(status.RunnerStatusCode);
+
+            if (evaluation.Kind != WorkerReadyEvaluationKind.Wait)
+            {
+                return (status, evaluation);
+            }
+
+            if (DateTimeOffset.UtcNow >= deadline)
+            {
+                return (status, new WorkerReadyEvaluation(WorkerReadyEvaluationKind.Error, ErrorCodes.VmReadyTimeout));
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private static bool MatchesExpectedWorker(VmSwitchRequest request, RunnerStatusResponse readyStatus)

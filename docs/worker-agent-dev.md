@@ -49,7 +49,7 @@ P0 必须实现：
 
 - `appsettings.json` 配置加载。
 - 多 VM 配置模型。
-- `profileId / workerId / snapshotName` 三层模型。
+- `profileId / workerId / snapshotName` 模型，`snapshotName` 使用版本化格式。
 - VM 纯净基础快照 `BaseSnapshotName` 校验。
 - VM 定制 profile 快照校验。
 - `vmrun` 命令封装。
@@ -64,7 +64,7 @@ P0 必须实现：
 - VM stop / revert / start。
 - VM 启动后 Runnable / Running 状态判断。
 - 本地 SQLite 事务表。
-- Agent 心跳和状态上报。
+- VM 状态上报。worker 心跳由 VM 内 runner 上报，WorkerAgent 不处理 heartbeat。
 
 P0 不实现：
 
@@ -163,7 +163,7 @@ P0 不实现：
   - RunnerKillUrl 非空且端口应为 9090。
   - GuestBackupPaths 包含 Cache、Db、File、Logs。
   - HostWorkPath 非空。
-  - 每个 Profile 的 ProfileId、SnapshotName 非空。
+  - 每个 Profile 的 ProfileId、SnapshotName 非空；SnapshotName 必须符合 ProfileId.vYYMMDD.No。
   - 同一 VM 内 ProfileId 不重复。
   - 宿主机内 WorkerId 不重复。
 
@@ -391,11 +391,10 @@ P0 不实现：
 本步骤目标：
 实现 SchedulerClient，支持 P0 所需云后台交互：
 1. 查询 profile 待执行任务。
-2. 上报 Agent 心跳。
-3. 上报 VM profile 能力。
-4. 上报 VM 当前运行状态。
-5. 上报 switch-log。
-6. 上报目录备份结果。
+2. 上报 VM profile 能力。
+3. 上报 VM 当前运行状态。
+4. 上报 switch-log。
+5. 上报目录备份结果。
 
 接口要求：
 - profile 待执行任务查询按 profileId，不按 workerId。
@@ -404,8 +403,7 @@ P0 不实现：
 
 需要实现的 DTO：
 - ProfilePendingTaskResponse。
-- HostAgentHeartbeatRequest。
-- HostAgentCapabilitiesRequest。
+- HostProfileCapabilityRequest。
 - VmStatusReportRequest。
 - WorkerSwitchLogRequest。
 - DirectoryBackupResultRequest。
@@ -418,8 +416,7 @@ P0 不实现：
 测试要求：
 - 使用 fake HttpMessageHandler。
 - pending 查询 URL 包含 profileId。
-- 心跳请求 JSON 字段正确。
-- 能力上报包含 vms/profiles/baseSnapshotName。
+- 能力上报为 List，元素包含 hostName、machineCode、profileId、profileName、snapshotName。
 - VM 状态上报包含 currentProfileId/currentSnapshotName/runnerStatusCode。
 - 目录备份结果包含 backedUpDirectories。
 - 非成功 HTTP 状态返回可诊断错误。
@@ -565,7 +562,7 @@ kill 规则：
 - 调用 IVmrunService.ListSnapshotsAsync 获取快照列表。
 - 校验 BaseSnapshotName 存在。
 - 校验 BaseSnapshotName 与 VmName 一致。
-- 校验每个 Profile.SnapshotName 存在。
+- 校验每个 ProfileId 对应的同名快照存在。
 - 生成 capability：
   - hostId
   - agentName
@@ -703,39 +700,31 @@ kill 规则：
 - 调度器不按任务数计算目标容量。
 ```
 
-## 开发提示词 13：Agent 心跳、能力上报与当前状态上报后台服务
+## 开发提示词 13：能力上报与当前状态上报后台服务
 
 ```text
 请实现 P0 第 13 步：后台上报服务。
 
 先阅读 docs/worker-agent-design.md：
-- 第 14.2 上报 Agent 心跳
 - 第 14.3 上报 VM profile 能力
 - 第 14.4 上报 VM 当前运行状态
 
 本步骤目标：
 实现 Agent 启动后对云后台的基础上报：
-1. Agent heartbeat。
-2. VM profile capability。
-3. VM current status。
+1. VM profile capability。
+2. WorkerAgent 不处理 heartbeat 或周期 VM current status；worker 心跳由 VM 内 runner 上报。
 
 需要实现的内容：
-- HeartbeatBackgroundService。
 - CapabilityReportService 或在启动校验后触发能力上报。
-- VmStatusReportService。
 - 使用 SchedulerClient 上报。
-- 使用 LocalStore 或内存状态提供 VM 当前状态。
 - 上报失败要记录日志，但不能导致 Agent 进程崩溃。
 
 上报时机：
 - 启动完成配置校验后上报 capability。
-- 按 HeartbeatIntervalSeconds 上报 heartbeat。
-- VM 状态变化后上报 current status。
-- P0 可使用周期上报 current status，状态变化即时上报可留到后续优化，但接口和服务边界要预留。
+- WorkerAgent 不上报 heartbeat；runner 已有心跳上报。
 
 测试要求：
-- heartbeat 定时调用 SchedulerClient。
-- capability 上报包含所有 VM 和 profiles。
+- capability 上报包含所有 VM/Profile 展平后的 List 项。
 - VM status 上报包含 currentProfileId/currentSnapshotName/runnerStatusCode。
 - SchedulerClient 抛异常时服务记录失败并继续运行。
 
@@ -824,7 +813,7 @@ P0 完成时应满足：
 - 能执行 vmrun stop/revert/start。
 - 能等待 runner Runnable 或 Running。
 - 能持久化本地事务。
-- 能上报心跳、能力、VM 当前状态、切换记录、目录备份结果。
+- 能上报能力、VM 当前状态、切换记录、目录备份结果；worker 心跳由 runner 上报。
 - 不启动 runner。
 - 不执行 RPA 任务。
 - 不管理 lease。
