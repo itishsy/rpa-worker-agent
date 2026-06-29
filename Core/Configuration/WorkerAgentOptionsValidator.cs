@@ -30,6 +30,7 @@ public static class WorkerAgentOptionsValidator
             Require(vm.RunnerStatusUrl, $"{vmPath}.RunnerStatusUrl", errors);
             Require(vm.RunnerKillUrl, $"{vmPath}.RunnerKillUrl", errors);
             Require(vm.HostWorkPath, $"{vmPath}.HostWorkPath", errors);
+            Require(vm.GuestWorkPath, $"{vmPath}.GuestWorkPath", errors);
 
             if (!string.IsNullOrWhiteSpace(vm.WorkerId) && !workerIds.Add(vm.WorkerId))
             {

@@ -7,7 +7,7 @@ namespace Seebot.WorkerAgent.Core.Backup;
 
 public sealed class LogBackupService : ILogBackupService
 {
-    private static readonly string[] DirectoryNames = ["cache", "db", "file", "logs"];
+    private static readonly string[] DirectoryNames = ["db", "logs", "cache", "file"];
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = true
@@ -26,30 +26,33 @@ public sealed class LogBackupService : ILogBackupService
         DateTimeOffset timestamp,
         CancellationToken cancellationToken)
     {
-        var targetPath = Path.Combine(vm.HostWorkPath, vm.Name, timestamp.ToString("yyyyMMddHHmmss"));
+        var timestampTag = timestamp.ToString("yyyyMMddHHmmss");
+        var targetPath = Path.Combine(vm.HostWorkPath, vm.Name, timestampTag);
         Directory.CreateDirectory(targetPath);
+
+        var guestZipPath = Path.Combine(vm.GuestWorkPath, $"{timestampTag}.zip").Replace('/', '\\');
+        var hostScriptPath = Path.Combine(targetPath, $"{timestampTag}_backup.ps1");
 
         string? errorMessage = null;
         var success = false;
+        long totalBytes = 0;
 
         try
         {
-            foreach (var source in BuildSources(vm))
+            await CompressOnGuestAsync(vm, guestZipPath, timestampTag, hostScriptPath, cancellationToken).ConfigureAwait(false);
+
+            var hostZipPath = Path.Combine(targetPath, $"{timestampTag}.zip");
+            await _vmrunService.CopyFileFromGuestToHostAsync(
+                vm.VmxPath,
+                vm.GuestUser,
+                vm.GuestPasswordSecret,
+                guestZipPath,
+                hostZipPath,
+                cancellationToken).ConfigureAwait(false);
+
+            if (File.Exists(hostZipPath))
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var hostStagingPath = GuestPathToHostShared(source.GuestPath, vm.GuestSharedPath, vm.HostSharedPath);
-
-                await _vmrunService.CopyFileFromGuestToHostAsync(
-                    vm.VmxPath,
-                    vm.GuestUser,
-                    vm.GuestPasswordSecret,
-                    source.GuestPath,
-                    hostStagingPath,
-                    cancellationToken).ConfigureAwait(false);
-
-                var hostDestPath = Path.Combine(targetPath, source.Name);
-                CopyDirectory(hostStagingPath, hostDestPath);
+                totalBytes = new FileInfo(hostZipPath).Length;
             }
 
             success = true;
@@ -63,14 +66,12 @@ public sealed class LogBackupService : ILogBackupService
             errorMessage = exception.Message;
         }
 
-        var fileCount = CountFiles(targetPath);
-        var totalBytes = SumFileBytes(targetPath);
         var result = new LogBackupResult
         {
             TxId = transaction.TransactionId,
             TargetPath = targetPath,
             Directories = DirectoryNames,
-            FileCount = fileCount,
+            FileCount = success ? 1 : 0,
             TotalBytes = totalBytes,
             Success = success,
             ErrorCode = success ? null : ErrorCodes.LogBackupFailed,
@@ -82,7 +83,9 @@ public sealed class LogBackupService : ILogBackupService
             transaction,
             timestamp,
             targetPath,
-            fileCount,
+            guestZipPath,
+            timestampTag,
+            result.FileCount,
             totalBytes,
             success,
             result.ErrorCode,
@@ -92,55 +95,74 @@ public sealed class LogBackupService : ILogBackupService
         return result;
     }
 
-    private static IReadOnlyList<BackupSource> BuildSources(VirtualMachineOptions vm)
+    private async Task CompressOnGuestAsync(
+        VirtualMachineOptions vm,
+        string guestZipPath,
+        string timestampTag,
+        string hostScriptPath,
+        CancellationToken cancellationToken)
     {
-        return
-        [
-            new BackupSource("cache", vm.GuestBackupPaths.Cache),
-            new BackupSource("db", vm.GuestBackupPaths.Db),
-            new BackupSource("file", vm.GuestBackupPaths.File),
-            new BackupSource("logs", vm.GuestBackupPaths.Logs)
-        ];
+        var sourceLines = string.Join("," + Environment.NewLine, DirectoryNames.Select(d =>
+        {
+            var fullPath = Path.Combine(vm.GuestWorkPath, d).Replace('/', '\\');
+            return $"    [pscustomobject]@{{ Name = '{EscapePowerShellSingleQuotedString(d)}'; Path = '{EscapePowerShellSingleQuotedString(fullPath)}' }}";
+        }));
+        var guestTimestampPath = Path.Combine(vm.GuestWorkPath, timestampTag).Replace('/', '\\');
+
+        var script = $@"$ErrorActionPreference = 'Stop'
+$zipPath = '{EscapePowerShellSingleQuotedString(guestZipPath)}'
+$timestampPath = '{EscapePowerShellSingleQuotedString(guestTimestampPath)}'
+$sources = @(
+{sourceLines}
+)
+if (Test-Path -LiteralPath $timestampPath) {{
+    Remove-Item -LiteralPath $timestampPath -Recurse -Force
+}}
+New-Item -ItemType Directory -Path $timestampPath -Force | Out-Null
+
+$copiedDirectoryCount = 0
+foreach ($source in $sources) {{
+    if (-not (Test-Path -LiteralPath $source.Path)) {{
+        continue
+    }}
+
+    $destinationPath = Join-Path $timestampPath $source.Name
+    New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
+    $items = Get-ChildItem -LiteralPath $source.Path -Force
+    if ($items.Count -gt 0) {{
+        Copy-Item -LiteralPath $items.FullName -Destination $destinationPath -Recurse -Force
+    }}
+    $copiedDirectoryCount++
+}}
+
+if ($copiedDirectoryCount -eq 0) {{
+    exit 1
+}}
+if (Test-Path -LiteralPath $zipPath) {{
+    Remove-Item -LiteralPath $zipPath -Force
+}}
+Compress-Archive -Path $timestampPath -DestinationPath $zipPath -Force
+";
+
+        // 保存脚本到 host 供审计
+        await File.WriteAllTextAsync(hostScriptPath, script, System.Text.Encoding.UTF8, cancellationToken)
+            .ConfigureAwait(false);
+
+        // -EncodedCommand 传入 UTF-16LE Base64，完全绕过执行策略和命令行转义
+        var encodedCommand = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
+
+        await _vmrunService.RunProgramInGuestAsync(
+            vm.VmxPath,
+            vm.GuestUser,
+            vm.GuestPasswordSecret,
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            ["-NonInteractive", "-EncodedCommand", encodedCommand],
+            cancellationToken).ConfigureAwait(false);
     }
 
-    // 将 Guest 路径转换为 Host 侧共享目录的对应路径
-    // 例：GuestSharedPath=C:\seebot  HostSharedPath=D:\work\shared
-    //     guestPath=C:\seebot\cache  → D:\work\shared\cache
-    private static string GuestPathToHostShared(string guestPath, string guestSharedPath, string hostSharedPath)
+    private static string EscapePowerShellSingleQuotedString(string value)
     {
-        var guestNorm = guestSharedPath.TrimEnd('\\', '/');
-        var pathNorm = guestPath.TrimEnd('\\', '/');
-
-        if (!pathNorm.StartsWith(guestNorm, StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidOperationException(
-                $"Guest path '{guestPath}' is not under GuestSharedPath '{guestSharedPath}'.");
-        }
-
-        var relative = pathNorm.Length > guestNorm.Length
-            ? pathNorm[(guestNorm.Length + 1)..]
-            : "";
-
-        return string.IsNullOrEmpty(relative)
-            ? hostSharedPath
-            : Path.Combine(hostSharedPath, relative);
-    }
-
-    private static void CopyDirectory(string sourcePath, string destPath)
-    {
-        if (!Directory.Exists(sourcePath))
-        {
-            return;
-        }
-
-        Directory.CreateDirectory(destPath);
-        foreach (var file in Directory.EnumerateFiles(sourcePath, "*", SearchOption.AllDirectories))
-        {
-            var relative = Path.GetRelativePath(sourcePath, file);
-            var destFile = Path.Combine(destPath, relative);
-            Directory.CreateDirectory(Path.GetDirectoryName(destFile)!);
-            File.Copy(file, destFile, overwrite: true);
-        }
+        return value.Replace("'", "''", StringComparison.Ordinal);
     }
 
     private static async Task WriteManifestAsync(
@@ -148,6 +170,8 @@ public sealed class LogBackupService : ILogBackupService
         SwitchTransaction transaction,
         DateTimeOffset timestamp,
         string targetPath,
+        string guestZipPath,
+        string timestampTag,
         int fileCount,
         long totalBytes,
         bool success,
@@ -157,10 +181,10 @@ public sealed class LogBackupService : ILogBackupService
     {
         var sources = new
         {
-            cache = vm.GuestBackupPaths.Cache,
-            db = vm.GuestBackupPaths.Db,
-            file = vm.GuestBackupPaths.File,
-            logs = vm.GuestBackupPaths.Logs
+            cache = Path.Combine(vm.GuestWorkPath, "cache"),
+            db = Path.Combine(vm.GuestWorkPath, "db"),
+            file = Path.Combine(vm.GuestWorkPath, "file"),
+            logs = Path.Combine(vm.GuestWorkPath, "logs")
         };
 
         var manifest = new
@@ -176,7 +200,10 @@ public sealed class LogBackupService : ILogBackupService
             firstTaskId = transaction.FirstTaskId,
             backupTime = timestamp.ToString("yyyy-MM-dd HH:mm:ss"),
             workPath = vm.HostWorkPath,
+            guestWorkPath = vm.GuestWorkPath,
             targetPath,
+            guestZipPath,
+            zipFileName = $"{timestampTag}.zip",
             sources,
             directories = DirectoryNames,
             fileCount,
@@ -189,17 +216,4 @@ public sealed class LogBackupService : ILogBackupService
         await using var stream = File.Create(Path.Combine(targetPath, "backup_manifest.json"));
         await JsonSerializer.SerializeAsync(stream, manifest, JsonOptions, cancellationToken);
     }
-
-    private static int CountFiles(string targetPath)
-    {
-        return Directory.EnumerateFiles(targetPath, "*", SearchOption.AllDirectories).Count();
-    }
-
-    private static long SumFileBytes(string targetPath)
-    {
-        return Directory.EnumerateFiles(targetPath, "*", SearchOption.AllDirectories)
-            .Sum(file => new FileInfo(file).Length);
-    }
-
-    private sealed record BackupSource(string Name, string GuestPath);
 }

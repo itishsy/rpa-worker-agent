@@ -47,11 +47,14 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IVmrunService>(provider =>
         {
             var options = provider.GetRequiredService<IOptions<VmrunOptions>>().Value;
-            var timeoutSeconds = options.StopSoftTimeoutSeconds > 0 ? options.StopSoftTimeoutSeconds : 60;
+            var commandTimeout = TimeSpan.FromSeconds(options.StopSoftTimeoutSeconds > 0 ? options.StopSoftTimeoutSeconds : 60);
+            var fileOperationTimeout = TimeSpan.FromSeconds(options.FileOperationTimeoutSeconds > 0 ? options.FileOperationTimeoutSeconds : 600);
             return new VmrunService(
                 options.VmrunPath,
+                string.IsNullOrWhiteSpace(options.HostType) ? "ws" : options.HostType,
                 provider.GetRequiredService<IProcessRunner>(),
-                TimeSpan.FromSeconds(timeoutSeconds));
+                commandTimeout,
+                fileOperationTimeout);
         });
         services.AddHttpClient<ISchedulerClient, SchedulerClient>((provider, client) =>
         {

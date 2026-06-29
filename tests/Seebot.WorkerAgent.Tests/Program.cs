@@ -762,17 +762,17 @@ static void LogBackupServiceCreatesTimestampedTargetDirectoriesAndCopiesFourFold
     var service = new LogBackupService(vmrun);
     var timestamp = DateTimeOffset.Parse("2026-06-19T10:11:12+08:00");
     var vm = BackupVm(scope.DirectoryPath);
-    SeedBackupSource(vm.HostSharedPath);
 
     var result = service.BackupAsync(vm, BackupTransaction(), timestamp, CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.True(result.Success, "Backup should succeed when all copies succeed.");
+    Assert.True(result.Success, "Backup should succeed when script and copy both succeed.");
     Assert.Equal(Path.Combine(scope.DirectoryPath, "SR20-2026-6HQ8", "20260619101112"), result.TargetPath, "Backup target path should use yyyyMMddHHmmss.");
-    Assert.True(Directory.Exists(Path.Combine(result.TargetPath, "cache")), "cache directory should exist.");
-    Assert.True(Directory.Exists(Path.Combine(result.TargetPath, "db")), "db directory should exist.");
-    Assert.True(Directory.Exists(Path.Combine(result.TargetPath, "file")), "file directory should exist.");
-    Assert.True(Directory.Exists(Path.Combine(result.TargetPath, "logs")), "logs directory should exist.");
-    Assert.True(File.Exists(Path.Combine(result.TargetPath, "db", "db.txt")), "db files should be copied from shared host path.");
+    Assert.Equal(1, vmrun.ProgramCalls.Count, "One PowerShell program should be invoked on the guest.");
+    Assert.Contains(vmrun.ProgramCalls[0], "-EncodedCommand", "Arguments should use -EncodedCommand.");
+    Assert.Equal(1, vmrun.CopyCalls.Count, "One CopyFileFromGuestToHost call should copy the zip.");
+    Assert.True(vmrun.CopyCalls[0].GuestPath.EndsWith("20260619101112.zip", StringComparison.OrdinalIgnoreCase), "Copied guest path should be the timestamped zip.");
+    Assert.True(File.Exists(Path.Combine(result.TargetPath, "20260619101112.zip")), "Zip file should exist at target path.");
+    Assert.True(File.Exists(Path.Combine(result.TargetPath, "20260619101112_backup.ps1")), "ps1 audit script should be saved at target path.");
 }
 
 static void LogBackupServiceWritesManifestWithRequiredDirectories()
@@ -781,7 +781,6 @@ static void LogBackupServiceWritesManifestWithRequiredDirectories()
     var service = new LogBackupService(new FakeVmrunService());
     var timestamp = DateTimeOffset.Parse("2026-06-19T10:11:12+08:00");
     var vm = BackupVm(scope.DirectoryPath);
-    SeedBackupSource(vm.HostSharedPath);
 
     var result = service.BackupAsync(vm, BackupTransaction(), timestamp, CancellationToken.None).GetAwaiter().GetResult();
 
@@ -792,7 +791,9 @@ static void LogBackupServiceWritesManifestWithRequiredDirectories()
     Assert.Equal("HOST-SR20-001", json.RootElement.GetProperty("hostId").GetString(), "Manifest hostId should match transaction.");
     Assert.Equal("SR20-2026-6HQ8", json.RootElement.GetProperty("vmName").GetString(), "Manifest vmName should match VM config.");
     Assert.Equal(scope.DirectoryPath, json.RootElement.GetProperty("workPath").GetString(), "Manifest workPath should match HostWorkPath.");
+    Assert.Equal(@"C:\seebot", json.RootElement.GetProperty("guestWorkPath").GetString(), "Manifest guestWorkPath should match GuestWorkPath.");
     Assert.Equal(@"C:\seebot\db", json.RootElement.GetProperty("sources").GetProperty("db").GetString(), "Manifest should include db source.");
+    Assert.Equal("20260619101112.zip", json.RootElement.GetProperty("zipFileName").GetString(), "Manifest should record the zip file name.");
     var directories = json.RootElement.GetProperty("directories").EnumerateArray().Select(item => item.GetString()).ToArray();
     Assert.SequenceEqual(new[] { "cache", "db", "file", "logs" }, directories!, "Manifest directories should include cache/db/file/logs.");
     Assert.True(json.RootElement.GetProperty("success").GetBoolean(), "Manifest success should be true on success.");
@@ -802,15 +803,15 @@ static void LogBackupServiceReturnsFailureWhenDirectoryCopyFails()
 {
     using var scope = TempDirectory();
     var vm = BackupVm(scope.DirectoryPath);
-    vm.GuestBackupPaths.Db = @"D:\outside\db";
-    var vmrun = new FakeVmrunService();
+    var guestZipPath = Path.Combine(vm.GuestWorkPath, "20260619101112.zip").Replace('/', '\\');
+    var vmrun = new FakeVmrunService(failOnGuestPath: guestZipPath);
     var service = new LogBackupService(vmrun);
 
     var result = service.BackupAsync(vm, BackupTransaction(), DateTimeOffset.Parse("2026-06-19T10:11:12+08:00"), CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.False(result.Success, "Backup should fail when any directory copy fails.");
+    Assert.False(result.Success, "Backup should fail when zip copy fails.");
     Assert.Equal(ErrorCodes.LogBackupFailed, result.ErrorCode, "Failure should use LOG_BACKUP_FAILED.");
-    Assert.Contains(new[] { result.ErrorMessage ?? "" }, "Guest path");
+    Assert.False(string.IsNullOrEmpty(result.ErrorMessage), "Failure should include error message.");
     using var json = JsonDocument.Parse(File.ReadAllText(Path.Combine(result.TargetPath, "backup_manifest.json")));
     Assert.False(json.RootElement.GetProperty("success").GetBoolean(), "Manifest success should be false on copy failure.");
 }
@@ -1631,6 +1632,7 @@ static VirtualMachineOptions BackupVm(string hostWorkPath)
         GuestUser = "Administrator",
         GuestPasswordSecret = "password",
         HostWorkPath = hostWorkPath,
+        GuestWorkPath = @"C:\seebot",
         HostSharedPath = Path.Combine(hostWorkPath, "shared"),
         GuestSharedPath = @"C:\seebot",
         GuestBackupPaths = new GuestBackupPathsOptions
@@ -1718,8 +1720,10 @@ static VmrunService NewVmrunService(FakeProcessRunner runner)
 {
     return new VmrunService(
         @"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe",
+        "ws",
         runner,
-        TimeSpan.FromSeconds(30));
+        TimeSpan.FromSeconds(30),
+        TimeSpan.FromSeconds(60));
 }
 
 static VmrunCommandResult SuccessResult(string commandName)
@@ -2034,6 +2038,31 @@ internal sealed class FakeVmrunService : IVmrunService
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "removeSharedFolder"));
     }
 
+    public List<string> ProgramCalls { get; } = [];
+
+    public Task<VmrunCommandResult> RunProgramInGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        string programPath,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken)
+    {
+        ProgramCalls.Add(string.Join(" ", arguments));
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "runProgramInGuest"));
+    }
+
+    public Task<VmrunCommandResult> CopyFileFromHostToGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        string hostPath,
+        string guestPath,
+        CancellationToken cancellationToken)
+    {
+        return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "copyFileFromHostToGuest"));
+    }
+
     public Task<VmrunCommandResult> CopyFileFromGuestToHostAsync(
         string vmxPath,
         string guestUser,
@@ -2046,6 +2075,18 @@ internal sealed class FakeVmrunService : IVmrunService
         if (string.Equals(guestPath, _failOnGuestPath, StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException("copy failed");
+        }
+
+        // 在 host 端创建占位文件，模拟 copy 完成
+        if (!string.IsNullOrEmpty(hostPath))
+        {
+            var dir = Path.GetDirectoryName(hostPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            File.WriteAllBytes(hostPath, []);
         }
 
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "copyFileFromGuestToHost"));

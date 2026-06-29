@@ -3,14 +3,18 @@ namespace Seebot.WorkerAgent.Core.Vmware;
 public sealed class VmrunService : IVmrunService
 {
     private readonly string _vmrunPath;
+    private readonly string _hostType;
     private readonly IProcessRunner _processRunner;
     private readonly TimeSpan _commandTimeout;
+    private readonly TimeSpan _fileOperationTimeout;
 
-    public VmrunService(string vmrunPath, IProcessRunner processRunner, TimeSpan commandTimeout)
+    public VmrunService(string vmrunPath, string hostType, IProcessRunner processRunner, TimeSpan commandTimeout, TimeSpan fileOperationTimeout)
     {
         _vmrunPath = vmrunPath;
+        _hostType = hostType;
         _processRunner = processRunner;
         _commandTimeout = commandTimeout;
+        _fileOperationTimeout = fileOperationTimeout;
     }
 
     public async Task<IReadOnlyList<string>> ListSnapshotsAsync(string vmxPath, CancellationToken cancellationToken)
@@ -143,7 +147,7 @@ public sealed class VmrunService : IVmrunService
         IReadOnlyList<string> commandArguments,
         CancellationToken cancellationToken)
     {
-        var arguments = new List<string> { commandName };
+        var arguments = new List<string> { "-T", _hostType, commandName };
         arguments.AddRange(commandArguments);
 
         var result = await _processRunner.RunAsync(
@@ -173,6 +177,67 @@ public sealed class VmrunService : IVmrunService
         return RunVmrunAsync("removeSharedFolder", [vmxPath, shareName], cancellationToken);
     }
 
+    public async Task<VmrunCommandResult> RunProgramInGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        string programPath,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken)
+    {
+        // vmrun -T ws -gu user -gp pass runProgramInGuest vmx programPath [arg1 arg2 ...]
+        var args = new List<string>
+        {
+            "-T", _hostType,
+            "-gu", guestUser,
+            "-gp", guestPassword,
+            "runProgramInGuest",
+            vmxPath, programPath
+        };
+        args.AddRange(arguments);
+
+        var result = await _processRunner.RunAsync(
+            new ProcessCommand(_vmrunPath, args, _fileOperationTimeout, "runProgramInGuest"),
+            cancellationToken);
+
+        if (result.ExitCode != 0)
+        {
+            throw new VmrunCommandException(result);
+        }
+
+        return result;
+    }
+
+    public async Task<VmrunCommandResult> CopyFileFromHostToGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        string hostPath,
+        string guestPath,
+        CancellationToken cancellationToken)
+    {
+        // vmrun -T ws -gu user -gp pass copyFileFromHostToGuest vmx hostPath guestPath
+        var arguments = new List<string>
+        {
+            "-T", _hostType,
+            "-gu", guestUser,
+            "-gp", guestPassword,
+            "copyFileFromHostToGuest",
+            vmxPath, hostPath, guestPath
+        };
+
+        var result = await _processRunner.RunAsync(
+            new ProcessCommand(_vmrunPath, arguments, _fileOperationTimeout, "copyFileFromHostToGuest"),
+            cancellationToken);
+
+        if (result.ExitCode != 0)
+        {
+            throw new VmrunCommandException(result);
+        }
+
+        return result;
+    }
+
     public async Task<VmrunCommandResult> CopyFileFromGuestToHostAsync(
         string vmxPath,
         string guestUser,
@@ -181,9 +246,10 @@ public sealed class VmrunService : IVmrunService
         string hostPath,
         CancellationToken cancellationToken)
     {
-        // vmrun 全局选项必须在子命令之前：vmrun -gu user -gp pass copyFileFromGuestToHost vmx guestPath hostPath
+        // vmrun -T ws -gu user -gp pass copyFileFromGuestToHost vmx guestPath hostPath
         var arguments = new List<string>
         {
+            "-T", _hostType,
             "-gu", guestUser,
             "-gp", guestPassword,
             "copyFileFromGuestToHost",
@@ -191,7 +257,7 @@ public sealed class VmrunService : IVmrunService
         };
 
         var result = await _processRunner.RunAsync(
-            new ProcessCommand(_vmrunPath, arguments, _commandTimeout, "copyFileFromGuestToHost"),
+            new ProcessCommand(_vmrunPath, arguments, _fileOperationTimeout, "copyFileFromGuestToHost"),
             cancellationToken);
 
         if (result.ExitCode != 0)
