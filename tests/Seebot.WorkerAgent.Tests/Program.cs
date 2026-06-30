@@ -580,12 +580,14 @@ static void SchedulerClientPendingQueryIncludesProfileIdAndBearerToken()
     });
     var client = NewSchedulerClient(handler);
 
-    var response = client.QueryPendingTasksAsync("rpa-sh-tax-etax-001", CancellationToken.None).GetAwaiter().GetResult();
+    var response = client.QueryPendingTasksAsync("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.Equal(1, response.Count, "Pending response should deserialize profileId list.");
     Assert.Equal(true, response[0].HasTask, "Pending profile should be treated as a task.");
     Assert.Equal("rpa-sh-tax-etax", response[0].ProfileId, "Pending response should deserialize profileId.");
     Assert.Equal("/robot/client/task/findTaskProfileCode/rpa-sh-tax-etax-001", handler.LastRequest!.RequestUri!.AbsolutePath, "Pending query path should match scheduler contract.");
+    Assert.Equal("?profileCode=rpa-sh-tax-etax", handler.LastRequest.RequestUri.Query, "Pending query should pass the current profileId as profileCode.");
+    Assert.Equal<string?>(null, handler.LastRequestBody, "Pending query should not send profileIds in the request body.");
     Assert.Equal("Bearer", handler.LastRequest.Headers.Authorization!.Scheme, "Authorization scheme should be Bearer.");
     Assert.Equal("scheduler-token", handler.LastRequest.Headers.Authorization.Parameter, "Authorization token should match scheduler AccessToken.");
 }
@@ -770,7 +772,7 @@ static void LogBackupServiceCreatesTimestampedTargetDirectoriesAndCopiesFourFold
     Assert.True(result.Success, "Backup should succeed when script and copy both succeed.");
     Assert.Equal(Path.Combine(scope.DirectoryPath, "SR20-2026-6HQ8", "20260619101112"), result.TargetPath, "Backup target path should use yyyyMMddHHmmss.");
     Assert.Equal(1, vmrun.ProgramCalls.Count, "One PowerShell program should be invoked on the guest.");
-    Assert.Contains(vmrun.ProgramCalls[0], "-EncodedCommand", "Arguments should use -EncodedCommand.");
+    Assert.True(vmrun.ProgramCalls[0].Contains("-EncodedCommand", StringComparison.Ordinal), "Arguments should use -EncodedCommand.");
     Assert.Equal(1, vmrun.CopyCalls.Count, "One CopyFileFromGuestToHost call should copy the zip.");
     Assert.True(vmrun.CopyCalls[0].GuestPath.EndsWith("20260619101112.zip", StringComparison.OrdinalIgnoreCase), "Copied guest path should be the timestamped zip.");
     Assert.True(File.Exists(Path.Combine(result.TargetPath, "20260619101112.zip")), "Zip file should exist at target path.");
@@ -2307,6 +2309,28 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "removeSharedFolder"));
     }
 
+    public Task<VmrunCommandResult> RunProgramInGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        string programPath,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException();
+    }
+
+    public Task<VmrunCommandResult> CopyFileFromHostToGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        string hostPath,
+        string guestPath,
+        CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException();
+    }
+
     public Task<VmrunCommandResult> CopyFileFromGuestToHostAsync(
         string vmxPath,
         string guestUser,
@@ -2434,10 +2458,11 @@ internal sealed class RecordingSchedulerClient : ISchedulerClient
 
     public bool ThrowOnVmStatusReport { get; set; }
 
-    public Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingTasksAsync(string workerId, CancellationToken cancellationToken)
+    public Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingTasksAsync(string workerId, string profileId, CancellationToken cancellationToken)
     {
-        QueriedProfileIds.Add(workerId);
-        return Task.FromResult<IReadOnlyList<ProfilePendingTaskResponse>>(Pending.Values.ToList());
+        QueriedProfileIds.Add(profileId);
+        return Task.FromResult<IReadOnlyList<ProfilePendingTaskResponse>>(
+            Pending.TryGetValue(profileId, out var pending) ? [pending] : []);
     }
 
     public Task ReportCapabilitiesAsync(IReadOnlyList<HostProfileCapabilityRequest> request, CancellationToken cancellationToken)
@@ -2598,6 +2623,28 @@ internal sealed class RecordingSnapshotUpdateVmrunService : IVmrunService
     {
         _recorder.Actions.Add("vmrun-remove-shared-folder");
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "removeSharedFolder"));
+    }
+
+    public Task<VmrunCommandResult> RunProgramInGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        string programPath,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException();
+    }
+
+    public Task<VmrunCommandResult> CopyFileFromHostToGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        string hostPath,
+        string guestPath,
+        CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException();
     }
 
     public Task<VmrunCommandResult> CopyFileFromGuestToHostAsync(

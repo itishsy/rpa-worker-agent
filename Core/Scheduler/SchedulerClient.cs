@@ -27,16 +27,16 @@ public sealed class SchedulerClient : ISchedulerClient
         }
     }
 
-    public async Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingTasksAsync(string workerId, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingTasksAsync(string workerId, string profileId, CancellationToken cancellationToken)
     {
-        var url = BuildUri($"/robot/client/task/findTaskProfileCode/{Uri.EscapeDataString(workerId)}");
+        var url = BuildUri($"/robot/client/task/findTaskProfileCode/{Uri.EscapeDataString(workerId)}?profileCode={Uri.EscapeDataString(profileId)}");
         using var request = CreateRequest(HttpMethod.Post, url);
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         await EnsureSuccessAsync(response, "QueryPendingTasks", cancellationToken);
 
         var result = await response.Content.ReadFromJsonAsync<ApiResult<string[]>>(JsonOptions, cancellationToken);
-        var profileIds = result?.Data;
-        return profileIds is null ? [] : profileIds
+        var returnedIds = result?.Data;
+        return returnedIds is null ? [] : returnedIds
             .Where(id => !string.IsNullOrWhiteSpace(id))
             .Select(id => new ProfilePendingTaskResponse { ProfileId = id, HasTask = true })
             .ToList();

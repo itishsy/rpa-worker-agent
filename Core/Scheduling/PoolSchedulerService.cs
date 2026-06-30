@@ -151,16 +151,20 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
     private async Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingProfilesAsync(
         CancellationToken cancellationToken)
     {
-        var workerIds = _options.VirtualMachines
-            .Select(vm => vm.WorkerId)
-            .Where(id => !string.IsNullOrWhiteSpace(id))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
         var results = new List<ProfilePendingTaskResponse>();
-        foreach (var workerId in workerIds)
+        var vmStates = await _localStore.GetVmStatesAsync(_options.Agent.HostId, cancellationToken).ConfigureAwait(false);
+        var stateByVmName = vmStates.ToDictionary(state => state.VmName, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var vm in _options.VirtualMachines)
         {
-            var profiles = await _schedulerClient.QueryPendingTasksAsync(workerId, cancellationToken).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(vm.WorkerId)
+                || !stateByVmName.TryGetValue(vm.Name, out var state)
+                || string.IsNullOrWhiteSpace(state.CurrentProfileId))
+            {
+                continue;
+            }
+
+            var profiles = await _schedulerClient.QueryPendingTasksAsync(vm.WorkerId, state.CurrentProfileId, cancellationToken).ConfigureAwait(false);
             results.AddRange(profiles);
         }
 
