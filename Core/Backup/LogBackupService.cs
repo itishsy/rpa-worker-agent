@@ -26,10 +26,10 @@ public sealed class LogBackupService : ILogBackupService
         DateTimeOffset timestamp,
         CancellationToken cancellationToken)
     {
-        var timestampTag = timestamp.ToString("yyyyMMddHHmmss");
-        var targetPath = Path.Combine(vm.HostWorkPath, vm.Name, timestampTag);
+        var targetPath = Path.Combine(vm.HostWorkPath, vm.Name, timestamp.ToString("yyyyMMdd"));
         Directory.CreateDirectory(targetPath);
 
+        var timestampTag = timestamp.ToString("yyyyMMddHHmmss") + "_" + transaction.FromProfileId;
         var guestZipPath = Path.Combine(vm.GuestWorkPath, $"{timestampTag}.zip").Replace('/', '\\');
         var hostScriptPath = Path.Combine(targetPath, $"{timestampTag}_backup.ps1");
 
@@ -53,6 +53,10 @@ public sealed class LogBackupService : ILogBackupService
             if (File.Exists(hostZipPath))
             {
                 totalBytes = new FileInfo(hostZipPath).Length;
+            }
+            if (File.Exists(hostScriptPath))
+            {
+                File.Delete(hostScriptPath);
             }
 
             success = true;
@@ -78,19 +82,19 @@ public sealed class LogBackupService : ILogBackupService
             ErrorMessage = errorMessage
         };
 
-        await WriteManifestAsync(
-            vm,
-            transaction,
-            timestamp,
-            targetPath,
-            guestZipPath,
-            timestampTag,
-            result.FileCount,
-            totalBytes,
-            success,
-            result.ErrorCode,
-            errorMessage,
-            cancellationToken);
+        //await WriteManifestAsync(
+        //    vm,
+        //    transaction,
+        //    timestamp,
+        //    targetPath,
+        //    guestZipPath,
+        //    timestampTag,
+        //    result.FileCount,
+        //    totalBytes,
+        //    success,
+        //    result.ErrorCode,
+        //    errorMessage,
+        //    cancellationToken);
 
         return result;
     }
