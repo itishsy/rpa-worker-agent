@@ -56,6 +56,22 @@ public static class ServiceCollectionExtensions
                 commandTimeout,
                 fileOperationTimeout);
         });
+        const string SchedulerAuthHttpClientName = "SchedulerAuth";
+        services.AddHttpClient(SchedulerAuthHttpClientName, (provider, client) =>
+        {
+            var options = provider.GetRequiredService<IOptions<SchedulerOptions>>().Value;
+            if (!string.IsNullOrWhiteSpace(options.BaseUrl))
+            {
+                client.BaseAddress = new Uri(options.BaseUrl);
+            }
+        });
+        // 单例是为了让所有 SchedulerClient 消费者共享同一份 token 缓存，避免各自触发重复登录
+        services.AddSingleton<ISchedulerTokenProvider>(provider =>
+        {
+            var httpClient = provider.GetRequiredService<IHttpClientFactory>().CreateClient(SchedulerAuthHttpClientName);
+            var options = provider.GetRequiredService<SchedulerOptions>();
+            return new SchedulerTokenProvider(httpClient, options);
+        });
         services.AddHttpClient<ISchedulerClient, SchedulerClient>((provider, client) =>
         {
             var options = provider.GetRequiredService<IOptions<SchedulerOptions>>().Value;

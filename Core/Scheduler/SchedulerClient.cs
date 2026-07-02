@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Encodings.Web;
@@ -14,13 +15,13 @@ public sealed class SchedulerClient : ISchedulerClient
     };
 
     private readonly HttpClient _httpClient;
-    private readonly SchedulerOptions _options;
+    private readonly ISchedulerTokenProvider _tokenProvider;
     private readonly Uri? _baseUri;
 
-    public SchedulerClient(HttpClient httpClient, SchedulerOptions options)
+    public SchedulerClient(HttpClient httpClient, SchedulerOptions options, ISchedulerTokenProvider tokenProvider)
     {
         _httpClient = httpClient;
-        _options = options;
+        _tokenProvider = tokenProvider;
         if (!string.IsNullOrWhiteSpace(options.BaseUrl))
         {
             _baseUri = new Uri(EnsureTrailingSlash(options.BaseUrl));
@@ -30,9 +31,7 @@ public sealed class SchedulerClient : ISchedulerClient
     public async Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingTasksAsync(string workerId, string profileId, CancellationToken cancellationToken)
     {
         var url = BuildUri($"/robot/client/task/findTaskProfileCode/{Uri.EscapeDataString(workerId)}?profileCode={Uri.EscapeDataString(profileId)}");
-        using var request = CreateRequest(HttpMethod.Post, url);
-        using var response = await _httpClient.SendAsync(request, cancellationToken);
-        await EnsureSuccessAsync(response, "QueryPendingTasks", cancellationToken);
+        using var response = await SendWithRetryAsync(HttpMethod.Post, url, contentFactory: null, "QueryPendingTasks", cancellationToken);
 
         var result = await response.Content.ReadFromJsonAsync<ApiResult<string[]>>(JsonOptions, cancellationToken);
         var returnedIds = result?.Data;
@@ -64,11 +63,64 @@ public sealed class SchedulerClient : ISchedulerClient
 
     private async Task PostAsync<T>(string relativePath, T payload, string operationName, CancellationToken cancellationToken)
     {
-        using var request = CreateRequest(HttpMethod.Post, BuildUri(relativePath));
-        request.Content = JsonContent.Create(payload, options: JsonOptions);
-        using var response = await _httpClient.SendAsync(request, cancellationToken);
-        await EnsureSuccessAsync(response, operationName, cancellationToken);
+        var uri = BuildUri(relativePath);
+        using var response = await SendWithRetryAsync(
+            HttpMethod.Post,
+            uri,
+            () => JsonContent.Create(payload, options: JsonOptions),
+            operationName,
+            cancellationToken);
         await EnsureApiSuccessAsync(response, operationName, cancellationToken);
+    }
+
+    // 发起请求前附加当前缓存的 token；若响应为 401，则刷新 token 并重试一次
+    private async Task<HttpResponseMessage> SendWithRetryAsync(
+        HttpMethod method,
+        Uri uri,
+        Func<HttpContent>? contentFactory,
+        string operationName,
+        CancellationToken cancellationToken)
+    {
+        var response = await SendOnceAsync(method, uri, contentFactory, refreshToken: false, operationName, cancellationToken);
+        if (response.StatusCode != HttpStatusCode.Unauthorized)
+        {
+            await EnsureSuccessAsync(response, operationName, cancellationToken);
+            return response;
+        }
+
+        response.Dispose();
+        response = await SendOnceAsync(method, uri, contentFactory, refreshToken: true, operationName, cancellationToken);
+        await EnsureSuccessAsync(response, operationName, cancellationToken);
+        return response;
+    }
+
+    private async Task<HttpResponseMessage> SendOnceAsync(
+        HttpMethod method,
+        Uri uri,
+        Func<HttpContent>? contentFactory,
+        bool refreshToken,
+        string operationName,
+        CancellationToken cancellationToken)
+    {
+        var accessToken = refreshToken
+            ? await _tokenProvider.RefreshAccessTokenAsync(cancellationToken)
+            : await _tokenProvider.GetAccessTokenAsync(cancellationToken);
+
+        using var request = new HttpRequestMessage(method, uri);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        if (contentFactory is not null)
+        {
+            request.Content = contentFactory();
+        }
+
+        try
+        {
+            return await _httpClient.SendAsync(request, cancellationToken);
+        }
+        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
+        {
+            throw new SchedulerClientException(operationName, HttpStatusCode.ServiceUnavailable, exception.Message);
+        }
     }
 
     private static async Task EnsureApiSuccessAsync(HttpResponseMessage response, string operationName, CancellationToken cancellationToken)
@@ -87,17 +139,6 @@ public sealed class SchedulerClient : ISchedulerClient
         {
             throw new SchedulerClientException(operationName, response.StatusCode, result.Message ?? $"code={result.Code}");
         }
-    }
-
-    private HttpRequestMessage CreateRequest(HttpMethod method, Uri uri)
-    {
-        var request = new HttpRequestMessage(method, uri);
-        if (!string.IsNullOrWhiteSpace(_options.AccessToken))
-        {
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.AccessToken);
-        }
-
-        return request;
     }
 
     private Uri BuildUri(string relativePath)

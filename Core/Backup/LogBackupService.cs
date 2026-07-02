@@ -28,7 +28,7 @@ public sealed class LogBackupService : ILogBackupService
         CancellationToken cancellationToken)
     {
         var directoryNames = ParseDirectoryNames(vm.GuestBackupPaths);
-        var targetPath = Path.Combine(_options.Agent.HostWorkPath, vm.Name, timestamp.ToString("yyyyMMdd"));
+        var targetPath = Path.Combine(_options.Agent.HostWorkPath, "backup", vm.Name, timestamp.ToString("yyyyMMdd"));
         Directory.CreateDirectory(targetPath);
 
         var timestampTag = timestamp.ToString("yyyyMMddHHmmss") + "_" + transaction.FromProfileId;
