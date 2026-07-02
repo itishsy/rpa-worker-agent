@@ -53,11 +53,6 @@ public sealed class StartupValidator : IStartupValidator
                 errors.Add($"VMX file does not exist for VM {vm.Name}: {vm.VmxPath}");
             }
 
-            if (!string.Equals(vm.BaseSnapshotName, vm.Name, StringComparison.OrdinalIgnoreCase))
-            {
-                errors.Add($"BaseSnapshotName for VM {vm.Name} must match VM name.");
-            }
-
             var snapshots = await LoadSnapshotsAsync(vm, errors, cancellationToken);
             if (!ContainsSnapshot(snapshots, vm.BaseSnapshotName))
             {

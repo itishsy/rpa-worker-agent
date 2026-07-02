@@ -1880,6 +1880,7 @@ static WorkerAgentOptions ValidOptions()
                 RunnerStatusUrl = "http://192.168.100.101:9090/api/robot/start/status",
                 RunnerKillUrl = "http://192.168.100.101:9090/api/robot/kill",
                 HostWorkPath = @"D:\seebot",
+                GuestWorkPath = @"C:\seebot",
                 GuestBackupPaths = new GuestBackupPathsOptions
                 {
                     Cache = @"C:\seebot\cache",
@@ -1913,6 +1914,7 @@ static WorkerAgentOptions ValidOptions()
                 RunnerStatusUrl = "http://192.168.100.102:9090/api/robot/start/status",
                 RunnerKillUrl = "http://192.168.100.102:9090/api/robot/kill",
                 HostWorkPath = @"D:\seebot",
+                GuestWorkPath = @"C:\seebot",
                 GuestBackupPaths = new GuestBackupPathsOptions
                 {
                     Cache = @"C:\seebot\cache",
