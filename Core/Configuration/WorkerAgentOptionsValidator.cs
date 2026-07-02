@@ -4,8 +4,6 @@ namespace Seebot.WorkerAgent.Core.Configuration;
 
 public static class WorkerAgentOptionsValidator
 {
-    private const int RunnerControlPort = 9090;
-
     private static readonly Regex VersionedSnapshotSuffix =
         new(@"^.+\.v\d{6}\.\d+$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
@@ -14,6 +12,7 @@ public static class WorkerAgentOptionsValidator
         var errors = new List<string>();
 
         Require(options.Agent.HostId, "Agent.HostId", errors);
+        Require(options.Agent.HostWorkPath, "Agent.HostWorkPath", errors);
         Require(options.Vmrun.VmrunPath, "Vmrun.VmrunPath", errors);
 
         var workerIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -27,9 +26,6 @@ public static class WorkerAgentOptionsValidator
             Require(vm.VmxPath, $"{vmPath}.VmxPath", errors);
             Require(vm.BaseSnapshotName, $"{vmPath}.BaseSnapshotName", errors);
             Require(vm.WorkerId, $"{vmPath}.WorkerId", errors);
-            Require(vm.RunnerStatusUrl, $"{vmPath}.RunnerStatusUrl", errors);
-            Require(vm.RunnerKillUrl, $"{vmPath}.RunnerKillUrl", errors);
-            Require(vm.HostWorkPath, $"{vmPath}.HostWorkPath", errors);
             Require(vm.GuestWorkPath, $"{vmPath}.GuestWorkPath", errors);
 
             if (!string.IsNullOrWhiteSpace(vm.WorkerId) && !workerIds.Add(vm.WorkerId))
@@ -37,8 +33,6 @@ public static class WorkerAgentOptionsValidator
                 errors.Add($"{vmPath}.WorkerId must be unique across the host.");
             }
 
-            RequireRunnerPort(vm.RunnerStatusUrl, $"{vmPath}.RunnerStatusUrl", errors);
-            RequireRunnerPort(vm.RunnerKillUrl, $"{vmPath}.RunnerKillUrl", errors);
             ValidateGuestBackupPaths(vm.GuestBackupPaths, vmPath, errors);
             ValidateProfiles(vm.Profiles, vmPath, errors);
         }
@@ -46,12 +40,22 @@ public static class WorkerAgentOptionsValidator
         return new ValidationResult(errors);
     }
 
-    private static void ValidateGuestBackupPaths(GuestBackupPathsOptions paths, string vmPath, List<string> errors)
+    private static void ValidateGuestBackupPaths(string paths, string vmPath, List<string> errors)
     {
-        Require(paths.Cache, $"{vmPath}.GuestBackupPaths.Cache", errors);
-        Require(paths.Db, $"{vmPath}.GuestBackupPaths.Db", errors);
-        Require(paths.File, $"{vmPath}.GuestBackupPaths.File", errors);
-        Require(paths.Logs, $"{vmPath}.GuestBackupPaths.Logs", errors);
+        if (string.IsNullOrWhiteSpace(paths))
+        {
+            errors.Add($"{vmPath}.GuestBackupPaths is required.");
+            return;
+        }
+
+        var names = paths
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .ToList();
+        if (names.Count == 0)
+        {
+            errors.Add($"{vmPath}.GuestBackupPaths must contain at least one directory name.");
+        }
     }
 
     private static void ValidateProfiles(IReadOnlyList<ProfileOptions> profiles, string vmPath, List<string> errors)
@@ -80,25 +84,6 @@ public static class WorkerAgentOptionsValidator
             {
                 errors.Add($"{profilePath}.ProfileId must be unique inside the VM.");
             }
-        }
-    }
-
-    private static void RequireRunnerPort(string url, string name, List<string> errors)
-    {
-        if (string.IsNullOrWhiteSpace(url))
-        {
-            return;
-        }
-
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
-        {
-            errors.Add($"{name} must be an absolute URL using port {RunnerControlPort}.");
-            return;
-        }
-
-        if (uri.Port != RunnerControlPort)
-        {
-            errors.Add($"{name} must use port {RunnerControlPort}.");
         }
     }
 

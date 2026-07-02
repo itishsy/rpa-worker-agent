@@ -2,28 +2,37 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Domain;
+using Seebot.WorkerAgent.Core.Vmware;
 
 namespace Seebot.WorkerAgent.Core.Guest;
 
 public sealed class GuestWorkerClient : IGuestWorkerClient
 {
+    private const int RunnerControlPort = 9090;
+    private const string RunnerStatusPath = "api/robot/start/status";
+    private const string RunnerKillPath = "api/robot/start/status"; // TODO: 临时复用状态接口路径，待 Kill 接口路径确定后更新
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly HttpClient _httpClient;
+    private readonly IVmrunService _vmrunService;
 
-    public GuestWorkerClient(HttpClient httpClient)
+    public GuestWorkerClient(HttpClient httpClient, IVmrunService vmrunService)
     {
         _httpClient = httpClient;
+        _vmrunService = vmrunService;
     }
 
     public async Task<RunnerStatusResponse> GetRunnerStatusAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
     {
+        var url = await BuildRunnerUrlAsync(vm, RunnerStatusPath, "GetRunnerStatus", cancellationToken);
+
         try
         {
-            using var response = await _httpClient.GetAsync(vm.RunnerStatusUrl, cancellationToken);
-            await EnsureSuccessAsync(response, "GetRunnerStatus", vm.RunnerStatusUrl, cancellationToken);
+            using var response = await _httpClient.GetAsync(url, cancellationToken);
+            await EnsureSuccessAsync(response, "GetRunnerStatus", url, cancellationToken);
 
-            var result = await ReadJsonAsync<ApiResult<int>>(response, "GetRunnerStatus", vm.RunnerStatusUrl, cancellationToken);
+            var result = await ReadJsonAsync<ApiResult<int>>(response, "GetRunnerStatus", url, cancellationToken);
             // data=0 表示可切换（Runnable），其他值表示不可切换
             var statusCode = result.Data == 0 ? RunnerStatusCode.Runnable : RunnerStatusCode.Running;
 
@@ -39,7 +48,7 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
         }
         catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
         {
-            throw new GuestWorkerClientException("GetRunnerStatus", vm.RunnerStatusUrl, exception.Message, exception);
+            throw new GuestWorkerClientException("GetRunnerStatus", url, exception.Message, exception);
         }
     }
 
@@ -50,6 +59,8 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
         int deadlineSeconds,
         CancellationToken cancellationToken)
     {
+        var url = await BuildRunnerUrlAsync(vm, RunnerKillPath, "KillRunner", cancellationToken);
+
         try
         {
             using var request = JsonContent.Create(new
@@ -59,10 +70,10 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
                 deadlineSeconds
             }, options: JsonOptions);
 
-            using var response = await _httpClient.PostAsync(vm.RunnerKillUrl, request, cancellationToken);
-            await EnsureSuccessAsync(response, "KillRunner", vm.RunnerKillUrl, cancellationToken);
+            using var response = await _httpClient.PostAsync(url, request, cancellationToken);
+            await EnsureSuccessAsync(response, "KillRunner", url, cancellationToken);
 
-            var result = await ReadJsonAsync<ApiResult<int>>(response, "KillRunner", vm.RunnerKillUrl, cancellationToken);
+            var result = await ReadJsonAsync<ApiResult<int>>(response, "KillRunner", url, cancellationToken);
             return new KillRunnerResponse
             {
                 Success = result.Data == 0,
@@ -76,7 +87,24 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
         }
         catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
         {
-            throw new GuestWorkerClientException("KillRunner", vm.RunnerKillUrl, exception.Message, exception);
+            throw new GuestWorkerClientException("KillRunner", url, exception.Message, exception);
+        }
+    }
+
+    private async Task<string> BuildRunnerUrlAsync(
+        VirtualMachineOptions vm,
+        string path,
+        string operationName,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var ipAddress = await _vmrunService.GetGuestIPAddressAsync(vm.VmxPath, cancellationToken);
+            return $"http://{ipAddress}:{RunnerControlPort}/{path}";
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            throw new GuestWorkerClientException(operationName, vm.VmxPath, exception.Message, exception);
         }
     }
 

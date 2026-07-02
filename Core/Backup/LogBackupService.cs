@@ -7,17 +7,18 @@ namespace Seebot.WorkerAgent.Core.Backup;
 
 public sealed class LogBackupService : ILogBackupService
 {
-    private static readonly string[] DirectoryNames = ["db", "logs", "cache", "file"];
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = true
     };
 
     private readonly IVmrunService _vmrunService;
+    private readonly WorkerAgentOptions _options;
 
-    public LogBackupService(IVmrunService vmrunService)
+    public LogBackupService(IVmrunService vmrunService, WorkerAgentOptions options)
     {
         _vmrunService = vmrunService;
+        _options = options;
     }
 
     public async Task<LogBackupResult> BackupAsync(
@@ -26,7 +27,8 @@ public sealed class LogBackupService : ILogBackupService
         DateTimeOffset timestamp,
         CancellationToken cancellationToken)
     {
-        var targetPath = Path.Combine(vm.HostWorkPath, vm.Name, timestamp.ToString("yyyyMMdd"));
+        var directoryNames = ParseDirectoryNames(vm.GuestBackupPaths);
+        var targetPath = Path.Combine(_options.Agent.HostWorkPath, vm.Name, timestamp.ToString("yyyyMMdd"));
         Directory.CreateDirectory(targetPath);
 
         var timestampTag = timestamp.ToString("yyyyMMddHHmmss") + "_" + transaction.FromProfileId;
@@ -39,7 +41,13 @@ public sealed class LogBackupService : ILogBackupService
 
         try
         {
-            await CompressOnGuestAsync(vm, guestZipPath, timestampTag, hostScriptPath, cancellationToken).ConfigureAwait(false);
+            await CompressOnGuestAsync(
+                vm,
+                directoryNames,
+                guestZipPath,
+                timestampTag,
+                hostScriptPath,
+                cancellationToken).ConfigureAwait(false);
 
             var hostZipPath = Path.Combine(targetPath, $"{timestampTag}.zip");
             await _vmrunService.CopyFileFromGuestToHostAsync(
@@ -54,6 +62,7 @@ public sealed class LogBackupService : ILogBackupService
             {
                 totalBytes = new FileInfo(hostZipPath).Length;
             }
+
             if (File.Exists(hostScriptPath))
             {
                 File.Delete(hostScriptPath);
@@ -74,7 +83,7 @@ public sealed class LogBackupService : ILogBackupService
         {
             TxId = transaction.TransactionId,
             TargetPath = targetPath,
-            Directories = DirectoryNames,
+            Directories = directoryNames,
             FileCount = success ? 1 : 0,
             TotalBytes = totalBytes,
             Success = success,
@@ -82,31 +91,34 @@ public sealed class LogBackupService : ILogBackupService
             ErrorMessage = errorMessage
         };
 
-        //await WriteManifestAsync(
-        //    vm,
-        //    transaction,
-        //    timestamp,
-        //    targetPath,
-        //    guestZipPath,
-        //    timestampTag,
-        //    result.FileCount,
-        //    totalBytes,
-        //    success,
-        //    result.ErrorCode,
-        //    errorMessage,
-        //    cancellationToken);
+        // Manifest writing is currently disabled to preserve existing runtime behavior.
+        // await WriteManifestAsync(
+        //     vm,
+        //     transaction,
+        //     timestamp,
+        //     targetPath,
+        //     guestZipPath,
+        //     timestampTag,
+        //     directoryNames,
+        //     result.FileCount,
+        //     totalBytes,
+        //     success,
+        //     result.ErrorCode,
+        //     errorMessage,
+        //     cancellationToken);
 
         return result;
     }
 
     private async Task CompressOnGuestAsync(
         VirtualMachineOptions vm,
+        IReadOnlyList<string> directoryNames,
         string guestZipPath,
         string timestampTag,
         string hostScriptPath,
         CancellationToken cancellationToken)
     {
-        var sourceLines = string.Join("," + Environment.NewLine, DirectoryNames.Select(d =>
+        var sourceLines = string.Join("," + Environment.NewLine, directoryNames.Select(d =>
         {
             var fullPath = Path.Combine(vm.GuestWorkPath, d).Replace('/', '\\');
             return $"    [pscustomobject]@{{ Name = '{EscapePowerShellSingleQuotedString(d)}'; Path = '{EscapePowerShellSingleQuotedString(fullPath)}' }}";
@@ -148,11 +160,9 @@ if (Test-Path -LiteralPath $zipPath) {{
 Compress-Archive -Path $timestampPath -DestinationPath $zipPath -Force
 ";
 
-        // 保存脚本到 host 供审计
         await File.WriteAllTextAsync(hostScriptPath, script, System.Text.Encoding.UTF8, cancellationToken)
             .ConfigureAwait(false);
 
-        // -EncodedCommand 传入 UTF-16LE Base64，完全绕过执行策略和命令行转义
         var encodedCommand = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
 
         await _vmrunService.RunProgramInGuestAsync(
@@ -169,13 +179,25 @@ Compress-Archive -Path $timestampPath -DestinationPath $zipPath -Force
         return value.Replace("'", "''", StringComparison.Ordinal);
     }
 
-    private static async Task WriteManifestAsync(
+    private static IReadOnlyList<string> ParseDirectoryNames(string value)
+    {
+        var names = value
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return names.Count == 0 ? ["cache", "db", "file", "logs"] : names;
+    }
+
+    private async Task WriteManifestAsync(
         VirtualMachineOptions vm,
         SwitchTransaction transaction,
         DateTimeOffset timestamp,
         string targetPath,
         string guestZipPath,
         string timestampTag,
+        IReadOnlyList<string> directoryNames,
         int fileCount,
         long totalBytes,
         bool success,
@@ -183,13 +205,11 @@ Compress-Archive -Path $timestampPath -DestinationPath $zipPath -Force
         string? errorMessage,
         CancellationToken cancellationToken)
     {
-        var sources = new
-        {
-            cache = Path.Combine(vm.GuestWorkPath, "cache"),
-            db = Path.Combine(vm.GuestWorkPath, "db"),
-            file = Path.Combine(vm.GuestWorkPath, "file"),
-            logs = Path.Combine(vm.GuestWorkPath, "logs")
-        };
+        var sources = directoryNames
+            .ToDictionary(
+                name => name,
+                name => Path.Combine(vm.GuestWorkPath, name),
+                StringComparer.OrdinalIgnoreCase);
 
         var manifest = new
         {
@@ -203,13 +223,13 @@ Compress-Archive -Path $timestampPath -DestinationPath $zipPath -Force
             toSnapshotName = transaction.TargetSnapshotName,
             firstTaskId = transaction.FirstTaskId,
             backupTime = timestamp.ToString("yyyy-MM-dd HH:mm:ss"),
-            workPath = vm.HostWorkPath,
+            workPath = _options.Agent.HostWorkPath,
             guestWorkPath = vm.GuestWorkPath,
             targetPath,
             guestZipPath,
             zipFileName = $"{timestampTag}.zip",
             sources,
-            directories = DirectoryNames,
+            directories = directoryNames,
             fileCount,
             totalBytes,
             success,

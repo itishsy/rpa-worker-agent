@@ -167,11 +167,11 @@ static void RunnerStatusUrlMustUsePort9090()
 static void MissingGuestDbBackupPathFailsValidation()
 {
     var options = ValidOptions();
-    options.VirtualMachines[0].GuestBackupPaths.Db = "";
+    options.VirtualMachines[0].GuestBackupPaths = "";
 
     var result = WorkerAgentOptionsValidator.Validate(options);
 
-    Assert.Contains(result.Errors, "GuestBackupPaths.Db");
+    Assert.Contains(result.Errors, "GuestBackupPaths");
 }
 
 static void MissingSnapshotNameFailsValidation()
@@ -763,14 +763,14 @@ static void LogBackupServiceCreatesTimestampedTargetDirectoriesAndCopiesFourFold
 {
     using var scope = TempDirectory();
     var vmrun = new FakeVmrunService();
-    var service = new LogBackupService(vmrun);
+    var service = new LogBackupService(vmrun, BackupOptions(scope.DirectoryPath));
     var timestamp = DateTimeOffset.Parse("2026-06-19T10:11:12+08:00");
     var vm = BackupVm(scope.DirectoryPath);
 
     var result = service.BackupAsync(vm, BackupTransaction(), timestamp, CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.True(result.Success, "Backup should succeed when script and copy both succeed.");
-    Assert.Equal(Path.Combine(scope.DirectoryPath, "SR20-2026-6HQ8", "20260619101112"), result.TargetPath, "Backup target path should use yyyyMMddHHmmss.");
+    Assert.Equal(Path.Combine(scope.DirectoryPath, "SR20-2026-6HQ8", "20260619"), result.TargetPath, "Backup target path should use yyyyMMdd.");
     Assert.Equal(1, vmrun.ProgramCalls.Count, "One PowerShell program should be invoked on the guest.");
     Assert.True(vmrun.ProgramCalls[0].Contains("-EncodedCommand", StringComparison.Ordinal), "Arguments should use -EncodedCommand.");
     Assert.Equal(1, vmrun.CopyCalls.Count, "One CopyFileFromGuestToHost call should copy the zip.");
@@ -782,7 +782,7 @@ static void LogBackupServiceCreatesTimestampedTargetDirectoriesAndCopiesFourFold
 static void LogBackupServiceWritesManifestWithRequiredDirectories()
 {
     using var scope = TempDirectory();
-    var service = new LogBackupService(new FakeVmrunService());
+    var service = new LogBackupService(new FakeVmrunService(), BackupOptions(scope.DirectoryPath));
     var timestamp = DateTimeOffset.Parse("2026-06-19T10:11:12+08:00");
     var vm = BackupVm(scope.DirectoryPath);
 
@@ -809,7 +809,7 @@ static void LogBackupServiceReturnsFailureWhenDirectoryCopyFails()
     var vm = BackupVm(scope.DirectoryPath);
     var guestZipPath = Path.Combine(vm.GuestWorkPath, "20260619101112.zip").Replace('/', '\\');
     var vmrun = new FakeVmrunService(failOnGuestPath: guestZipPath);
-    var service = new LogBackupService(vmrun);
+    var service = new LogBackupService(vmrun, BackupOptions(scope.DirectoryPath));
 
     var result = service.BackupAsync(vm, BackupTransaction(), DateTimeOffset.Parse("2026-06-19T10:11:12+08:00"), CancellationToken.None).GetAwaiter().GetResult();
 
@@ -1540,7 +1540,7 @@ static WorkerAgentOptions P0IntegrationOptions(string root)
     ];
     options.VirtualMachines[0].VmxPath = vmxPath;
     options.VirtualMachines[0].WorkerId = "rpa-sh-tax-etax-001";
-    options.VirtualMachines[0].HostWorkPath = root;
+    options.Agent.HostWorkPath = root;
     options.VirtualMachines[0].GuestUser = "Administrator";
     options.VirtualMachines[0].GuestPasswordSecret = "password";
     return options;
@@ -1687,16 +1687,18 @@ static VirtualMachineOptions BackupVm(string hostWorkPath)
         WorkerId = "rpa-sh-tax-etax-001",
         GuestUser = "Administrator",
         GuestPasswordSecret = "password",
-        HostWorkPath = hostWorkPath,
         GuestWorkPath = @"C:\seebot",
-        HostSharedPath = Path.Combine(hostWorkPath, "shared"),
-        GuestSharedPath = @"C:\seebot",
-        GuestBackupPaths = new GuestBackupPathsOptions
+        GuestBackupPaths = "cache,db,file,logs"
+    };
+}
+
+static WorkerAgentOptions BackupOptions(string hostWorkPath)
+{
+    return new WorkerAgentOptions
+    {
+        Agent = new AgentOptions
         {
-            Cache = @"C:\seebot\cache",
-            Db = @"C:\seebot\db",
-            File = @"C:\seebot\file",
-            Logs = @"C:\seebot\logs"
+            HostWorkPath = hostWorkPath
         }
     };
 }
@@ -1841,6 +1843,7 @@ static WorkerAgentOptions ValidOptions()
         {
             HostId = "SB-VM-001",
             AgentName = "SR20 Host Agent",
+            HostWorkPath = @"D:\seebot",
             PollIntervalSeconds = 10,
             CapabilityReportIntervalSeconds = 300,
             SwitchTimeoutSeconds = 300,
@@ -1879,15 +1882,8 @@ static WorkerAgentOptions ValidOptions()
                 RunnerControlBaseUrl = "http://192.168.100.101:9090",
                 RunnerStatusUrl = "http://192.168.100.101:9090/api/robot/start/status",
                 RunnerKillUrl = "http://192.168.100.101:9090/api/robot/kill",
-                HostWorkPath = @"D:\seebot",
                 GuestWorkPath = @"C:\seebot",
-                GuestBackupPaths = new GuestBackupPathsOptions
-                {
-                    Cache = @"C:\seebot\cache",
-                    Db = @"C:\seebot\db",
-                    File = @"C:\seebot\file",
-                    Logs = @"C:\seebot\logs"
-                },
+                GuestBackupPaths = "cache,db,file,logs",
                 Profiles =
                 [
                     new ProfileOptions
@@ -1913,15 +1909,8 @@ static WorkerAgentOptions ValidOptions()
                 RunnerControlBaseUrl = "http://192.168.100.102:9090",
                 RunnerStatusUrl = "http://192.168.100.102:9090/api/robot/start/status",
                 RunnerKillUrl = "http://192.168.100.102:9090/api/robot/kill",
-                HostWorkPath = @"D:\seebot",
                 GuestWorkPath = @"C:\seebot",
-                GuestBackupPaths = new GuestBackupPathsOptions
-                {
-                    Cache = @"C:\seebot\cache",
-                    Db = @"C:\seebot\db",
-                    File = @"C:\seebot\file",
-                    Logs = @"C:\seebot\logs"
-                },
+                GuestBackupPaths = "cache,db,file,logs",
                 Profiles =
                 [
                     new ProfileOptions

@@ -7,6 +7,9 @@ namespace Seebot.WorkerAgent.Core.Snapshot;
 
 public sealed class SnapshotUpdateService : ISnapshotUpdateService
 {
+    private const int RunnerStatusCheckMaxAttempts = 5;
+    private static readonly TimeSpan RunnerStatusCheckInterval = TimeSpan.FromSeconds(20);
+
     private readonly IVmrunService _vmrunService;
     private readonly IGuestWorkerClient _guestWorkerClient;
     private readonly IConfigFileUpdater _configFileUpdater;
@@ -68,14 +71,29 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
 
         await Task.Delay(TimeSpan.FromMinutes(1), _timeProvider, cancellationToken);
 
-        RunnerStatusResponse status;
-        try
+        RunnerStatusResponse? status = null;
+        Exception? lastException = null;
+        for (var attempt = 1; attempt <= RunnerStatusCheckMaxAttempts; attempt++)
         {
-            status = await _guestWorkerClient.GetRunnerStatusAsync(vm, cancellationToken);
+            try
+            {
+                status = await _guestWorkerClient.GetRunnerStatusAsync(vm, cancellationToken);
+                lastException = null;
+                break;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                lastException = ex;
+                if (attempt < RunnerStatusCheckMaxAttempts)
+                {
+                    await Task.Delay(RunnerStatusCheckInterval, _timeProvider, cancellationToken);
+                }
+            }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+
+        if (lastException is not null || status is null)
         {
-            return Fail(ErrorCodes.RunnerStatusCheckFailed, ex.Message, "check-status");
+            return Fail(ErrorCodes.RunnerStatusCheckFailed, lastException?.Message ?? "Unknown error.", "check-status");
         }
 
         if (status.RunnerStatusCode is not (RunnerStatusCode.Runnable or RunnerStatusCode.Running))

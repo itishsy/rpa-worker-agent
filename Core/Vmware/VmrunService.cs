@@ -28,6 +28,18 @@ public sealed class VmrunService : IVmrunService
         return Task.FromResult(ReadCurrentSnapshotFromVmsd(vmxPath));
     }
 
+    public async Task<string> GetGuestIPAddressAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        var result = await RunVmrunAsync("getGuestIPAddress", [vmxPath], cancellationToken);
+        var ipAddress = result.StandardOutput.Trim();
+        if (string.IsNullOrWhiteSpace(ipAddress))
+        {
+            throw new VmrunCommandException(result);
+        }
+
+        return ipAddress;
+    }
+
     // vmrun 没有 getCurrentSnapshot 命令，通过同目录的 .vmsd 文件解析
     // snapshot.current = "N" 指向当前快照 UID，snapshotX.uid = "N" 对应 snapshotX.displayName
     // 注意：文件还含有 snapshot.mruX.uid 等非快照条目，必须只匹配 snapshot{数字}.uid

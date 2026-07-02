@@ -68,19 +68,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ILocalStore>(provider =>
         {
             var agentOptions = provider.GetRequiredService<WorkerAgentOptions>().Agent;
-            string dbPath;
-            if (string.IsNullOrWhiteSpace(agentOptions.LocalDbPath))
-            {
-                dbPath = Path.Combine(AppContext.BaseDirectory, "data", "agent.db");
-            }
-            else if (string.Equals(Path.GetExtension(agentOptions.LocalDbPath), ".db", StringComparison.OrdinalIgnoreCase))
-            {
-                dbPath = agentOptions.LocalDbPath;
-            }
-            else
-            {
-                dbPath = Path.Combine(agentOptions.LocalDbPath, "agent.db");
-            }
+            var dbPath = Path.Combine(agentOptions.HostWorkPath, "db", "agent.db");
             Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
             return new LocalStore(dbPath);
         });

@@ -6,6 +6,8 @@ public interface IVmrunService
 
     Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken);
 
+    Task<string> GetGuestIPAddressAsync(string vmxPath, CancellationToken cancellationToken);
+
     Task<VmrunCommandResult> StopVmAsync(string vmxPath, VmStopMode mode, CancellationToken cancellationToken);
 
     Task<VmrunCommandResult> RevertToSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken);
