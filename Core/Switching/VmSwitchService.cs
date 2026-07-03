@@ -11,11 +11,17 @@ namespace Seebot.WorkerAgent.Core.Switching;
 
 public sealed class VmSwitchService : IVmSwitchService
 {
+    // vmrun stop soft 返回后，vmware-vmx.exe 释放 vmdk/lck 文件锁存在短暂延迟，
+    // revertToSnapshot 紧接着执行会报“文件正在使用中”，重试可以规避这个瞬时竞争
+    private const int SnapshotRevertMaxAttempts = 3;
+
     private readonly IGuestWorkerClient _guestWorkerClient;
     private readonly ILogBackupService _logBackupService;
     private readonly IVmrunService _vmrunService;
     private readonly ILocalStore _localStore;
     private readonly WorkerAgentOptions _options;
+    private readonly TimeProvider _timeProvider;
+    private readonly TimeSpan _snapshotRevertRetryDelay;
     private readonly ILogger<VmSwitchService> _logger;
 
     public VmSwitchService(
@@ -24,6 +30,8 @@ public sealed class VmSwitchService : IVmSwitchService
         IVmrunService vmrunService,
         ILocalStore localStore,
         WorkerAgentOptions options,
+        TimeProvider? timeProvider = null,
+        TimeSpan? snapshotRevertRetryDelay = null,
         ILogger<VmSwitchService>? logger = null)
     {
         _guestWorkerClient = guestWorkerClient;
@@ -31,6 +39,8 @@ public sealed class VmSwitchService : IVmSwitchService
         _vmrunService = vmrunService;
         _localStore = localStore;
         _options = options;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _snapshotRevertRetryDelay = snapshotRevertRetryDelay ?? TimeSpan.FromSeconds(5);
         _logger = logger ?? NullLogger<VmSwitchService>.Instance;
     }
 
@@ -118,8 +128,7 @@ public sealed class VmSwitchService : IVmSwitchService
 
         try
         {
-            _logger.LogInformation("Reverting VM to snapshot. TxId={TxId}, VmName={VmName}, TargetSnapshotName={TargetSnapshotName}", tx.TransactionId, request.Vm.Name, request.TargetSnapshotName);
-            await _vmrunService.RevertToSnapshotAsync(request.Vm.VmxPath, request.TargetSnapshotName, cancellationToken);
+            await RevertToSnapshotWithRetryAsync(tx, request, cancellationToken);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
@@ -185,6 +194,36 @@ public sealed class VmSwitchService : IVmSwitchService
             TxId = tx.TransactionId,
             Success = true
         };
+    }
+
+    private async Task RevertToSnapshotWithRetryAsync(SwitchTransaction tx, VmSwitchRequest request, CancellationToken cancellationToken)
+    {
+        for (var attempt = 1; attempt <= SnapshotRevertMaxAttempts; attempt++)
+        {
+            try
+            {
+                _logger.LogInformation(
+                    "Reverting VM to snapshot. TxId={TxId}, VmName={VmName}, TargetSnapshotName={TargetSnapshotName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}",
+                    tx.TransactionId,
+                    request.Vm.Name,
+                    request.TargetSnapshotName,
+                    attempt,
+                    SnapshotRevertMaxAttempts);
+                await _vmrunService.RevertToSnapshotAsync(request.Vm.VmxPath, request.TargetSnapshotName, cancellationToken);
+                return;
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException && attempt < SnapshotRevertMaxAttempts)
+            {
+                _logger.LogWarning(
+                    exception,
+                    "Snapshot revert attempt failed, retrying after delay. TxId={TxId}, VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}",
+                    tx.TransactionId,
+                    request.Vm.Name,
+                    attempt,
+                    SnapshotRevertMaxAttempts);
+                await Task.Delay(_snapshotRevertRetryDelay, _timeProvider, cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 
     private SwitchTransaction CreateTransaction(VmSwitchRequest request)

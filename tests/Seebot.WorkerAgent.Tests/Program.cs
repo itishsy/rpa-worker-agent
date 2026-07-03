@@ -105,7 +105,9 @@ var tests = new (string Name, Action Body)[]
     ("P0 integration runner Running does not switch", P0IntegrationRunnerRunningDoesNotSwitch),
     ("P0 integration kill WORKER_RUNNING does not switch", P0IntegrationKillWorkerRunningDoesNotSwitch),
     ("P0 integration backup failure does not revert", P0IntegrationBackupFailureDoesNotRevert),
-    ("P0 integration revert failure marks transaction and VM error", P0IntegrationRevertFailureMarksTransactionAndVmError)
+    ("P0 integration revert failure marks transaction and VM error", P0IntegrationRevertFailureMarksTransactionAndVmError),
+    ("VmSwitchService retries transient revert failure then succeeds", VmSwitchServiceRetriesTransientRevertFailureThenSucceeds),
+    ("VmSwitchService gives up and marks VM error after exhausting revert retries", VmSwitchServiceGivesUpAfterExhaustingRevertRetries)
 };
 
 foreach (var test in tests)
@@ -1504,6 +1506,43 @@ static void P0IntegrationRevertFailureMarksTransactionAndVmError()
     Assert.Equal(1, store.UpsertedVmStates.Count, "Revert failure should mark VM state as abnormal.");
     Assert.Equal(AgentVmStatus.ERROR, store.UpsertedVmStates[0].VmStatus, "Failed VM should be marked ERROR.");
     Assert.Equal(ErrorCodes.SnapshotRevertFailed, store.UpsertedVmStates[0].ErrorCode, "Failed VM should preserve revert error code.");
+    Assert.Equal(3, recorder.Actions.Count(action => action == "vmrun-revert"), "Permanent revert failure should exhaust all retry attempts.");
+}
+
+static void VmSwitchServiceRetriesTransientRevertFailureThenSucceeds()
+{
+    var recorder = new ActionRecorder();
+    var store = new RecordingLocalStore(recorder);
+    var vmrun = new RecordingSwitchVmrunService(recorder)
+    {
+        FailRevertTimes = 1
+    };
+
+    var result = NewVmSwitchService(ReadyGuest(recorder), new RecordingBackupService(recorder), vmrun, store)
+        .SwitchAsync(SwitchRequest(), CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.True(result.Success, "Switch should succeed once revert succeeds on retry.");
+    Assert.Equal(2, recorder.Actions.Count(action => action == "vmrun-revert"), "Revert should be retried exactly once before succeeding.");
+    Assert.Equal(0, store.UpsertedVmStates.Count(state => state.VmStatus == AgentVmStatus.ERROR), "Transient revert failure recovered by retry must not mark VM as ERROR.");
+}
+
+static void VmSwitchServiceGivesUpAfterExhaustingRevertRetries()
+{
+    var recorder = new ActionRecorder();
+    var store = new RecordingLocalStore(recorder);
+    var vmrun = new RecordingSwitchVmrunService(recorder)
+    {
+        FailRevertTimes = 5
+    };
+
+    var result = NewVmSwitchService(ReadyGuest(recorder), new RecordingBackupService(recorder), vmrun, store)
+        .SwitchAsync(SwitchRequest(), CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.False(result.Success, "Switch should fail once retries are exhausted.");
+    Assert.Equal(ErrorCodes.SnapshotRevertFailed, result.ErrorCode, "Exhausted retries should map to SNAPSHOT_REVERT_FAILED.");
+    Assert.Equal(3, recorder.Actions.Count(action => action == "vmrun-revert"), "Revert should be attempted exactly the configured max number of times.");
+    Assert.Equal(1, store.UpsertedVmStates.Count, "Exhausted retries should mark VM state as abnormal.");
+    Assert.Equal(AgentVmStatus.ERROR, store.UpsertedVmStates[0].VmStatus, "VM should be marked ERROR after retries are exhausted.");
 }
 
 static PoolSchedulerService NewPoolScheduler(
@@ -1612,7 +1651,7 @@ static VmSwitchService NewVmSwitchService(
         {
             DefaultStartNoGui = true
         }
-    });
+    }, snapshotRevertRetryDelay: TimeSpan.Zero);
 }
 
 static VmSwitchRequest SwitchRequest()
@@ -2279,6 +2318,8 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
     }
 
     public bool FailOnRevert { get; set; }
+    public int FailRevertTimes { get; set; }
+    private int _revertAttempts;
 
     public Task<IReadOnlyList<string>> ListSnapshotsAsync(string vmxPath, CancellationToken cancellationToken)
     {
@@ -2307,6 +2348,12 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
         if (FailOnRevert)
         {
             throw new InvalidOperationException("revert failed");
+        }
+
+        if (_revertAttempts < FailRevertTimes)
+        {
+            _revertAttempts++;
+            throw new InvalidOperationException("revert transiently failed");
         }
 
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "revertToSnapshot"));
