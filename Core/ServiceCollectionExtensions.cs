@@ -54,7 +54,8 @@ public static class ServiceCollectionExtensions
                 string.IsNullOrWhiteSpace(options.HostType) ? "ws" : options.HostType,
                 provider.GetRequiredService<IProcessRunner>(),
                 commandTimeout,
-                fileOperationTimeout);
+                fileOperationTimeout,
+                provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<VmrunService>>());
         });
         const string SchedulerAuthHttpClientName = "SchedulerAuth";
         services.AddHttpClient(SchedulerAuthHttpClientName, (provider, client) =>
@@ -70,7 +71,10 @@ public static class ServiceCollectionExtensions
         {
             var httpClient = provider.GetRequiredService<IHttpClientFactory>().CreateClient(SchedulerAuthHttpClientName);
             var options = provider.GetRequiredService<SchedulerOptions>();
-            return new SchedulerTokenProvider(httpClient, options);
+            return new SchedulerTokenProvider(
+                httpClient,
+                options,
+                provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<SchedulerTokenProvider>>());
         });
         services.AddHttpClient<ISchedulerClient, SchedulerClient>((provider, client) =>
         {
@@ -91,11 +95,11 @@ public static class ServiceCollectionExtensions
         services.AddHostedService<LocalStoreInitializerService>();
         services.AddSingleton<ILogBackupService, LogBackupService>();
         services.AddSingleton<Startup.IStartupValidator, StartupValidator>();
+        services.AddSingleton<IProfileSnapshotResolver, ProfileSnapshotResolver>();
+        services.AddSingleton<IVmOperationLock, VmOperationLock>();
         services.AddSingleton<IVmSwitchService, VmSwitchService>();
         services.AddSingleton<IVmStateRefreshService, VmStateRefreshService>();
         services.AddSingleton<IPoolSchedulerService, PoolSchedulerService>();
-        services.AddSingleton<IConfigFileUpdater>(_ =>
-            new ConfigFileUpdater(Path.Combine(AppContext.BaseDirectory, "appsettings.json")));
         services.AddSingleton<ISnapshotUpdateService, SnapshotUpdateService>();
         services.AddSingleton<CapabilityReportService>();
         services.AddHostedService(sp => sp.GetRequiredService<CapabilityReportService>());

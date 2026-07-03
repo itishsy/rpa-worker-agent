@@ -1,3 +1,7 @@
+using System.Diagnostics;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
 namespace Seebot.WorkerAgent.Core.Vmware;
 
 public sealed class VmrunService : IVmrunService
@@ -7,14 +11,22 @@ public sealed class VmrunService : IVmrunService
     private readonly IProcessRunner _processRunner;
     private readonly TimeSpan _commandTimeout;
     private readonly TimeSpan _fileOperationTimeout;
+    private readonly ILogger<VmrunService> _logger;
 
-    public VmrunService(string vmrunPath, string hostType, IProcessRunner processRunner, TimeSpan commandTimeout, TimeSpan fileOperationTimeout)
+    public VmrunService(
+        string vmrunPath,
+        string hostType,
+        IProcessRunner processRunner,
+        TimeSpan commandTimeout,
+        TimeSpan fileOperationTimeout,
+        ILogger<VmrunService>? logger = null)
     {
         _vmrunPath = vmrunPath;
         _hostType = hostType;
         _processRunner = processRunner;
         _commandTimeout = commandTimeout;
         _fileOperationTimeout = fileOperationTimeout;
+        _logger = logger ?? NullLogger<VmrunService>.Instance;
     }
 
     public async Task<IReadOnlyList<string>> ListSnapshotsAsync(string vmxPath, CancellationToken cancellationToken)
@@ -162,9 +174,7 @@ public sealed class VmrunService : IVmrunService
         var arguments = new List<string> { "-T", _hostType, commandName };
         arguments.AddRange(commandArguments);
 
-        var result = await _processRunner.RunAsync(
-            new ProcessCommand(_vmrunPath, arguments, _commandTimeout, commandName),
-            cancellationToken);
+        var result = await RunProcessAsync(new ProcessCommand(_vmrunPath, arguments, _commandTimeout, commandName), arguments, cancellationToken);
 
         if (result.ExitCode != 0)
         {
@@ -208,9 +218,7 @@ public sealed class VmrunService : IVmrunService
         };
         args.AddRange(arguments);
 
-        var result = await _processRunner.RunAsync(
-            new ProcessCommand(_vmrunPath, args, _fileOperationTimeout, "runProgramInGuest"),
-            cancellationToken);
+        var result = await RunProcessAsync(new ProcessCommand(_vmrunPath, args, _fileOperationTimeout, "runProgramInGuest"), args, cancellationToken);
 
         if (result.ExitCode != 0)
         {
@@ -238,9 +246,7 @@ public sealed class VmrunService : IVmrunService
             vmxPath, hostPath, guestPath
         };
 
-        var result = await _processRunner.RunAsync(
-            new ProcessCommand(_vmrunPath, arguments, _fileOperationTimeout, "copyFileFromHostToGuest"),
-            cancellationToken);
+        var result = await RunProcessAsync(new ProcessCommand(_vmrunPath, arguments, _fileOperationTimeout, "copyFileFromHostToGuest"), arguments, cancellationToken);
 
         if (result.ExitCode != 0)
         {
@@ -268,9 +274,7 @@ public sealed class VmrunService : IVmrunService
             vmxPath, guestPath, hostPath
         };
 
-        var result = await _processRunner.RunAsync(
-            new ProcessCommand(_vmrunPath, arguments, _fileOperationTimeout, "copyFileFromGuestToHost"),
-            cancellationToken);
+        var result = await RunProcessAsync(new ProcessCommand(_vmrunPath, arguments, _fileOperationTimeout, "copyFileFromGuestToHost"), arguments, cancellationToken);
 
         if (result.ExitCode != 0)
         {
@@ -296,5 +300,87 @@ public sealed class VmrunService : IVmrunService
             .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(line => !line.StartsWith("Total snapshots:", StringComparison.OrdinalIgnoreCase))
             .ToArray();
+    }
+
+    private async Task<VmrunCommandResult> RunProcessAsync(
+        ProcessCommand command,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken)
+    {
+        var started = Stopwatch.GetTimestamp();
+        _logger.LogInformation(
+            "VMware command started. Command={Command}, Arguments={Arguments}, TimeoutSeconds={TimeoutSeconds}",
+            command.CommandName,
+            SanitizeArguments(arguments),
+            command.Timeout.TotalSeconds);
+
+        try
+        {
+            var result = await _processRunner.RunAsync(command, cancellationToken);
+            var elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            if (result.ExitCode == 0)
+            {
+                _logger.LogInformation(
+                    "VMware command completed. Command={Command}, ExitCode={ExitCode}, ElapsedMs={ElapsedMs}, Stdout={Stdout}, Stderr={Stderr}",
+                    command.CommandName,
+                    result.ExitCode,
+                    elapsedMs,
+                    Truncate(result.StandardOutput),
+                    Truncate(result.StandardError));
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "VMware command failed. Command={Command}, ExitCode={ExitCode}, ElapsedMs={ElapsedMs}, Stdout={Stdout}, Stderr={Stderr}",
+                    command.CommandName,
+                    result.ExitCode,
+                    elapsedMs,
+                    Truncate(result.StandardOutput),
+                    Truncate(result.StandardError));
+            }
+
+            return result;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _logger.LogError(
+                exception,
+                "VMware command threw exception. Command={Command}, ElapsedMs={ElapsedMs}",
+                command.CommandName,
+                Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+            throw;
+        }
+    }
+
+    private static string SanitizeArguments(IReadOnlyList<string> arguments)
+    {
+        var sanitized = new List<string>(arguments.Count);
+        for (var i = 0; i < arguments.Count; i++)
+        {
+            var value = arguments[i];
+            sanitized.Add(value);
+            if (string.Equals(value, "-gp", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(value, "-EncodedCommand", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < arguments.Count)
+                {
+                    sanitized.Add("***");
+                    i++;
+                }
+            }
+        }
+
+        return string.Join(" ", sanitized);
+    }
+
+    private static string Truncate(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "";
+        }
+
+        var singleLine = value.Replace("\r", " ", StringComparison.Ordinal).Replace("\n", " ", StringComparison.Ordinal).Trim();
+        return singleLine.Length <= 1000 ? singleLine : singleLine[..1000] + "...";
     }
 }

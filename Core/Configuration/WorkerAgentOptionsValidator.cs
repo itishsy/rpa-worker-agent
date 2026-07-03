@@ -1,12 +1,7 @@
-using System.Text.RegularExpressions;
-
 namespace Seebot.WorkerAgent.Core.Configuration;
 
 public static class WorkerAgentOptionsValidator
 {
-    private static readonly Regex VersionedSnapshotSuffix =
-        new(@"^.+\.v\d{6}\.\d+$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
     public static ValidationResult Validate(WorkerAgentOptions options)
     {
         var errors = new List<string>();
@@ -69,16 +64,6 @@ public static class WorkerAgentOptionsValidator
 
             Require(profile.ProfileId, $"{profilePath}.ProfileId", errors);
             Require(profile.ProfileName, $"{profilePath}.ProfileName", errors);
-            Require(profile.SnapshotName, $"{profilePath}.SnapshotName", errors);
-            if (!string.IsNullOrWhiteSpace(profile.SnapshotName))
-            {
-                var expectedPrefix = profile.ProfileId + ".v";
-                if (!VersionedSnapshotSuffix.IsMatch(profile.SnapshotName)
-                    || !profile.SnapshotName.StartsWith(expectedPrefix, StringComparison.OrdinalIgnoreCase))
-                {
-                    errors.Add($"{profilePath}.SnapshotName must match format ProfileId.vYYMMDD.No (e.g. {profile.ProfileId}.v260624.1).");
-                }
-            }
 
             if (!string.IsNullOrWhiteSpace(profile.ProfileId) && !profileIds.Add(profile.ProfileId))
             {

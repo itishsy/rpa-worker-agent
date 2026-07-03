@@ -1,5 +1,8 @@
 using System.Net.Http.Json;
+using System.Diagnostics;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Domain;
 using Seebot.WorkerAgent.Core.Vmware;
@@ -16,16 +19,20 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
 
     private readonly HttpClient _httpClient;
     private readonly IVmrunService _vmrunService;
+    private readonly ILogger<GuestWorkerClient> _logger;
 
-    public GuestWorkerClient(HttpClient httpClient, IVmrunService vmrunService)
+    public GuestWorkerClient(HttpClient httpClient, IVmrunService vmrunService, ILogger<GuestWorkerClient>? logger = null)
     {
         _httpClient = httpClient;
         _vmrunService = vmrunService;
+        _logger = logger ?? NullLogger<GuestWorkerClient>.Instance;
     }
 
     public async Task<RunnerStatusResponse> GetRunnerStatusAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
     {
         var url = await BuildRunnerUrlAsync(vm, RunnerStatusPath, "GetRunnerStatus", cancellationToken);
+        var started = Stopwatch.GetTimestamp();
+        _logger.LogInformation("Runner status request started. VmName={VmName}, WorkerId={WorkerId}, Url={Url}", vm.Name, vm.WorkerId, url);
 
         try
         {
@@ -36,11 +43,18 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
             // data=0 表示可切换（Runnable），其他值表示不可切换
             var statusCode = result.Data == 0 ? RunnerStatusCode.Runnable : RunnerStatusCode.Running;
 
-            return new RunnerStatusResponse
+            var runnerStatus = new RunnerStatusResponse
             {
                 Success = true,
                 RunnerStatusCode = statusCode
             };
+            _logger.LogInformation(
+                "Runner status request completed. VmName={VmName}, StatusCode={StatusCode}, RunnerStatusCode={RunnerStatusCode}, ElapsedMs={ElapsedMs}",
+                vm.Name,
+                (int)response.StatusCode,
+                runnerStatus.RunnerStatusCode,
+                Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+            return runnerStatus;
         }
         catch (GuestWorkerClientException)
         {
@@ -48,6 +62,11 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
         }
         catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
         {
+            _logger.LogWarning(
+                exception,
+                "Runner status request failed. VmName={VmName}, ElapsedMs={ElapsedMs}",
+                vm.Name,
+                Stopwatch.GetElapsedTime(started).TotalMilliseconds);
             throw new GuestWorkerClientException("GetRunnerStatus", url, exception.Message, exception);
         }
     }
@@ -60,6 +79,15 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
         CancellationToken cancellationToken)
     {
         var url = await BuildRunnerUrlAsync(vm, RunnerKillPath, "KillRunner", cancellationToken);
+        var started = Stopwatch.GetTimestamp();
+        _logger.LogInformation(
+            "Runner kill request started. VmName={VmName}, WorkerId={WorkerId}, TxId={TxId}, Reason={Reason}, DeadlineSeconds={DeadlineSeconds}, Url={Url}",
+            vm.Name,
+            vm.WorkerId,
+            txId,
+            reason,
+            deadlineSeconds,
+            url);
 
         try
         {
@@ -74,12 +102,21 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
             await EnsureSuccessAsync(response, "KillRunner", url, cancellationToken);
 
             var result = await ReadJsonAsync<ApiResult<int>>(response, "KillRunner", url, cancellationToken);
-            return new KillRunnerResponse
+            var killResult = new KillRunnerResponse
             {
                 Success = result.Data == 0,
                 ErrorCode = result.Data == 0 ? null : ErrorCodes.ExecutorStopFailed,
                 Message = result.Data == 0 ? result.Message : $"Kill runner failed, data={result.Data}"
             };
+            _logger.LogInformation(
+                "Runner kill request completed. VmName={VmName}, TxId={TxId}, Success={Success}, Data={Data}, ErrorCode={ErrorCode}, ElapsedMs={ElapsedMs}",
+                vm.Name,
+                txId,
+                killResult.Success,
+                result.Data,
+                killResult.ErrorCode,
+                Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+            return killResult;
         }
         catch (GuestWorkerClientException)
         {
@@ -87,6 +124,12 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
         }
         catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
         {
+            _logger.LogWarning(
+                exception,
+                "Runner kill request failed. VmName={VmName}, TxId={TxId}, ElapsedMs={ElapsedMs}",
+                vm.Name,
+                txId,
+                Stopwatch.GetElapsedTime(started).TotalMilliseconds);
             throw new GuestWorkerClientException("KillRunner", url, exception.Message, exception);
         }
     }
@@ -99,7 +142,9 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
     {
         try
         {
+            _logger.LogInformation("Resolving guest IP address started. VmName={VmName}, VmxPath={VmxPath}, Operation={Operation}", vm.Name, vm.VmxPath, operationName);
             var ipAddress = await _vmrunService.GetGuestIPAddressAsync(vm.VmxPath, cancellationToken);
+            _logger.LogInformation("Resolving guest IP address completed. VmName={VmName}, IpAddress={IpAddress}, Operation={Operation}", vm.Name, ipAddress, operationName);
             return $"http://{ipAddress}:{RunnerControlPort}/{path}";
         }
         catch (Exception exception) when (exception is not OperationCanceledException)

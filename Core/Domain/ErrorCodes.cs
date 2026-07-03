@@ -11,6 +11,7 @@ public static class ErrorCodes
     public const string LogBackupFailedButForceRevert = "LOG_BACKUP_FAILED_BUT_FORCE_REVERT";
     public const string VmStopFailed = "VM_STOP_FAILED";
     public const string SnapshotNotFound = "SNAPSHOT_NOT_FOUND";
+    public const string SnapshotAmbiguous = "SNAPSHOT_AMBIGUOUS";
     public const string SnapshotRevertFailed = "SNAPSHOT_REVERT_FAILED";
     public const string VmStartFailed = "VM_START_FAILED";
     public const string VmReadyTimeout = "VM_READY_TIMEOUT";

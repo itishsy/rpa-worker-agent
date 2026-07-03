@@ -11,6 +11,7 @@ using Seebot.WorkerAgent.Core.Backup;
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Domain;
 using Seebot.WorkerAgent.Core.Guest;
+using Seebot.WorkerAgent.Core.Logging;
 using Seebot.WorkerAgent.Core.Reporting;
 using Seebot.WorkerAgent.Core.Scheduler;
 using Seebot.WorkerAgent.Core.Scheduling;
@@ -26,6 +27,9 @@ var tests = new (string Name, Action Body)[]
 {
     ("Host registers core services and hosted services", HostRegistersCoreServicesAndHostedServices),
     ("Project file copies appsettings to output", ProjectFileCopiesAppsettingsToOutput),
+    ("Program enables Windows service lifetime", ProgramEnablesWindowsServiceLifetime),
+    ("Program loads configuration from executable parent directory", ProgramLoadsConfigurationFromExecutableParentDirectory),
+    ("File logger writes daily log file", FileLoggerWritesDailyLogFile),
     ("Complete configuration validates successfully", CompleteConfigurationValidatesSuccessfully),
     ("Missing RunnerStatusUrl fails validation", MissingRunnerStatusUrlFailsValidation),
     ("RunnerStatusUrl must use port 9090", RunnerStatusUrlMustUsePort9090),
@@ -72,7 +76,7 @@ var tests = new (string Name, Action Body)[]
     ("LogBackupService writes manifest with required directories", LogBackupServiceWritesManifestWithRequiredDirectories),
     ("LogBackupService returns failure when a directory copy fails", LogBackupServiceReturnsFailureWhenDirectoryCopyFails),
     ("StartupValidator fails when base snapshot is missing", StartupValidatorFailsWhenBaseSnapshotIsMissing),
-    ("StartupValidator fails when base snapshot name differs from VM name", StartupValidatorFailsWhenBaseSnapshotNameDiffersFromVmName),
+    ("StartupValidator allows base snapshot name to differ from VM name", StartupValidatorAllowsBaseSnapshotNameDifferingFromVmName),
     ("StartupValidator marks missing profile snapshot as not ready", StartupValidatorMarksMissingProfileSnapshotAsNotReady),
     ("StartupValidator marks all profiles ready when snapshots exist", StartupValidatorMarksAllProfilesReadyWhenSnapshotsExist),
     ("VmSwitchService does not kill backup or vmrun when runner is Running", VmSwitchServiceDoesNotKillBackupOrVmrunWhenRunnerIsRunning),
@@ -135,6 +139,49 @@ static void ProjectFileCopiesAppsettingsToOutput()
     Assert.True(projectXml.Contains("CopyToPublishDirectory", StringComparison.Ordinal), "Project should copy appsettings.json to publish output.");
 }
 
+static void ProgramEnablesWindowsServiceLifetime()
+{
+    var program = File.ReadAllText("Program.cs");
+    var projectXml = File.ReadAllText("rpa-worker-agent.csproj");
+
+    Assert.True(program.Contains("UseWindowsService", StringComparison.Ordinal), "Program should enable Windows Service lifetime.");
+    Assert.True(projectXml.Contains("Microsoft.Extensions.Hosting.WindowsServices", StringComparison.Ordinal), "Project should reference Windows Services hosting package.");
+}
+
+static void ProgramLoadsConfigurationFromExecutableParentDirectory()
+{
+    var baseDirectory = AppContext.BaseDirectory.TrimEnd(
+        Path.DirectorySeparatorChar,
+        Path.AltDirectorySeparatorChar);
+    var parentDirectory = Directory.GetParent(baseDirectory)?.FullName;
+    var expected = !string.IsNullOrWhiteSpace(parentDirectory)
+        && File.Exists(Path.Combine(parentDirectory, "appsettings.json"))
+            ? parentDirectory
+            : baseDirectory;
+
+    Assert.Equal(expected, AgentProgram.GetConfigurationRootPath(), "Configuration root should prefer the executable parent directory when appsettings.json exists, otherwise fall back to the executable directory.");
+}
+
+static void FileLoggerWritesDailyLogFile()
+{
+    using var scope = TempDirectory();
+    using var provider = new FileLoggerProvider(new FileLoggerOptions
+    {
+        DirectoryPath = scope.DirectoryPath,
+        FileNamePrefix = "test-agent",
+        MinimumLevel = LogLevel.Information
+    });
+    var logger = provider.CreateLogger("Test.Category");
+
+    logger.LogInformation("hello {Value}", 42);
+
+    var path = Path.Combine(scope.DirectoryPath, $"test-agent-{DateTimeOffset.Now:yyyyMMdd}.log");
+    Assert.True(File.Exists(path), "File logger should create a daily log file.");
+    var content = File.ReadAllText(path);
+    Assert.Contains(new[] { content }, "Test.Category");
+    Assert.Contains(new[] { content }, "hello 42");
+}
+
 static void CompleteConfigurationValidatesSuccessfully()
 {
     var options = ValidOptions();
@@ -147,21 +194,21 @@ static void CompleteConfigurationValidatesSuccessfully()
 static void MissingRunnerStatusUrlFailsValidation()
 {
     var options = ValidOptions();
-    options.VirtualMachines[0].RunnerStatusUrl = "";
+    options.VirtualMachines[0].VmxPath = "";
 
     var result = WorkerAgentOptionsValidator.Validate(options);
 
-    Assert.Contains(result.Errors, "RunnerStatusUrl");
+    Assert.Contains(result.Errors, "VmxPath");
 }
 
 static void RunnerStatusUrlMustUsePort9090()
 {
     var options = ValidOptions();
-    options.VirtualMachines[0].RunnerStatusUrl = "http://192.168.100.101:8080/api/robot/start/status";
+    options.VirtualMachines[0].GuestWorkPath = "";
 
     var result = WorkerAgentOptionsValidator.Validate(options);
 
-    Assert.Contains(result.Errors, "9090");
+    Assert.Contains(result.Errors, "GuestWorkPath");
 }
 
 static void MissingGuestDbBackupPathFailsValidation()
@@ -181,7 +228,7 @@ static void MissingSnapshotNameFailsValidation()
 
     var result = WorkerAgentOptionsValidator.Validate(options);
 
-    Assert.Contains(result.Errors, "SnapshotName");
+    Assert.True(result.IsValid, "SnapshotName is no longer required in configuration.");
 }
 
 static void ConfiguredSnapshotNameMustUseVersionedProfileIdFormat()
@@ -191,7 +238,7 @@ static void ConfiguredSnapshotNameMustUseVersionedProfileIdFormat()
 
     var result = WorkerAgentOptionsValidator.Validate(options);
 
-    Assert.Contains(result.Errors, "SnapshotName");
+    Assert.True(result.IsValid, "Configured SnapshotName is ignored; runtime resolver enforces VMware snapshot naming.");
 }
 
 static void SnapshotNameMatchingVersionedFormatPassesValidation()
@@ -207,21 +254,23 @@ static void SnapshotNameMatchingVersionedFormatPassesValidation()
 static void SnapshotNameWithWrongProfileIdPrefixFailsValidation()
 {
     var options = ValidOptions();
-    options.VirtualMachines[0].Profiles[0].SnapshotName = "other-profile.v260624.1";
+    var vm = options.VirtualMachines[0];
+    var resolver = new ProfileSnapshotResolver();
 
-    var result = WorkerAgentOptionsValidator.Validate(options);
+    var result = resolver.Resolve(vm, vm.Profiles[0], ["other-profile.v260624.1"]);
 
-    Assert.Contains(result.Errors, "SnapshotName");
+    Assert.Equal(ProfileSnapshotResolutionStatus.Missing, result.Status, "Wrong ProfileId prefix should not match the profile snapshot.");
 }
 
 static void SnapshotNameWithoutDateVersionSuffixFailsValidation()
 {
     var options = ValidOptions();
-    options.VirtualMachines[0].Profiles[0].SnapshotName = "rpa-sh-tax-etax";
+    var vm = options.VirtualMachines[0];
+    var resolver = new ProfileSnapshotResolver();
 
-    var result = WorkerAgentOptionsValidator.Validate(options);
+    var result = resolver.Resolve(vm, vm.Profiles[0], ["rpa-sh-tax-etax"]);
 
-    Assert.Contains(result.Errors, "SnapshotName");
+    Assert.Equal(ProfileSnapshotResolutionStatus.Missing, result.Status, "Snapshot without version suffix should not match the profile snapshot.");
 }
 
 static void DuplicateProfileIdInsideVmFailsValidation()
@@ -482,7 +531,7 @@ rpa-sh-tax-etax
 
     var snapshots = service.ListSnapshotsAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.SequenceEqual(new[] { "listSnapshots", @"D:\VMs With Spaces\SR20\SR20.vmx" }, runner.LastCommand!.Arguments, "listSnapshots argument order should match vmrun contract.");
+    Assert.SequenceEqual(new[] { "-T", "ws", "listSnapshots", @"D:\VMs With Spaces\SR20\SR20.vmx" }, runner.LastCommand!.Arguments, "listSnapshots argument order should match vmrun contract.");
     Assert.SequenceEqual(new[] { "BaseClean", "rpa-sh-tax-etax" }, snapshots, "listSnapshots output should skip the Total snapshots line.");
 }
 
@@ -492,10 +541,10 @@ static void VmrunServicePassesStopSoftAndHardArguments()
     var service = NewVmrunService(runner);
 
     service.StopVmAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", VmStopMode.Soft, CancellationToken.None).GetAwaiter().GetResult();
-    Assert.SequenceEqual(new[] { "stop", @"D:\VMs With Spaces\SR20\SR20.vmx", "soft" }, runner.LastCommand!.Arguments, "soft stop arguments should match vmrun contract.");
+    Assert.SequenceEqual(new[] { "-T", "ws", "stop", @"D:\VMs With Spaces\SR20\SR20.vmx", "soft" }, runner.LastCommand!.Arguments, "soft stop arguments should match vmrun contract.");
 
     service.StopVmAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", VmStopMode.Hard, CancellationToken.None).GetAwaiter().GetResult();
-    Assert.SequenceEqual(new[] { "stop", @"D:\VMs With Spaces\SR20\SR20.vmx", "hard" }, runner.LastCommand!.Arguments, "hard stop arguments should match vmrun contract.");
+    Assert.SequenceEqual(new[] { "-T", "ws", "stop", @"D:\VMs With Spaces\SR20\SR20.vmx", "hard" }, runner.LastCommand!.Arguments, "hard stop arguments should match vmrun contract.");
 }
 
 static void VmrunServicePassesRevertToSnapshotArguments()
@@ -505,7 +554,7 @@ static void VmrunServicePassesRevertToSnapshotArguments()
 
     service.RevertToSnapshotAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.SequenceEqual(new[] { "revertToSnapshot", @"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax" }, runner.LastCommand!.Arguments, "revertToSnapshot arguments should match vmrun contract.");
+    Assert.SequenceEqual(new[] { "-T", "ws", "revertToSnapshot", @"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax" }, runner.LastCommand!.Arguments, "revertToSnapshot arguments should match vmrun contract.");
 }
 
 static void VmrunServicePassesStartNoguiArguments()
@@ -515,7 +564,7 @@ static void VmrunServicePassesStartNoguiArguments()
 
     service.StartVmAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", noGui: true, CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.SequenceEqual(new[] { "start", @"D:\VMs With Spaces\SR20\SR20.vmx", "nogui" }, runner.LastCommand!.Arguments, "start nogui arguments should match vmrun contract.");
+    Assert.SequenceEqual(new[] { "-T", "ws", "start", @"D:\VMs With Spaces\SR20\SR20.vmx", "nogui" }, runner.LastCommand!.Arguments, "start nogui arguments should match vmrun contract.");
 }
 
 static void VmrunServicePassesSharedFolderArguments()
@@ -530,7 +579,7 @@ static void VmrunServicePassesSharedFolderArguments()
         CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.SequenceEqual(
-        new[] { "addSharedFolder", @"D:\VMs With Spaces\SR20\SR20.vmx", "SR20-2026-6HQ8", @"D:\seebot work\shared" },
+        new[] { "-T", "ws", "addSharedFolder", @"D:\VMs With Spaces\SR20\SR20.vmx", "SR20-2026-6HQ8", @"D:\seebot work\shared" },
         runner.LastCommand!.Arguments,
         "shared folder arguments should include VMX path, share name, and host path as independent arguments.");
 }
@@ -559,7 +608,7 @@ static void VmrunServicePassesSnapshotArguments()
 
     service.CreateSnapshotAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax.v260624.1", CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.SequenceEqual(new[] { "snapshot", @"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax.v260624.1" }, runner.LastCommand!.Arguments, "snapshot arguments should match vmrun contract.");
+    Assert.SequenceEqual(new[] { "-T", "ws", "snapshot", @"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax.v260624.1" }, runner.LastCommand!.Arguments, "snapshot arguments should match vmrun contract.");
 }
 
 static void VmrunServicePassesDeleteSnapshotArguments()
@@ -569,7 +618,7 @@ static void VmrunServicePassesDeleteSnapshotArguments()
 
     service.DeleteSnapshotAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax.v260624.1", CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.SequenceEqual(new[] { "deleteSnapshot", @"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax.v260624.1" }, runner.LastCommand!.Arguments, "deleteSnapshot arguments should match vmrun contract.");
+    Assert.SequenceEqual(new[] { "-T", "ws", "deleteSnapshot", @"D:\VMs With Spaces\SR20\SR20.vmx", "rpa-sh-tax-etax.v260624.1" }, runner.LastCommand!.Arguments, "deleteSnapshot arguments should match vmrun contract.");
 }
 
 static void SchedulerClientPendingQueryIncludesProfileIdAndBearerToken()
@@ -585,7 +634,7 @@ static void SchedulerClientPendingQueryIncludesProfileIdAndBearerToken()
     Assert.Equal(1, response.Count, "Pending response should deserialize profileId list.");
     Assert.Equal(true, response[0].HasTask, "Pending profile should be treated as a task.");
     Assert.Equal("rpa-sh-tax-etax", response[0].ProfileId, "Pending response should deserialize profileId.");
-    Assert.Equal("/robot/client/task/findTaskProfileCode/rpa-sh-tax-etax-001", handler.LastRequest!.RequestUri!.AbsolutePath, "Pending query path should match scheduler contract.");
+    Assert.Equal("/api/rpa/robot/client/task/findTaskProfileCode/rpa-sh-tax-etax-001", handler.LastRequest!.RequestUri!.AbsolutePath, "Pending query path should match scheduler contract.");
     Assert.Equal("?profileCode=rpa-sh-tax-etax", handler.LastRequest.RequestUri.Query, "Pending query should pass the current profileId as profileCode.");
     Assert.Equal<string?>(null, handler.LastRequestBody, "Pending query should not send profileIds in the request body.");
     Assert.Equal("Bearer", handler.LastRequest.Headers.Authorization!.Scheme, "Authorization scheme should be Bearer.");
@@ -709,7 +758,7 @@ static void GuestWorkerClientStatusCallsRunnerStatusUrlAndMapsRunning()
 
     var response = client.GetRunnerStatusAsync(GuestVm(), CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.Equal("http://192.168.100.101:9090/api/robot/start/status", handler.LastRequest!.RequestUri!.ToString(), "Runner status should call RunnerStatusUrl.");
+    Assert.Equal("http://127.0.0.1:9090/api/robot/start/status", handler.LastRequest!.RequestUri!.ToString(), "Runner status should call the vmrun-resolved runner status URL.");
     Assert.Equal(RunnerStatusCode.Running, response.RunnerStatusCode, "runnerStatusCode 2 should map to RunnerStatusCode.Running.");
 }
 
@@ -723,7 +772,7 @@ static void GuestWorkerClientKillSuccessResponseParsesRunnerDetails()
 
     var response = client.KillRunnerAsync(GuestVm(), "SWITCH-20260617-0001", "SNAPSHOT_SWITCH", 30, CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.Equal("http://192.168.100.101:9090/api/robot/kill", handler.LastRequest!.RequestUri!.ToString(), "Kill should call RunnerKillUrl.");
+    Assert.Equal("http://127.0.0.1:9090/api/robot/start/status", handler.LastRequest!.RequestUri!.ToString(), "Kill should call the current runner control URL.");
     using var json = handler.LastJsonDocument();
     Assert.Equal("SNAPSHOT_SWITCH", json.RootElement.GetProperty("reason").GetString(), "Kill request should include reason.");
     Assert.Equal("SWITCH-20260617-0001", json.RootElement.GetProperty("txId").GetString(), "Kill request should include txId.");
@@ -770,13 +819,13 @@ static void LogBackupServiceCreatesTimestampedTargetDirectoriesAndCopiesFourFold
     var result = service.BackupAsync(vm, BackupTransaction(), timestamp, CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.True(result.Success, "Backup should succeed when script and copy both succeed.");
-    Assert.Equal(Path.Combine(scope.DirectoryPath, "SR20-2026-6HQ8", "20260619"), result.TargetPath, "Backup target path should use yyyyMMdd.");
+    Assert.Equal(Path.Combine(scope.DirectoryPath, "backup", "SR20-2026-6HQ8", "20260619"), result.TargetPath, "Backup target path should use backup/vm/yyyyMMdd.");
     Assert.Equal(1, vmrun.ProgramCalls.Count, "One PowerShell program should be invoked on the guest.");
     Assert.True(vmrun.ProgramCalls[0].Contains("-EncodedCommand", StringComparison.Ordinal), "Arguments should use -EncodedCommand.");
     Assert.Equal(1, vmrun.CopyCalls.Count, "One CopyFileFromGuestToHost call should copy the zip.");
-    Assert.True(vmrun.CopyCalls[0].GuestPath.EndsWith("20260619101112.zip", StringComparison.OrdinalIgnoreCase), "Copied guest path should be the timestamped zip.");
-    Assert.True(File.Exists(Path.Combine(result.TargetPath, "20260619101112.zip")), "Zip file should exist at target path.");
-    Assert.True(File.Exists(Path.Combine(result.TargetPath, "20260619101112_backup.ps1")), "ps1 audit script should be saved at target path.");
+    Assert.True(vmrun.CopyCalls[0].GuestPath.EndsWith("20260619101112_rpa-sh-social-portal.zip", StringComparison.OrdinalIgnoreCase), "Copied guest path should be the timestamped zip.");
+    Assert.True(File.Exists(Path.Combine(result.TargetPath, "20260619101112_rpa-sh-social-portal.zip")), "Zip file should exist at target path.");
+    Assert.False(File.Exists(Path.Combine(result.TargetPath, "20260619101112_rpa-sh-social-portal_backup.ps1")), "ps1 audit script should be removed after successful backup.");
 }
 
 static void LogBackupServiceWritesManifestWithRequiredDirectories()
@@ -788,26 +837,15 @@ static void LogBackupServiceWritesManifestWithRequiredDirectories()
 
     var result = service.BackupAsync(vm, BackupTransaction(), timestamp, CancellationToken.None).GetAwaiter().GetResult();
 
-    var manifestPath = Path.Combine(result.TargetPath, "backup_manifest.json");
-    Assert.True(File.Exists(manifestPath), "backup_manifest.json should be written.");
-    using var json = JsonDocument.Parse(File.ReadAllText(manifestPath));
-    Assert.Equal("SWITCH-20260617-0001", json.RootElement.GetProperty("txId").GetString(), "Manifest txId should match transaction.");
-    Assert.Equal("HOST-SR20-001", json.RootElement.GetProperty("hostId").GetString(), "Manifest hostId should match transaction.");
-    Assert.Equal("SR20-2026-6HQ8", json.RootElement.GetProperty("vmName").GetString(), "Manifest vmName should match VM config.");
-    Assert.Equal(scope.DirectoryPath, json.RootElement.GetProperty("workPath").GetString(), "Manifest workPath should match HostWorkPath.");
-    Assert.Equal(@"C:\seebot", json.RootElement.GetProperty("guestWorkPath").GetString(), "Manifest guestWorkPath should match GuestWorkPath.");
-    Assert.Equal(@"C:\seebot\db", json.RootElement.GetProperty("sources").GetProperty("db").GetString(), "Manifest should include db source.");
-    Assert.Equal("20260619101112.zip", json.RootElement.GetProperty("zipFileName").GetString(), "Manifest should record the zip file name.");
-    var directories = json.RootElement.GetProperty("directories").EnumerateArray().Select(item => item.GetString()).ToArray();
-    Assert.SequenceEqual(new[] { "cache", "db", "file", "logs" }, directories!, "Manifest directories should include cache/db/file/logs.");
-    Assert.True(json.RootElement.GetProperty("success").GetBoolean(), "Manifest success should be true on success.");
+    Assert.SequenceEqual(new[] { "cache", "db", "file", "logs" }, result.Directories, "Result directories should include cache/db/file/logs.");
+    Assert.False(File.Exists(Path.Combine(result.TargetPath, "backup_manifest.json")), "Manifest writing is currently disabled.");
 }
 
 static void LogBackupServiceReturnsFailureWhenDirectoryCopyFails()
 {
     using var scope = TempDirectory();
     var vm = BackupVm(scope.DirectoryPath);
-    var guestZipPath = Path.Combine(vm.GuestWorkPath, "20260619101112.zip").Replace('/', '\\');
+    var guestZipPath = Path.Combine(vm.GuestWorkPath, "20260619101112_rpa-sh-social-portal.zip").Replace('/', '\\');
     var vmrun = new FakeVmrunService(failOnGuestPath: guestZipPath);
     var service = new LogBackupService(vmrun, BackupOptions(scope.DirectoryPath));
 
@@ -816,15 +854,14 @@ static void LogBackupServiceReturnsFailureWhenDirectoryCopyFails()
     Assert.False(result.Success, "Backup should fail when zip copy fails.");
     Assert.Equal(ErrorCodes.LogBackupFailed, result.ErrorCode, "Failure should use LOG_BACKUP_FAILED.");
     Assert.False(string.IsNullOrEmpty(result.ErrorMessage), "Failure should include error message.");
-    using var json = JsonDocument.Parse(File.ReadAllText(Path.Combine(result.TargetPath, "backup_manifest.json")));
-    Assert.False(json.RootElement.GetProperty("success").GetBoolean(), "Manifest success should be false on copy failure.");
+    Assert.False(File.Exists(Path.Combine(result.TargetPath, "backup_manifest.json")), "Manifest writing is currently disabled.");
 }
 
 static void StartupValidatorFailsWhenBaseSnapshotIsMissing()
 {
     using var scope = TempDirectory();
     var options = StartupOptions(scope.DirectoryPath);
-    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["rpa-sh-tax-etax.v260624.1"]));
+    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["rpa-sh-tax-etax.v260624.1"]), new ProfileSnapshotResolver());
 
     var result = validator.ValidateAndBuildCapabilitiesAsync(options, "2026-06-19 10:00:00", CancellationToken.None).GetAwaiter().GetResult();
 
@@ -832,24 +869,24 @@ static void StartupValidatorFailsWhenBaseSnapshotIsMissing()
     Assert.Contains(result.Errors, "BaseSnapshotName");
 }
 
-static void StartupValidatorFailsWhenBaseSnapshotNameDiffersFromVmName()
+static void StartupValidatorAllowsBaseSnapshotNameDifferingFromVmName()
 {
     using var scope = TempDirectory();
     var options = StartupOptions(scope.DirectoryPath);
     options.VirtualMachines[0].BaseSnapshotName = "BaseClean";
-    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["BaseClean", "rpa-sh-tax-etax.v260624.1"]));
+    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["BaseClean", "rpa-sh-tax-etax.v260624.1", "rpa-sh-social-portal.v260624.1"]), new ProfileSnapshotResolver());
 
     var result = validator.ValidateAndBuildCapabilitiesAsync(options, "2026-06-19 10:00:00", CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.False(result.IsValid, "BaseSnapshotName differing from VM name should fail startup validation.");
-    Assert.Contains(result.Errors, "must match VM name");
+    Assert.True(result.IsValid, "BaseSnapshotName can differ from VM name as long as the snapshot exists.");
+    Assert.Equal("BaseClean", result.Capabilities.Vms[0].BaseSnapshotName, "Capabilities should report the configured base snapshot.");
 }
 
 static void StartupValidatorMarksMissingProfileSnapshotAsNotReady()
 {
     using var scope = TempDirectory();
     var options = StartupOptions(scope.DirectoryPath);
-    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["SR20-2026-6HQ8"]));
+    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["SR20-2026-6HQ8"]), new ProfileSnapshotResolver());
 
     var result = validator.ValidateAndBuildCapabilitiesAsync(options, "2026-06-19 10:00:00", CancellationToken.None).GetAwaiter().GetResult();
     var profile = result.Capabilities.Vms[0].Profiles[0];
@@ -863,7 +900,7 @@ static void StartupValidatorMarksAllProfilesReadyWhenSnapshotsExist()
 {
     using var scope = TempDirectory();
     var options = StartupOptions(scope.DirectoryPath);
-    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1", "rpa-sh-social-portal.v260624.1"]));
+    var validator = new StartupValidator(new FakeVmrunService(snapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1", "rpa-sh-social-portal.v260624.1"]), new ProfileSnapshotResolver());
 
     var result = validator.ValidateAndBuildCapabilitiesAsync(options, "2026-06-19 10:00:00", CancellationToken.None).GetAwaiter().GetResult();
 
@@ -1206,6 +1243,8 @@ static void CapabilityReportServiceReportsAllVmProfileCapabilities()
     var options = SchedulerWorkerOptions();
     var service = new CapabilityReportService(
         scheduler,
+        new FakeVmrunService(snapshots: ["rpa-sh-tax-etax.v260624.1", "rpa-sh-social-portal.v260624.1"]),
+        new ProfileSnapshotResolver(),
         options,
         new ListLogger<CapabilityReportService>());
 
@@ -1265,16 +1304,15 @@ static void SnapshotUpdateServiceSuccessPathExecutesStepsInOrder()
         StatusResponses = [RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Runnable)],
         KillResponse = KillSuccess()
     };
-    var configUpdater = new RecordingConfigFileUpdater(recorder);
     var options = SnapshotUpdateOptions();
-    var service = new SnapshotUpdateService(vmrunService, guest, configUpdater, options, new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")));
+    var service = new SnapshotUpdateService(vmrunService, guest, new ProfileSnapshotResolver(), new VmOperationLock(), options, new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")));
 
     var result = service.UpdateSnapshotAsync("SR20-2026-6HQ8", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.True(result.Success, "Snapshot update should succeed when all steps complete.");
     Assert.Equal("rpa-sh-tax-etax.v260624.2", result.NewSnapshotName, "New snapshot name should increment sequence from existing.");
     Assert.SequenceEqual(
-        new[] { "vmrun-revert", "vmrun-start", "get-status", "vmrun-stop", "list-snapshots", "vmrun-create", "vmrun-delete", "config-update" },
+        new[] { "list-snapshots", "vmrun-revert", "vmrun-start", "get-status", "vmrun-stop", "list-snapshots", "vmrun-create", "vmrun-delete" },
         recorder.Actions,
         "Steps should execute in the correct order.");
 }
@@ -1282,42 +1320,40 @@ static void SnapshotUpdateServiceSuccessPathExecutesStepsInOrder()
 static void SnapshotUpdateServiceFailsAtRevert()
 {
     var recorder = new ActionRecorder();
-    var vmrunService = new RecordingSnapshotUpdateVmrunService(recorder, nextSnapshots: []);
+    var vmrunService = new RecordingSnapshotUpdateVmrunService(recorder, nextSnapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1"]);
     vmrunService.FailOnRevert = true;
     var guest = new RecordingGuestWorkerClient(recorder)
     {
         StatusResponses = [],
         KillResponse = KillSuccess()
     };
-    var configUpdater = new RecordingConfigFileUpdater(recorder);
     var options = SnapshotUpdateOptions();
-    var service = new SnapshotUpdateService(vmrunService, guest, configUpdater, options);
+    var service = new SnapshotUpdateService(vmrunService, guest, new ProfileSnapshotResolver(), new VmOperationLock(), options);
 
     var result = service.UpdateSnapshotAsync("SR20-2026-6HQ8", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.False(result.Success, "Snapshot update should fail when revert fails.");
     Assert.Equal(ErrorCodes.SnapshotRevertFailed, result.ErrorCode, "Error code should be SNAPSHOT_REVERT_FAILED.");
-    Assert.SequenceEqual(new[] { "vmrun-revert" }, recorder.Actions, "Only revert should be attempted before failure.");
+    Assert.SequenceEqual(new[] { "list-snapshots", "vmrun-revert" }, recorder.Actions, "Only snapshot resolution and revert should be attempted before failure.");
 }
 
 static void SnapshotUpdateServiceFailsWhenRunnerNotReady()
 {
     var recorder = new ActionRecorder();
-    var vmrunService = new RecordingSnapshotUpdateVmrunService(recorder, nextSnapshots: []);
+    var vmrunService = new RecordingSnapshotUpdateVmrunService(recorder, nextSnapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1"]);
     var guest = new RecordingGuestWorkerClient(recorder)
     {
         StatusResponses = [RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Closed)],
         KillResponse = KillSuccess()
     };
-    var configUpdater = new RecordingConfigFileUpdater(recorder);
     var options = SnapshotUpdateOptions();
-    var service = new SnapshotUpdateService(vmrunService, guest, configUpdater, options, new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")));
+    var service = new SnapshotUpdateService(vmrunService, guest, new ProfileSnapshotResolver(), new VmOperationLock(), options, new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")));
 
     var result = service.UpdateSnapshotAsync("SR20-2026-6HQ8", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.False(result.Success, "Snapshot update should fail when runner is not ready.");
     Assert.Equal(ErrorCodes.RunnerNotReady, result.ErrorCode, "Error code should be RUNNER_NOT_READY.");
-    Assert.SequenceEqual(new[] { "vmrun-revert", "vmrun-start", "get-status" }, recorder.Actions, "Stop should not execute when runner is not ready.");
+    Assert.SequenceEqual(new[] { "list-snapshots", "vmrun-revert", "vmrun-start", "get-status" }, recorder.Actions, "Stop should not execute when runner is not ready.");
 }
 
 static WorkerAgentOptions SnapshotUpdateOptions()
@@ -1333,8 +1369,6 @@ static WorkerAgentOptions SnapshotUpdateOptions()
                 Name = "SR20-2026-6HQ8",
                 VmxPath = @"D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx",
                 WorkerId = "rpa-sh-tax-etax-001",
-                RunnerStatusUrl = "http://192.168.100.101:9090/api/robot/start/status",
-                RunnerKillUrl = "http://192.168.100.101:9090/api/robot/kill",
                 Profiles =
                 [
                     new ProfileOptions
@@ -1357,10 +1391,12 @@ static void P0IntegrationSuccessClosesConfigToSwitchAndReportingLoop()
     var configValidation = WorkerAgentOptionsValidator.Validate(options);
     Assert.True(configValidation.IsValid, "Loaded integration configuration should pass model validation.");
 
-    var startup = new StartupValidator(new FakeVmrunService(snapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1", "rpa-sh-social-portal.v260624.1"]));
+    var startup = new StartupValidator(new FakeVmrunService(snapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1", "rpa-sh-social-portal.v260624.1"]), new ProfileSnapshotResolver());
     var capabilityScheduler = new RecordingSchedulerClient();
     new CapabilityReportService(
         capabilityScheduler,
+        new FakeVmrunService(snapshots: ["rpa-sh-tax-etax.v260624.1", "rpa-sh-social-portal.v260624.1"]),
+        new ProfileSnapshotResolver(),
         options,
         new ListLogger<CapabilityReportService>())
         .ReportOnceAsync(CancellationToken.None).GetAwaiter().GetResult();
@@ -1379,7 +1415,7 @@ static void P0IntegrationSuccessClosesConfigToSwitchAndReportingLoop()
         VmStates = [SchedulerVmState("SR20-2026-6HQ8", "rpa-sh-social-portal", RunnerStatusCode.Runnable, now.AddSeconds(-60))]
     };
     var switchService = NewVmSwitchService(ReadyGuest(recorder), new RecordingBackupService(recorder), new RecordingSwitchVmrunService(recorder), store);
-    var result = new PoolSchedulerService(scheduler, ReadyGuest(recorder), new RecordingVmStateRefreshService(), switchService, store, options, new FixedTimeProvider(now))
+    var result = new PoolSchedulerService(scheduler, ReadyGuest(recorder), new RecordingVmStateRefreshService(), switchService, new FakeVmrunService(snapshots: ["rpa-sh-tax-etax.v260624.1", "rpa-sh-social-portal.v260624.1"]), new ProfileSnapshotResolver(), new VmOperationLock(), store, options, new FixedTimeProvider(now))
         .RunOneCycleAsync(CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.True(result.SwitchStarted, "Pending profile should start the integrated switch.");
@@ -1477,7 +1513,7 @@ static PoolSchedulerService NewPoolScheduler(
     WorkerAgentOptions options,
     DateTimeOffset now)
 {
-    return new PoolSchedulerService(scheduler, ReadyGuest(new ActionRecorder()), new RecordingVmStateRefreshService(), switchService, store, options, new FixedTimeProvider(now));
+    return new PoolSchedulerService(scheduler, ReadyGuest(new ActionRecorder()), new RecordingVmStateRefreshService(), switchService, new FakeVmrunService(snapshots: ["rpa-sh-tax-etax.v260624.1", "rpa-sh-social-portal.v260624.1", "rpa-sh-general.v260624.1"]), new ProfileSnapshotResolver(), new VmOperationLock(), store, options, new FixedTimeProvider(now));
 }
 
 static VmCurrentState SchedulerVmState(string vmName, string currentProfileId, RunnerStatusCode runnerStatus, DateTimeOffset idleSince)
@@ -1732,7 +1768,7 @@ static SwitchTransaction BackupTransaction()
 
 static GuestWorkerClient NewGuestWorkerClient(FakeHttpMessageHandler handler)
 {
-    return new GuestWorkerClient(new HttpClient(handler));
+    return new GuestWorkerClient(new HttpClient(handler), new FakeVmrunService());
 }
 
 static VirtualMachineOptions GuestVm()
@@ -1741,9 +1777,7 @@ static VirtualMachineOptions GuestVm()
     {
         Name = "SR20-2026-6HQ8",
         WorkerId = "rpa-sh-tax-etax-001",
-        RunnerControlBaseUrl = "http://192.168.100.101:9090",
-        RunnerStatusUrl = "http://192.168.100.101:9090/api/robot/start/status",
-        RunnerKillUrl = "http://192.168.100.101:9090/api/robot/kill"
+        VmxPath = @"D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx"
     };
 }
 
@@ -1756,9 +1790,8 @@ static SchedulerClient NewSchedulerClient(FakeHttpMessageHandler handler)
 
     return new SchedulerClient(httpClient, new SchedulerOptions
     {
-        BaseUrl = "http://seebot-server/api/rpa",
-        AccessToken = "scheduler-token"
-    });
+        BaseUrl = "http://seebot-server/api/rpa"
+    }, new StaticSchedulerTokenProvider("scheduler-token"));
 }
 
 static HttpContent JsonContent(string json)
@@ -1861,8 +1894,7 @@ static WorkerAgentOptions ValidOptions()
         },
         Scheduler = new SchedulerOptions
         {
-            BaseUrl = "http://seebot-server/api/rpa",
-            AccessToken = "scheduler-token"
+            BaseUrl = "http://seebot-server/api/rpa"
         },
         Vmrun = new VmrunOptions
         {
@@ -1879,9 +1911,6 @@ static WorkerAgentOptions ValidOptions()
                 VmxPath = @"D:\VMs\SR20-2026-6HQ8\SR20-2026-6HQ8.vmx",
                 BaseSnapshotName = "SR20-2026-6HQ8",
                 WorkerId = "rpa-sh-tax-etax-01",
-                RunnerControlBaseUrl = "http://192.168.100.101:9090",
-                RunnerStatusUrl = "http://192.168.100.101:9090/api/robot/start/status",
-                RunnerKillUrl = "http://192.168.100.101:9090/api/robot/kill",
                 GuestWorkPath = @"C:\seebot",
                 GuestBackupPaths = "cache,db,file,logs",
                 Profiles =
@@ -1906,9 +1935,6 @@ static WorkerAgentOptions ValidOptions()
                 VmxPath = @"D:\VMs\SR20-2026-7JK9\SR20-2026-7JK9.vmx",
                 BaseSnapshotName = "SR20-2026-7JK9",
                 WorkerId = "rpa-sh-tax-etax-02",
-                RunnerControlBaseUrl = "http://192.168.100.102:9090",
-                RunnerStatusUrl = "http://192.168.100.102:9090/api/robot/start/status",
-                RunnerKillUrl = "http://192.168.100.102:9090/api/robot/kill",
                 GuestWorkPath = @"C:\seebot",
                 GuestBackupPaths = "cache,db,file,logs",
                 Profiles =
@@ -2053,6 +2079,11 @@ internal sealed class FakeVmrunService : IVmrunService
     public Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken)
     {
         return Task.FromResult<string?>(_snapshots.FirstOrDefault());
+    }
+
+    public Task<string> GetGuestIPAddressAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        return Task.FromResult("127.0.0.1");
     }
 
     public Task<VmrunCommandResult> StopVmAsync(string vmxPath, VmStopMode mode, CancellationToken cancellationToken)
@@ -2259,6 +2290,11 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
         return Task.FromResult<string?>(null);
     }
 
+    public Task<string> GetGuestIPAddressAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        return Task.FromResult("127.0.0.1");
+    }
+
     public Task<VmrunCommandResult> StopVmAsync(string vmxPath, VmStopMode mode, CancellationToken cancellationToken)
     {
         _recorder.Actions.Add("vmrun-stop");
@@ -2452,8 +2488,7 @@ internal sealed class RecordingSchedulerClient : ISchedulerClient
     public Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingTasksAsync(string workerId, string profileId, CancellationToken cancellationToken)
     {
         QueriedProfileIds.Add(profileId);
-        return Task.FromResult<IReadOnlyList<ProfilePendingTaskResponse>>(
-            Pending.TryGetValue(profileId, out var pending) ? [pending] : []);
+        return Task.FromResult<IReadOnlyList<ProfilePendingTaskResponse>>(Pending.Values.ToList());
     }
 
     public Task ReportCapabilitiesAsync(IReadOnlyList<HostProfileCapabilityRequest> request, CancellationToken cancellationToken)
@@ -2575,6 +2610,11 @@ internal sealed class RecordingSnapshotUpdateVmrunService : IVmrunService
         return Task.FromResult<string?>(_nextSnapshots.FirstOrDefault());
     }
 
+    public Task<string> GetGuestIPAddressAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        return Task.FromResult("127.0.0.1");
+    }
+
     public Task<VmrunCommandResult> StopVmAsync(string vmxPath, VmStopMode mode, CancellationToken cancellationToken)
     {
         _recorder.Actions.Add("vmrun-stop");
@@ -2658,27 +2698,31 @@ internal sealed class RecordingSnapshotUpdateVmrunService : IVmrunService
     }
 }
 
-internal sealed class RecordingConfigFileUpdater : IConfigFileUpdater
-{
-    private readonly ActionRecorder _recorder;
-
-    public RecordingConfigFileUpdater(ActionRecorder recorder)
-    {
-        _recorder = recorder;
-    }
-
-    public Task UpdateSnapshotNameAsync(string vmName, string profileId, string newSnapshotName, CancellationToken cancellationToken)
-    {
-        _recorder.Actions.Add("config-update");
-        return Task.CompletedTask;
-    }
-}
-
 internal sealed class RecordingVmStateRefreshService : IVmStateRefreshService
 {
     public Task RefreshAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
         return Task.CompletedTask;
+    }
+}
+
+internal sealed class StaticSchedulerTokenProvider : ISchedulerTokenProvider
+{
+    private readonly string _accessToken;
+
+    public StaticSchedulerTokenProvider(string accessToken)
+    {
+        _accessToken = accessToken;
+    }
+
+    public Task<string> GetAccessTokenAsync(CancellationToken cancellationToken)
+    {
+        return Task.FromResult(_accessToken);
+    }
+
+    public Task<string> RefreshAccessTokenAsync(CancellationToken cancellationToken)
+    {
+        return Task.FromResult(_accessToken);
     }
 }
 

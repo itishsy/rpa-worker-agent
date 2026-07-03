@@ -1,5 +1,6 @@
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Scheduler;
+using Seebot.WorkerAgent.Core.Snapshot;
 using Seebot.WorkerAgent.Core.Vmware;
 
 namespace Seebot.WorkerAgent.Core.Startup;
@@ -11,10 +12,12 @@ public sealed class StartupValidator : IStartupValidator
     private const string Invalid = "INVALID";
 
     private readonly IVmrunService _vmrunService;
+    private readonly IProfileSnapshotResolver _snapshotResolver;
 
-    public StartupValidator(IVmrunService vmrunService)
+    public StartupValidator(IVmrunService vmrunService, IProfileSnapshotResolver snapshotResolver)
     {
         _vmrunService = vmrunService;
+        _snapshotResolver = snapshotResolver;
     }
 
     public async Task<StartupValidationResult> ValidateAndBuildCapabilitiesAsync(
@@ -61,35 +64,24 @@ public sealed class StartupValidator : IStartupValidator
 
             foreach (var profile in vm.Profiles)
             {
-                var snapshotName = profile.SnapshotName;
-                var snapshotExists = ContainsSnapshot(snapshots, snapshotName);
+                var resolution = _snapshotResolver.Resolve(vm, profile, snapshots);
+                var validationStatus = ToValidationStatus(resolution);
+                var snapshotExists = resolution.IsReady;
                 if (!snapshotExists)
                 {
-                    errors.Add($"Profile snapshot does not exist for VM {vm.Name}, profile {profile.ProfileId}: {snapshotName}");
+                    errors.Add($"Profile snapshot is not ready for VM {vm.Name}, profile {profile.ProfileId}: {resolution.Message}");
                 }
 
                 vmCapability.Profiles.Add(new ProfileCapabilityDto
                 {
                     ProfileId = profile.ProfileId,
                     ProfileName = profile.ProfileName,
-                    SnapshotName = snapshotName,
+                    SnapshotName = resolution.SnapshotName ?? "",
                     Enabled = true,
                     SnapshotExists = snapshotExists,
-                    ValidationStatus = snapshotExists ? Ready : Missing,
-                    ValidationMessage = snapshotExists ? null : "Configured snapshot was not returned by vmrun listSnapshots."
+                    ValidationStatus = validationStatus,
+                    ValidationMessage = resolution.IsReady ? null : resolution.Message
                 });
-            }
-
-            if (!string.Equals(vm.BaseSnapshotName, vm.Name, StringComparison.OrdinalIgnoreCase))
-            {
-                foreach (var profileCapability in vmCapability.Profiles)
-                {
-                    if (profileCapability.ValidationStatus == Ready)
-                    {
-                        profileCapability.ValidationStatus = Invalid;
-                        profileCapability.ValidationMessage = "BaseSnapshotName does not match VM name.";
-                    }
-                }
             }
         }
 
@@ -115,5 +107,15 @@ public sealed class StartupValidator : IStartupValidator
     private static bool ContainsSnapshot(IReadOnlyList<string> snapshots, string snapshotName)
     {
         return snapshots.Any(snapshot => string.Equals(snapshot, snapshotName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string ToValidationStatus(ProfileSnapshotResolution resolution)
+    {
+        return resolution.Status switch
+        {
+            ProfileSnapshotResolutionStatus.Ready => Ready,
+            ProfileSnapshotResolutionStatus.Missing => Missing,
+            _ => Invalid
+        };
     }
 }

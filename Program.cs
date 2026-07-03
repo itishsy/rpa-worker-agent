@@ -2,9 +2,11 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Hosting.WindowsServices;
 using Microsoft.Extensions.Logging;
 using Seebot.WorkerAgent.Core;
 using Seebot.WorkerAgent.Core.Configuration;
+using Seebot.WorkerAgent.Core.Logging;
 using Seebot.WorkerAgent.Core.Operations;
 using Seebot.WorkerAgent.Core.Startup;
 using System.Globalization;
@@ -15,11 +17,19 @@ public static class Program
 {
     public static async Task Main(string[] args)
     {
-        var builder = CreateWebApplicationBuilder(args);
-        var app = builder.Build();
-        await ValidateStartupAsync(app, CancellationToken.None).ConfigureAwait(false);
-        app.MapOperationsApi();
-        await app.RunAsync();
+        try
+        {
+            var builder = CreateWebApplicationBuilder(args);
+            var app = builder.Build();
+            await ValidateStartupAsync(app, CancellationToken.None).ConfigureAwait(false);
+            app.MapOperationsApi();
+            await app.RunAsync();
+        }
+        catch (Exception exception)
+        {
+            WriteBootstrapFatalLog(exception);
+            throw;
+        }
     }
 
     public static async Task ValidateStartupAsync(WebApplication app, CancellationToken cancellationToken)
@@ -61,7 +71,16 @@ public static class Program
 
     public static WebApplicationBuilder CreateWebApplicationBuilder(string[] args)
     {
-        var builder = WebApplication.CreateBuilder(args);
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+        {
+            Args = args,
+            ContentRootPath = GetConfigurationRootPath()
+        });
+        builder.Host.UseWindowsService(options =>
+        {
+            options.ServiceName = "SeebotWorkerAgent";
+        });
+        builder.Logging.AddWorkerAgentFileLogger(builder.Configuration, AppContext.BaseDirectory);
 
         var listenUrl = builder.Configuration["OperationsApi:ListenUrl"];
         if (!string.IsNullOrWhiteSpace(listenUrl))
@@ -74,5 +93,36 @@ public static class Program
         builder.Services.AddHostedService<WorkerAgent>();
 
         return builder;
+    }
+
+    public static string GetConfigurationRootPath()
+    {
+        var baseDirectory = AppContext.BaseDirectory.TrimEnd(
+            Path.DirectorySeparatorChar,
+            Path.AltDirectorySeparatorChar);
+        var parentDirectory = Directory.GetParent(baseDirectory)?.FullName;
+        if (!string.IsNullOrWhiteSpace(parentDirectory)
+            && File.Exists(Path.Combine(parentDirectory, "appsettings.json")))
+        {
+            return parentDirectory;
+        }
+
+        return baseDirectory;
+    }
+
+    private static void WriteBootstrapFatalLog(Exception exception)
+    {
+        try
+        {
+            var logDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
+            Directory.CreateDirectory(logDirectory);
+            var logPath = Path.Combine(logDirectory, $"startup-fatal-{DateTimeOffset.Now:yyyyMMdd}.log");
+            var line = $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz} [Fatal] Service failed to start.{Environment.NewLine}{exception}{Environment.NewLine}";
+            File.AppendAllText(logPath, line);
+        }
+        catch
+        {
+            // Last-resort startup logging must never hide the original startup error.
+        }
     }
 }

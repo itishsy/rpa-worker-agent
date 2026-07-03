@@ -1,6 +1,7 @@
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Domain;
 using Seebot.WorkerAgent.Core.Guest;
+using Seebot.WorkerAgent.Core.Snapshot;
 using Seebot.WorkerAgent.Core.Storage;
 using Seebot.WorkerAgent.Core.Vmware;
 
@@ -10,17 +11,20 @@ public sealed class VmStateRefreshService : IVmStateRefreshService
 {
     private readonly IGuestWorkerClient _guestWorkerClient;
     private readonly IVmrunService _vmrunService;
+    private readonly IProfileSnapshotResolver _snapshotResolver;
     private readonly ILocalStore _localStore;
     private readonly WorkerAgentOptions _options;
 
     public VmStateRefreshService(
         IGuestWorkerClient guestWorkerClient,
         IVmrunService vmrunService,
+        IProfileSnapshotResolver snapshotResolver,
         ILocalStore localStore,
         WorkerAgentOptions options)
     {
         _guestWorkerClient = guestWorkerClient;
         _vmrunService = vmrunService;
+        _snapshotResolver = snapshotResolver;
         _localStore = localStore;
         _options = options;
     }
@@ -49,7 +53,7 @@ public sealed class VmStateRefreshService : IVmStateRefreshService
                 currentSnapshotName = existing.CurrentSnapshotName;
             }
 
-            var currentProfileId = ResolveProfileId(vm, currentSnapshotName) ?? existing.CurrentProfileId;
+            var currentProfileId = _snapshotResolver.ResolveProfileId(vm, currentSnapshotName) ?? existing.CurrentProfileId;
 
             // 第二步：查询 runner 状态，更新运行时字段
             RunnerStatusResponse status;
@@ -93,15 +97,4 @@ public sealed class VmStateRefreshService : IVmStateRefreshService
         }
     }
 
-    private static string? ResolveProfileId(VirtualMachineOptions vm, string? snapshotName)
-    {
-        if (string.IsNullOrEmpty(snapshotName))
-        {
-            return null;
-        }
-
-        return vm.Profiles
-            .FirstOrDefault(p => string.Equals(p.SnapshotName, snapshotName, StringComparison.OrdinalIgnoreCase))
-            ?.ProfileId;
-    }
 }

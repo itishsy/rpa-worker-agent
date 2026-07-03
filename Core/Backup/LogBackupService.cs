@@ -1,4 +1,6 @@
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Domain;
 using Seebot.WorkerAgent.Core.Vmware;
@@ -14,11 +16,13 @@ public sealed class LogBackupService : ILogBackupService
 
     private readonly IVmrunService _vmrunService;
     private readonly WorkerAgentOptions _options;
+    private readonly ILogger<LogBackupService> _logger;
 
-    public LogBackupService(IVmrunService vmrunService, WorkerAgentOptions options)
+    public LogBackupService(IVmrunService vmrunService, WorkerAgentOptions options, ILogger<LogBackupService>? logger = null)
     {
         _vmrunService = vmrunService;
         _options = options;
+        _logger = logger ?? NullLogger<LogBackupService>.Instance;
     }
 
     public async Task<LogBackupResult> BackupAsync(
@@ -35,6 +39,15 @@ public sealed class LogBackupService : ILogBackupService
         var guestZipPath = Path.Combine(vm.GuestWorkPath, $"{timestampTag}.zip").Replace('/', '\\');
         var hostScriptPath = Path.Combine(targetPath, $"{timestampTag}_backup.ps1");
 
+        _logger.LogInformation(
+            "Log backup started. TxId={TxId}, VmName={VmName}, FromProfileId={FromProfileId}, Directories={Directories}, TargetPath={TargetPath}, GuestZipPath={GuestZipPath}",
+            transaction.TransactionId,
+            vm.Name,
+            transaction.FromProfileId,
+            string.Join(",", directoryNames),
+            targetPath,
+            guestZipPath);
+
         string? errorMessage = null;
         var success = false;
         long totalBytes = 0;
@@ -50,6 +63,12 @@ public sealed class LogBackupService : ILogBackupService
                 cancellationToken).ConfigureAwait(false);
 
             var hostZipPath = Path.Combine(targetPath, $"{timestampTag}.zip");
+            _logger.LogInformation(
+                "Copy backup zip from guest started. TxId={TxId}, VmName={VmName}, GuestZipPath={GuestZipPath}, HostZipPath={HostZipPath}",
+                transaction.TransactionId,
+                vm.Name,
+                guestZipPath,
+                hostZipPath);
             await _vmrunService.CopyFileFromGuestToHostAsync(
                 vm.VmxPath,
                 vm.GuestUser,
@@ -77,6 +96,12 @@ public sealed class LogBackupService : ILogBackupService
         catch (Exception exception)
         {
             errorMessage = exception.Message;
+            _logger.LogWarning(
+                exception,
+                "Log backup failed. TxId={TxId}, VmName={VmName}, TargetPath={TargetPath}",
+                transaction.TransactionId,
+                vm.Name,
+                targetPath);
         }
 
         var result = new LogBackupResult
@@ -106,6 +131,17 @@ public sealed class LogBackupService : ILogBackupService
         //     result.ErrorCode,
         //     errorMessage,
         //     cancellationToken);
+
+        _logger.LogInformation(
+            "Log backup completed. TxId={TxId}, VmName={VmName}, Success={Success}, FileCount={FileCount}, TotalBytes={TotalBytes}, TargetPath={TargetPath}, ErrorCode={ErrorCode}, ErrorMessage={ErrorMessage}",
+            transaction.TransactionId,
+            vm.Name,
+            result.Success,
+            result.FileCount,
+            result.TotalBytes,
+            result.TargetPath,
+            result.ErrorCode,
+            result.ErrorMessage);
 
         return result;
     }
@@ -165,6 +201,12 @@ Compress-Archive -Path $timestampPath -DestinationPath $zipPath -Force
 
         var encodedCommand = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
 
+        _logger.LogInformation(
+            "Compress backup on guest started. VmName={VmName}, Directories={Directories}, GuestZipPath={GuestZipPath}, HostScriptPath={HostScriptPath}",
+            vm.Name,
+            string.Join(",", directoryNames),
+            guestZipPath,
+            hostScriptPath);
         await _vmrunService.RunProgramInGuestAsync(
             vm.VmxPath,
             vm.GuestUser,
@@ -172,6 +214,10 @@ Compress-Archive -Path $timestampPath -DestinationPath $zipPath -Force
             "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
             ["-NonInteractive", "-EncodedCommand", encodedCommand],
             cancellationToken).ConfigureAwait(false);
+        _logger.LogInformation(
+            "Compress backup on guest completed. VmName={VmName}, GuestZipPath={GuestZipPath}",
+            vm.Name,
+            guestZipPath);
     }
 
     private static string EscapePowerShellSingleQuotedString(string value)
