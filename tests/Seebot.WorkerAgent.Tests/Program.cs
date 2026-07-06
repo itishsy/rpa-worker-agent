@@ -55,6 +55,8 @@ var tests = new (string Name, Action Body)[]
     ("LocalStore creates and queries switch transactions", LocalStoreCreatesAndQueriesSwitchTransactions),
     ("LocalStore updates switch transaction status", LocalStoreUpdatesSwitchTransactionStatus),
     ("LocalStore incomplete transaction query excludes terminal states", LocalStoreIncompleteTransactionQueryExcludesTerminalStates),
+    ("VirtualMachineRegistry upserts and queries VM profiles", VirtualMachineRegistryUpsertsAndQueriesVmProfiles),
+    ("WorkerAgent configuration loads VirtualMachines from SQLite registry", WorkerAgentConfigurationLoadsVirtualMachinesFromSqliteRegistry),
     ("VmrunService passes listSnapshots arguments in order and parses output", VmrunServicePassesListSnapshotsArgumentsInOrderAndParsesOutput),
     ("VmrunService passes stop soft and hard arguments", VmrunServicePassesStopSoftAndHardArguments),
     ("VmrunService passes revertToSnapshot arguments", VmrunServicePassesRevertToSnapshotArguments),
@@ -515,6 +517,84 @@ static void LocalStoreIncompleteTransactionQueryExcludesTerminalStates()
 
     Assert.Equal(1, incomplete.Count, "Only non-terminal transactions should be returned.");
     Assert.Equal("tx-active", incomplete[0].TransactionId, "Active transaction should be returned.");
+}
+
+static void VirtualMachineRegistryUpsertsAndQueriesVmProfiles()
+{
+    using var scope = TempDatabase();
+    var registry = new SqliteVirtualMachineRegistry(scope.DatabasePath);
+    var vm = new VirtualMachineOptions
+    {
+        Name = "SR20-2606-POC1",
+        VmxPath = @"E:\vms\SR20-2606-POC1\Windows 10 x64.vmx",
+        BaseSnapshotName = "BaseClean",
+        GuestUser = "rpa",
+        GuestPasswordSecret = "secret",
+        WorkerId = "SR20-2606-POC1",
+        GuestWorkPath = @"D:\seebon\rpa",
+        GuestBackupPaths = "cache,db,file,logs",
+        Profiles =
+        [
+            new ProfileOptions { ProfileId = "General", ProfileName = "General environment" },
+            new ProfileOptions { ProfileId = "SuZhou-CA", ProfileName = "Suzhou CA" }
+        ]
+    };
+
+    registry.UpsertVmAsync(vm).GetAwaiter().GetResult();
+    registry.UpsertProfileAsync(vm.Name, new ProfileOptions { ProfileId = "DongGuan-CA", ProfileName = "Dongguan CA" }).GetAwaiter().GetResult();
+
+    var loaded = registry.GetByNameAsync(vm.Name).GetAwaiter().GetResult();
+
+    Assert.True(SqliteTableExists(scope.DatabasePath, "local_vm_config"), "VM config table should be created.");
+    Assert.True(SqliteTableExists(scope.DatabasePath, "local_vm_profile"), "VM profile table should be created.");
+    Assert.NotNull(loaded, "Saved VM should be queryable.");
+    Assert.Equal(vm.VmxPath, loaded!.VmxPath, "VMX path should round-trip through registry.");
+    Assert.Equal(3, loaded.Profiles.Count, "Profiles should round-trip through registry.");
+    Assert.True(loaded.Profiles.Any(profile => profile.ProfileId == "DongGuan-CA"), "Upserted profile should be queryable.");
+}
+
+static void WorkerAgentConfigurationLoadsVirtualMachinesFromSqliteRegistry()
+{
+    using var scope = TempDirectory();
+    var dbPath = Path.Combine(scope.DirectoryPath, "db", "agent.db");
+    Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+    var registry = new SqliteVirtualMachineRegistry(dbPath);
+    registry.UpsertVmAsync(new VirtualMachineOptions
+    {
+        Name = "VM-FROM-SQLITE",
+        VmxPath = @"E:\vms\VM-FROM-SQLITE\Windows 10 x64.vmx",
+        BaseSnapshotName = "BaseClean",
+        WorkerId = "worker-from-sqlite",
+        GuestWorkPath = @"D:\seebon\rpa",
+        GuestBackupPaths = "cache,db,file,logs",
+        Profiles = [new ProfileOptions { ProfileId = "General", ProfileName = "General environment" }]
+    }).GetAwaiter().GetResult();
+
+    var configuration = new ConfigurationBuilder()
+        .AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Agent:HostId"] = "HOST-LOCAL",
+            ["Agent:HostWorkPath"] = scope.DirectoryPath,
+            ["Scheduler:BaseUrl"] = "http://seebot-server/api/rpa",
+            ["Vmrun:VmrunPath"] = @"C:\Program Files\VMware\vmrun.exe",
+            ["VirtualMachines:0:Name"] = "VM-FROM-APPSETTINGS",
+            ["VirtualMachines:0:VmxPath"] = @"E:\vms\VM-FROM-APPSETTINGS\Windows 10 x64.vmx",
+            ["VirtualMachines:0:BaseSnapshotName"] = "AppsettingsSnapshot",
+            ["VirtualMachines:0:WorkerId"] = "worker-from-appsettings",
+            ["VirtualMachines:0:GuestWorkPath"] = @"D:\seebon\rpa",
+            ["VirtualMachines:0:GuestBackupPaths"] = "cache,db,file,logs"
+        })
+        .Build();
+    var services = new ServiceCollection();
+    services.AddLogging();
+    services.AddWorkerAgentConfiguration(configuration);
+    using var provider = services.BuildServiceProvider();
+
+    var options = provider.GetRequiredService<WorkerAgentOptions>();
+
+    Assert.Equal(1, options.VirtualMachines.Count, "VirtualMachines should be loaded from local SQLite registry.");
+    Assert.Equal("VM-FROM-SQLITE", options.VirtualMachines[0].Name, "SQLite registry should override appsettings VirtualMachines.");
+    Assert.Equal("General", options.VirtualMachines[0].Profiles[0].ProfileId, "Profiles should be loaded from SQLite registry.");
 }
 
 static void VmrunServicePassesListSnapshotsArgumentsInOrderAndParsesOutput()

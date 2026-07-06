@@ -33,11 +33,24 @@ public static class ServiceCollectionExtensions
         services.Configure<VmrunOptions>(configuration.GetSection("Vmrun"));
         services.Configure<List<VirtualMachineOptions>>(configuration.GetSection("VirtualMachines"));
         services.AddSingleton(provider => provider.GetRequiredService<IOptions<SchedulerOptions>>().Value);
+        services.AddSingleton<IVirtualMachineRegistry>(provider =>
+        {
+            var agentOptions = provider.GetRequiredService<IOptions<AgentOptions>>().Value;
+            var dbPath = GetAgentDatabasePath(agentOptions);
+            Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+            return new SqliteVirtualMachineRegistry(dbPath);
+        });
 
         services.AddSingleton(provider =>
         {
             var options = new WorkerAgentOptions();
             configuration.Bind(options);
+            options.VirtualMachines = provider
+                .GetRequiredService<IVirtualMachineRegistry>()
+                .GetAllAsync()
+                .GetAwaiter()
+                .GetResult()
+                .ToList();
             return options;
         });
 
@@ -88,7 +101,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ILocalStore>(provider =>
         {
             var agentOptions = provider.GetRequiredService<WorkerAgentOptions>().Agent;
-            var dbPath = Path.Combine(agentOptions.HostWorkPath, "db", "agent.db");
+            var dbPath = GetAgentDatabasePath(agentOptions);
             Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
             return new LocalStore(dbPath);
         });
@@ -105,5 +118,10 @@ public static class ServiceCollectionExtensions
         services.AddHostedService(sp => sp.GetRequiredService<CapabilityReportService>());
 
         return services;
+    }
+
+    private static string GetAgentDatabasePath(AgentOptions agentOptions)
+    {
+        return Path.Combine(agentOptions.HostWorkPath, "db", "agent.db");
     }
 }
