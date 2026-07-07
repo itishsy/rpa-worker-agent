@@ -466,6 +466,21 @@ static void LocalStoreUpsertsAndQueriesVmState()
     Assert.Equal("SR20-2026-6HQ8", states[0].VmName, "VM name should round-trip.");
     Assert.Equal(RunnerStatusCode.Runnable, states[0].RunnerStatusCode, "Runner status should round-trip.");
     Assert.Equal(AgentVmStatus.MONITORING, states[0].VmStatus, "VM status should round-trip.");
+
+    store.SeedVmStatesAsync("SB-VM-001", [
+        new VmCurrentState
+        {
+            VmName = "SR20-2026-6HQ8",
+            WorkerId = "rpa-sh-tax-etax-02",
+            VmStatus = AgentVmStatus.UNKNOWN,
+            UpdatedAt = now.AddMinutes(1)
+        }
+    ]).GetAwaiter().GetResult();
+
+    var seededState = store.GetVmStateAsync("SB-VM-001", "SR20-2026-6HQ8").GetAwaiter().GetResult();
+    Assert.Equal("rpa-sh-tax-etax-02", seededState!.WorkerId, "Seed should sync WorkerId from current VM config.");
+    Assert.Equal("rpa-sh-tax-etax", seededState.CurrentProfileId, "Seed should preserve runtime current profile.");
+    Assert.Equal("rpa-sh-tax-etax", seededState.CurrentSnapshotName, "Seed should preserve runtime current snapshot.");
 }
 
 static void LocalStoreCreatesAndQueriesSwitchTransactions()
@@ -535,13 +550,13 @@ static void VirtualMachineRegistryUpsertsAndQueriesVmProfiles()
         GuestBackupPaths = "cache,db,file,logs",
         Profiles =
         [
-            new ProfileOptions { ProfileId = "General", ProfileName = "General environment" },
-            new ProfileOptions { ProfileId = "SuZhou-CA", ProfileName = "Suzhou CA" }
+            new ProfileOptions { ProfileId = "General", ProfileName = "General environment", SnapshotName = "General.v260706.1" },
+            new ProfileOptions { ProfileId = "SuZhou-CA", ProfileName = "Suzhou CA", SnapshotName = "SuZhou-CA.v260706.1" }
         ]
     };
 
     registry.UpsertVmAsync(vm).GetAwaiter().GetResult();
-    registry.UpsertProfileAsync(vm.Name, new ProfileOptions { ProfileId = "DongGuan-CA", ProfileName = "Dongguan CA" }).GetAwaiter().GetResult();
+    registry.UpsertProfileAsync(vm.Name, new ProfileOptions { ProfileId = "DongGuan-CA", ProfileName = "Dongguan CA", SnapshotName = "DongGuan-CA.v260706.1" }).GetAwaiter().GetResult();
 
     var loaded = registry.GetByNameAsync(vm.Name).GetAwaiter().GetResult();
 
@@ -549,8 +564,24 @@ static void VirtualMachineRegistryUpsertsAndQueriesVmProfiles()
     Assert.True(SqliteTableExists(scope.DatabasePath, "local_vm_profile"), "VM profile table should be created.");
     Assert.NotNull(loaded, "Saved VM should be queryable.");
     Assert.Equal(vm.VmxPath, loaded!.VmxPath, "VMX path should round-trip through registry.");
+    Assert.True(loaded.Enabled, "VM should be enabled by default.");
     Assert.Equal(3, loaded.Profiles.Count, "Profiles should round-trip through registry.");
-    Assert.True(loaded.Profiles.Any(profile => profile.ProfileId == "DongGuan-CA"), "Upserted profile should be queryable.");
+    var dongGuanProfile = loaded.Profiles.FirstOrDefault(profile => profile.ProfileId == "DongGuan-CA");
+    Assert.NotNull(dongGuanProfile, "Upserted profile should be queryable.");
+    Assert.Equal("DongGuan-CA.v260706.1", dongGuanProfile!.SnapshotName, "Profile snapshot name should round-trip through registry.");
+    Assert.True(!string.IsNullOrWhiteSpace(dongGuanProfile.UpdatedAt), "Profile updated time should be queryable.");
+
+    registry.UpdateProfileSnapshotAsync(vm.Name, "DongGuan-CA", "DongGuan-CA.v260706.2").GetAwaiter().GetResult();
+    loaded = registry.GetByNameAsync(vm.Name).GetAwaiter().GetResult();
+    dongGuanProfile = loaded!.Profiles.FirstOrDefault(profile => profile.ProfileId == "DongGuan-CA");
+
+    Assert.Equal("DongGuan-CA.v260706.2", dongGuanProfile!.SnapshotName, "Profile snapshot name should be updateable after switch or snapshot update.");
+
+    registry.UpdateVmStatusAsync(vm.Name, enabled: false, "Base snapshot missing").GetAwaiter().GetResult();
+    loaded = registry.GetByNameAsync(vm.Name).GetAwaiter().GetResult();
+
+    Assert.False(loaded!.Enabled, "VM enabled status should be updateable.");
+    Assert.Equal("Base snapshot missing", loaded.DisabledReason, "VM disabled reason should be updateable.");
 }
 
 static void WorkerAgentConfigurationLoadsVirtualMachinesFromSqliteRegistry()
@@ -947,8 +978,10 @@ static void StartupValidatorFailsWhenBaseSnapshotIsMissing()
 
     var result = validator.ValidateAndBuildCapabilitiesAsync(options, "2026-06-19 10:00:00", CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.False(result.IsValid, "Missing base snapshot should fail startup validation.");
-    Assert.Contains(result.Errors, "BaseSnapshotName");
+    Assert.True(result.IsValid, "Missing base snapshot should disable the VM without failing service startup.");
+    Assert.False(options.VirtualMachines[0].Enabled, "Invalid VM should be disabled in memory.");
+    Assert.False(result.Capabilities.Vms[0].Enabled, "Invalid VM capability should be disabled.");
+    Assert.Contains(new[] { options.VirtualMachines[0].DisabledReason ?? "" }, "BaseSnapshotName");
 }
 
 static void StartupValidatorAllowsBaseSnapshotNameDifferingFromVmName()
@@ -973,7 +1006,8 @@ static void StartupValidatorMarksMissingProfileSnapshotAsNotReady()
     var result = validator.ValidateAndBuildCapabilitiesAsync(options, "2026-06-19 10:00:00", CancellationToken.None).GetAwaiter().GetResult();
     var profile = result.Capabilities.Vms[0].Profiles[0];
 
-    Assert.False(result.IsValid, "Missing profile snapshot should fail startup validation.");
+    Assert.True(result.IsValid, "Missing profile snapshot should disable the VM without failing service startup.");
+    Assert.False(options.VirtualMachines[0].Enabled, "VM with missing profile snapshot should be disabled.");
     Assert.False(profile.SnapshotExists, "Missing profile snapshot should set snapshotExists=false.");
     Assert.False(string.Equals("READY", profile.ValidationStatus, StringComparison.OrdinalIgnoreCase), "Missing profile snapshot should not be READY.");
 }
@@ -1394,9 +1428,9 @@ static void SnapshotUpdateServiceSuccessPathExecutesStepsInOrder()
     Assert.True(result.Success, "Snapshot update should succeed when all steps complete.");
     Assert.Equal("rpa-sh-tax-etax.v260624.2", result.NewSnapshotName, "New snapshot name should increment sequence from existing.");
     Assert.SequenceEqual(
-        new[] { "list-snapshots", "vmrun-revert", "vmrun-start", "get-status", "vmrun-stop", "list-snapshots", "vmrun-create", "vmrun-delete" },
+        new[] { "list-snapshots", "vmrun-revert", "vmrun-start", "get-status", "vmrun-stop", "list-snapshots", "vmrun-create", "vmrun-delete", "vmrun-start" },
         recorder.Actions,
-        "Steps should execute in the correct order.");
+        "Steps should execute in the correct order and restart the VM after snapshot update.");
 }
 
 static void SnapshotUpdateServiceFailsAtRevert()

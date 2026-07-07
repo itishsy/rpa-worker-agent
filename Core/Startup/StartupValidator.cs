@@ -1,6 +1,7 @@
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Scheduler;
 using Seebot.WorkerAgent.Core.Snapshot;
+using Seebot.WorkerAgent.Core.Storage;
 using Seebot.WorkerAgent.Core.Vmware;
 
 namespace Seebot.WorkerAgent.Core.Startup;
@@ -13,11 +14,16 @@ public sealed class StartupValidator : IStartupValidator
 
     private readonly IVmrunService _vmrunService;
     private readonly IProfileSnapshotResolver _snapshotResolver;
+    private readonly IVirtualMachineRegistry? _virtualMachineRegistry;
 
-    public StartupValidator(IVmrunService vmrunService, IProfileSnapshotResolver snapshotResolver)
+    public StartupValidator(
+        IVmrunService vmrunService,
+        IProfileSnapshotResolver snapshotResolver,
+        IVirtualMachineRegistry? virtualMachineRegistry = null)
     {
         _vmrunService = vmrunService;
         _snapshotResolver = snapshotResolver;
+        _virtualMachineRegistry = virtualMachineRegistry;
     }
 
     public async Task<StartupValidationResult> ValidateAndBuildCapabilitiesAsync(
@@ -40,26 +46,47 @@ public sealed class StartupValidator : IStartupValidator
 
         foreach (var vm in options.VirtualMachines)
         {
+            var vmErrors = new List<string>();
             var vmCapability = new VmCapabilityDto
             {
                 VmName = vm.Name,
                 WorkerId = vm.WorkerId,
                 VmxPath = vm.VmxPath,
                 BaseSnapshotName = vm.BaseSnapshotName,
-                Enabled = true,
+                Enabled = vm.Enabled,
                 IsQuarantined = false
             };
             capabilities.Vms.Add(vmCapability);
 
-            if (!File.Exists(vm.VmxPath))
+            if (!vm.Enabled)
             {
-                errors.Add($"VMX file does not exist for VM {vm.Name}: {vm.VmxPath}");
+                vmCapability.Enabled = false;
+                foreach (var profile in vm.Profiles)
+                {
+                    vmCapability.Profiles.Add(new ProfileCapabilityDto
+                    {
+                        ProfileId = profile.ProfileId,
+                        ProfileName = profile.ProfileName,
+                        SnapshotName = "",
+                        Enabled = false,
+                        SnapshotExists = false,
+                        ValidationStatus = Invalid,
+                        ValidationMessage = vm.DisabledReason ?? "VM is disabled."
+                    });
+                }
+
+                continue;
             }
 
-            var snapshots = await LoadSnapshotsAsync(vm, errors, cancellationToken);
+            if (!File.Exists(vm.VmxPath))
+            {
+                vmErrors.Add($"VMX file does not exist for VM {vm.Name}: {vm.VmxPath}");
+            }
+
+            var snapshots = await LoadSnapshotsAsync(vm, vmErrors, cancellationToken);
             if (!ContainsSnapshot(snapshots, vm.BaseSnapshotName))
             {
-                errors.Add($"BaseSnapshotName does not exist for VM {vm.Name}: {vm.BaseSnapshotName}");
+                vmErrors.Add($"BaseSnapshotName does not exist for VM {vm.Name}: {vm.BaseSnapshotName}");
             }
 
             foreach (var profile in vm.Profiles)
@@ -69,7 +96,7 @@ public sealed class StartupValidator : IStartupValidator
                 var snapshotExists = resolution.IsReady;
                 if (!snapshotExists)
                 {
-                    errors.Add($"Profile snapshot is not ready for VM {vm.Name}, profile {profile.ProfileId}: {resolution.Message}");
+                    vmErrors.Add($"Profile snapshot is not ready for VM {vm.Name}, profile {profile.ProfileId}: {resolution.Message}");
                 }
 
                 vmCapability.Profiles.Add(new ProfileCapabilityDto
@@ -82,6 +109,34 @@ public sealed class StartupValidator : IStartupValidator
                     ValidationStatus = validationStatus,
                     ValidationMessage = resolution.IsReady ? null : resolution.Message
                 });
+            }
+
+            if (vmErrors.Count > 0)
+            {
+                var disabledReason = string.Join("; ", vmErrors);
+                vm.Enabled = false;
+                vm.DisabledReason = disabledReason;
+                vmCapability.Enabled = false;
+                foreach (var profileCapability in vmCapability.Profiles)
+                {
+                    profileCapability.Enabled = false;
+                    if (string.Equals(profileCapability.ValidationStatus, Ready, StringComparison.OrdinalIgnoreCase))
+                    {
+                        profileCapability.ValidationStatus = Invalid;
+                        profileCapability.ValidationMessage = disabledReason;
+                    }
+                }
+
+                if (_virtualMachineRegistry is not null)
+                {
+                    await _virtualMachineRegistry.UpdateVmStatusAsync(vm.Name, enabled: false, disabledReason, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+            }
+            else if (_virtualMachineRegistry is not null)
+            {
+                await _virtualMachineRegistry.UpdateVmStatusAsync(vm.Name, enabled: true, disabledReason: null, cancellationToken)
+                    .ConfigureAwait(false);
             }
         }
 

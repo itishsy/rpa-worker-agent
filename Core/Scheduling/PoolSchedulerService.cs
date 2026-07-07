@@ -53,13 +53,14 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
 
     public async Task<PoolSchedulerCycleResult> RunOneCycleAsync(CancellationToken cancellationToken)
     {
-        if (_options.VirtualMachines.Count == 0)
+        var enabledVms = EnabledVirtualMachines();
+        if (enabledVms.Count == 0)
         {
             _logger.LogInformation("Scheduler cycle skipped because no VMs are configured.");
             return NoSwitch("No configured VMs.");
         }
 
-        _logger.LogInformation("Scheduler cycle started. HostId={HostId}, VmCount={VmCount}", _options.Agent.HostId, _options.VirtualMachines.Count);
+        _logger.LogInformation("Scheduler cycle started. HostId={HostId}, VmCount={VmCount}", _options.Agent.HostId, enabledVms.Count);
         var targetProfiles = await QueryPendingProfilesAsync(cancellationToken).ConfigureAwait(false);
         _logger.LogInformation("Scheduler pending profile query completed. PendingProfileCount={PendingProfileCount}", targetProfiles.Count);
 
@@ -202,7 +203,7 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
                 continue;
             }
 
-            var vm = _options.VirtualMachines.FirstOrDefault(v =>
+            var vm = EnabledVirtualMachines().FirstOrDefault(v =>
                 string.Equals(v.Name, state.VmName, StringComparison.OrdinalIgnoreCase));
             if (vm is null)
             {
@@ -239,7 +240,7 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
         var vmStates = await _localStore.GetVmStatesAsync(_options.Agent.HostId, cancellationToken).ConfigureAwait(false);
         var stateByVmName = vmStates.ToDictionary(state => state.VmName, StringComparer.OrdinalIgnoreCase);
 
-        foreach (var vm in _options.VirtualMachines)
+        foreach (var vm in EnabledVirtualMachines())
         {
             if (string.IsNullOrWhiteSpace(vm.WorkerId)
                 || !stateByVmName.TryGetValue(vm.Name, out var state)
@@ -271,7 +272,7 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
         IReadOnlyDictionary<string, VmCurrentState> stateByVmName,
         DateTimeOffset now)
     {
-        foreach (var vm in _options.VirtualMachines)
+        foreach (var vm in EnabledVirtualMachines())
         {
             var profile = vm.Profiles.FirstOrDefault(item =>
                 string.Equals(item.ProfileId, targetProfileId, StringComparison.OrdinalIgnoreCase));
@@ -329,7 +330,7 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
                 continue;
             }
 
-            var vm = _options.VirtualMachines.FirstOrDefault(v =>
+            var vm = EnabledVirtualMachines().FirstOrDefault(v =>
                 string.Equals(v.Name, tx.VmName, StringComparison.OrdinalIgnoreCase));
             if (vm is null)
             {
@@ -368,5 +369,10 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
             SwitchStarted = false,
             Reason = reason
         };
+    }
+
+    private IReadOnlyList<VirtualMachineOptions> EnabledVirtualMachines()
+    {
+        return _options.VirtualMachines.Where(vm => vm.Enabled).ToList();
     }
 }

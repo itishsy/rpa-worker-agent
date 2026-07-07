@@ -31,7 +31,7 @@ public sealed class VmStateRefreshService : IVmStateRefreshService
 
     public async Task RefreshAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
-        foreach (var vm in _options.VirtualMachines)
+        foreach (var vm in _options.VirtualMachines.Where(vm => vm.Enabled))
         {
             var existing = await _localStore.GetVmStateAsync(_options.Agent.HostId, vm.Name, cancellationToken).ConfigureAwait(false)
                            ?? new VmCurrentState

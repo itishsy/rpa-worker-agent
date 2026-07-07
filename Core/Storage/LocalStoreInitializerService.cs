@@ -30,6 +30,7 @@ public sealed class LocalStoreInitializerService : IHostedService
 
         var now = _timeProvider.GetUtcNow();
         var initialStates = _options.VirtualMachines
+            .Where(vm => vm.Enabled)
             .Select(vm => new VmCurrentState
             {
                 VmName = vm.Name,

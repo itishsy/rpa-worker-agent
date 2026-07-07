@@ -1,6 +1,7 @@
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Domain;
 using Seebot.WorkerAgent.Core.Guest;
+using Seebot.WorkerAgent.Core.Storage;
 using Seebot.WorkerAgent.Core.Vmware;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -16,6 +17,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
     private readonly IGuestWorkerClient _guestWorkerClient;
     private readonly IProfileSnapshotResolver _snapshotResolver;
     private readonly IVmOperationLock _vmOperationLock;
+    private readonly IVirtualMachineRegistry? _virtualMachineRegistry;
     private readonly WorkerAgentOptions _options;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<SnapshotUpdateService> _logger;
@@ -27,12 +29,14 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         IVmOperationLock vmOperationLock,
         WorkerAgentOptions options,
         TimeProvider? timeProvider = null,
-        ILogger<SnapshotUpdateService>? logger = null)
+        ILogger<SnapshotUpdateService>? logger = null,
+        IVirtualMachineRegistry? virtualMachineRegistry = null)
     {
         _vmrunService = vmrunService;
         _guestWorkerClient = guestWorkerClient;
         _snapshotResolver = snapshotResolver;
         _vmOperationLock = vmOperationLock;
+        _virtualMachineRegistry = virtualMachineRegistry;
         _options = options;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _logger = logger ?? NullLogger<SnapshotUpdateService>.Instance;
@@ -45,6 +49,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
     {
         _logger.LogInformation("Snapshot update started. VmName={VmName}, ProfileId={ProfileId}", vmName, profileId);
         var vm = _options.VirtualMachines
+            .Where(v => v.Enabled)
             .FirstOrDefault(v => string.Equals(v.Name, vmName, StringComparison.OrdinalIgnoreCase));
         if (vm is null)
         {
@@ -197,6 +202,23 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
             }
 
             return Fail(ErrorCodes.SnapshotDeleteFailed, ex.Message, "delete-snapshot");
+        }
+
+        try
+        {
+            _logger.LogInformation("Starting VM after snapshot update completed. VmName={VmName}", vm.Name);
+            await _vmrunService.StartVmAsync(vm.VmxPath, noGui: true, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return Fail(ErrorCodes.VmStartFailed, ex.Message, "start-after-update");
+        }
+
+        profile.SnapshotName = newSnapshotName;
+        if (_virtualMachineRegistry is not null)
+        {
+            await _virtualMachineRegistry.UpdateProfileSnapshotAsync(vm.Name, profileId, newSnapshotName, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         return new SnapshotUpdateResult

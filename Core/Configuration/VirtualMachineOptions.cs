@@ -10,5 +10,7 @@ public sealed class VirtualMachineOptions
     public string WorkerId { get; set; } = "";
     public string GuestWorkPath { get; set; } = "";
     public string GuestBackupPaths { get; set; } = "cache,db,file,logs";
+    public bool Enabled { get; set; } = true;
+    public string? DisabledReason { get; set; }
     public List<ProfileOptions> Profiles { get; set; } = [];
 }

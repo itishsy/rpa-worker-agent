@@ -27,6 +27,41 @@ public static class OperationsApiExtensions
             return Results.Ok(vms);
         });
 
+        group.MapGet("/vms/overview", async (
+            IVirtualMachineRegistry registry,
+            ILocalStore localStore,
+            WorkerAgentOptions options,
+            CancellationToken cancellationToken) =>
+        {
+            var vms = await registry.GetAllAsync(cancellationToken).ConfigureAwait(false);
+            var states = await localStore.GetVmStatesAsync(options.Agent.HostId, cancellationToken).ConfigureAwait(false);
+            var stateByVmName = states.ToDictionary(state => state.VmName, StringComparer.OrdinalIgnoreCase);
+
+            return Results.Ok(vms.Select(vm =>
+            {
+                stateByVmName.TryGetValue(vm.Name, out var state);
+                return new
+                {
+                    vm.Name,
+                    vm.VmxPath,
+                    vm.BaseSnapshotName,
+                    vm.GuestUser,
+                    vm.GuestPasswordSecret,
+                    vm.WorkerId,
+                    vm.GuestWorkPath,
+                    vm.GuestBackupPaths,
+                    vm.Enabled,
+                    vm.DisabledReason,
+                    vm.Profiles,
+                    CurrentProfileId = state?.CurrentProfileId,
+                    CurrentSnapshotName = state?.CurrentSnapshotName,
+                    RunnerStatus = state?.RunnerStatusCode?.ToString(),
+                    VmStatus = state?.VmStatus.ToString(),
+                    StateUpdatedAt = state?.UpdatedAt
+                };
+            }));
+        });
+
         group.MapGet("/vms/{vmName}", async (
             string vmName,
             IVirtualMachineRegistry registry,
@@ -171,77 +206,129 @@ public static class OperationsApiExtensions
     :root { color-scheme: light dark; font-family: Segoe UI, Arial, sans-serif; }
     body { margin: 0; background: #f7f8fa; color: #1f2937; }
     header { padding: 18px 24px; background: #1f2937; color: white; }
-    main { padding: 20px 24px; display: grid; gap: 18px; grid-template-columns: minmax(360px, 520px) 1fr; }
-    section { background: white; border: 1px solid #d8dee8; border-radius: 6px; padding: 16px; }
+    main {
+      padding: 20px 24px;
+      display: grid;
+      gap: 18px;
+      grid-template-columns: minmax(560px, 1.35fr) minmax(380px, 520px);
+      grid-template-areas:
+        "vm-list vm-editor"
+        "profile-list profile-editor";
+      align-items: start;
+    }
+    .column { display: contents; }
+    section {
+      background: white;
+      border: 1px solid #d8dee8;
+      border-radius: 6px;
+      padding: 16px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+    }
+    .vm-list { grid-area: vm-list; height: 750px; }
+    .vm-editor { grid-area: vm-editor; min-height: 560px; }
+    .profile-list { grid-area: profile-list; height: 390px; }
+    .profile-editor { grid-area: profile-editor; min-height: 360px; }
+    .fixed-panel { box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }
+    .editor-panel { overflow: visible; }
+    .table-wrap { flex: 1; min-height: 0; overflow: auto; border: 1px solid #e5e7eb; border-radius: 4px; }
     h1 { font-size: 20px; margin: 0; }
     h2 { font-size: 16px; margin: 0 0 12px; }
-    label { display: block; font-size: 12px; font-weight: 600; margin: 10px 0 4px; }
-    input { box-sizing: border-box; width: 100%; padding: 8px; border: 1px solid #c8d0dc; border-radius: 4px; font: inherit; }
+    form { display: grid; gap: 7px; }
+    label { display: block; font-size: 12px; font-weight: 600; margin: 2px 0 0; }
+    input { box-sizing: border-box; width: 100%; padding: 7px 8px; border: 1px solid #c8d0dc; border-radius: 4px; font: inherit; }
     button { padding: 8px 11px; border: 1px solid #9aa7b8; border-radius: 4px; background: #fff; cursor: pointer; }
+    button:hover { background: #f8fafc; }
     button.primary { background: #2563eb; color: white; border-color: #2563eb; }
+    button.primary:hover { background: #1d4ed8; }
     button.danger { color: #b91c1c; border-color: #f0b4b4; }
+    button.danger:hover { background: #fff5f5; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { border-bottom: 1px solid #e5e7eb; padding: 8px; text-align: left; vertical-align: top; }
-    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+    th { position: sticky; top: 0; z-index: 1; background: #f8fafc; font-size: 12px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
     .status { min-height: 20px; font-size: 13px; color: #475569; }
     .muted { color: #64748b; font-size: 12px; }
-    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    @media (max-width: 1100px) {
+      main {
+        grid-template-columns: 1fr;
+        grid-template-areas:
+          "vm-list"
+          "vm-editor"
+          "profile-list"
+          "profile-editor";
+      }
+      .vm-list, .profile-list { height: auto; min-height: 320px; }
+      .vm-editor, .profile-editor { min-height: 0; }
+    }
   </style>
 </head>
 <body>
   <header><h1>Worker Agent VM Profiles</h1></header>
   <main>
-    <section>
-      <h2>VM</h2>
-      <form id="vmForm">
-        <label>Name</label><input name="name" required>
-        <label>VMX Path</label><input name="vmxPath" required>
-        <label>Base Snapshot Name</label><input name="baseSnapshotName" required>
-        <label>Worker ID</label><input name="workerId" required>
-        <label>Guest User</label><input name="guestUser">
-        <label>Guest Password</label><input name="guestPasswordSecret" type="password">
-        <label>Guest Work Path</label><input name="guestWorkPath" required>
-        <label>Guest Backup Paths</label><input name="guestBackupPaths" value="cache,db,file,logs" required>
-        <div class="row">
-          <button class="primary" type="submit">Save VM</button>
-          <button type="button" onclick="clearVmForm()">Clear</button>
+    <div class="column">
+      <section class="fixed-panel vm-list">
+        <h2>Registered VMs</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>VM</th><th>Worker</th><th>Status</th><th>Current Profile</th><th>Actions</th></tr></thead>
+            <tbody id="vmRows"></tbody>
+          </table>
         </div>
-      </form>
-      <p class="muted">Changes are saved to local SQLite. Restart the service to apply runtime changes.</p>
-      <div id="status" class="status"></div>
-    </section>
-    <section>
-      <h2>Registered VMs</h2>
-      <table>
-        <thead><tr><th>VM</th><th>Worker</th><th>Profiles</th><th>Actions</th></tr></thead>
-        <tbody id="vmRows"></tbody>
-      </table>
-    </section>
-    <section>
-      <h2>Profile</h2>
-      <form id="profileForm">
-        <label>VM Name</label><input name="vmName" required>
-        <label>Profile ID</label><input name="profileId" required>
-        <label>Profile Name</label><input name="profileName" required>
-        <div class="row">
-          <button class="primary" type="submit">Save Profile</button>
-          <button type="button" onclick="clearProfileForm()">Clear</button>
+      </section>
+      <section class="fixed-panel profile-list">
+        <h2>Profiles</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>VM</th><th>Profile ID</th><th>Profile Name</th><th>Snapshot</th><th>Updated</th><th>Actions</th></tr></thead>
+            <tbody id="profileRows"></tbody>
+          </table>
         </div>
-      </form>
-    </section>
-    <section>
-      <h2>Profiles</h2>
-      <table>
-        <thead><tr><th>VM</th><th>Profile ID</th><th>Profile Name</th><th>Actions</th></tr></thead>
-        <tbody id="profileRows"></tbody>
-      </table>
-    </section>
+      </section>
+    </div>
+    <div class="column">
+      <section class="fixed-panel editor-panel vm-editor">
+        <h2>VM</h2>
+        <form id="vmForm">
+          <label>Name</label><input name="name" required>
+          <label>VMX Path</label><input name="vmxPath" required>
+          <label>Base Snapshot Name</label><input name="baseSnapshotName" required>
+          <label>Worker ID</label><input name="workerId" required>
+          <label>Guest User</label><input name="guestUser">
+          <label>Guest Password</label><input name="guestPasswordSecret" type="password">
+          <label>Guest Work Path</label><input name="guestWorkPath" required>
+          <label>Guest Backup Paths</label><input name="guestBackupPaths" value="cache,db,file,logs" required>
+          <label><input name="enabled" type="checkbox" checked style="width:auto"> Enabled</label>
+          <div class="row">
+            <button class="primary" type="submit">Save VM</button>
+            <button type="button" onclick="clearVmForm()">Clear</button>
+          </div>
+        </form>
+        <p class="muted">Changes are saved to local SQLite. Restart the service to apply runtime changes.</p>
+        <div id="status" class="status"></div>
+      </section>
+      <section class="fixed-panel editor-panel profile-editor">
+        <h2>Profile</h2>
+        <form id="profileForm">
+          <label>VM Name</label><input name="vmName" required>
+          <label>Profile ID</label><input name="profileId" required>
+          <label>Profile Name</label><input name="profileName" required>
+          <label>Snapshot Name</label><input name="snapshotName">
+          <div class="row">
+            <button class="primary" type="submit">Save Profile</button>
+            <button type="button" onclick="updateSelectedSnapshot()">Update Snapshot</button>
+            <button type="button" onclick="clearProfileForm()">Clear</button>
+          </div>
+        </form>
+      </section>
+    </div>
   </main>
   <script>
     const qs = new URLSearchParams(location.search);
     const apiKey = qs.get('apiKey') || '';
     const api = path => '/operations' + path + (apiKey ? (path.includes('?') ? '&' : '?') + 'apiKey=' + encodeURIComponent(apiKey) : '');
     const status = message => document.getElementById('status').textContent = message || '';
+    let vms = [];
+    let selectedVmName = '';
 
     async function request(path, options) {
       const response = await fetch(api(path), {
@@ -256,33 +343,54 @@ public static class OperationsApiExtensions
     }
 
     async function load() {
-      const vms = await request('/vms');
+      vms = await request('/vms/overview');
+      if (selectedVmName && !vms.some(vm => vm.name === selectedVmName)) {
+        selectedVmName = '';
+      }
       document.getElementById('vmRows').innerHTML = vms.map(vm => `
         <tr>
           <td>${escapeHtml(vm.name)}<div class="muted">${escapeHtml(vm.vmxPath)}</div></td>
           <td>${escapeHtml(vm.workerId)}</td>
-          <td>${renderVmProfiles(vm)}</td>
+          <td>${renderEnabled(vm)}</td>
+          <td>${escapeHtml(vm.currentProfileId || '')}<div class="muted">${escapeHtml(vm.currentSnapshotName || '')}</div></td>
           <td>
             <button onclick='editVm(${JSON.stringify(vm)})'>Edit</button>
             <button class="danger" onclick='deleteVm(${JSON.stringify(vm.name)})'>Delete</button>
           </td>
         </tr>`).join('');
-      document.getElementById('profileRows').innerHTML = vms.flatMap(vm => (vm.profiles || []).map(profile => `
+      renderSelectedProfiles();
+    }
+
+    function showProfiles(vmName) {
+      selectedVmName = vmName;
+      document.getElementById('profileForm').elements.vmName.value = vmName;
+      renderSelectedProfiles();
+    }
+
+    function renderSelectedProfiles() {
+      const vm = vms.find(item => item.name === selectedVmName);
+      const rows = vm
+        ? (vm.profiles || []).map(profile => `
         <tr>
           <td>${escapeHtml(vm.name)}</td>
           <td>${escapeHtml(profile.profileId)}</td>
           <td>${escapeHtml(profile.profileName)}</td>
+          <td>${escapeHtml(snapshotForProfile(vm, profile))}</td>
+          <td>${escapeHtml(formatDateTime(profile.updatedAt))}</td>
           <td>
             <button onclick='editProfile(${JSON.stringify(vm.name)}, ${JSON.stringify(profile)})'>Edit</button>
-            <button class="primary" onclick='updateSnapshot(${JSON.stringify(vm.name)}, ${JSON.stringify(profile.profileId)})'>Update Snapshot</button>
             <button class="danger" onclick='deleteProfile(${JSON.stringify(vm.name)}, ${JSON.stringify(profile.profileId)})'>Delete</button>
           </td>
-        </tr>`)).join('');
+        </tr>`)
+        : [];
+
+      document.getElementById('profileRows').innerHTML = rows.join('');
     }
 
     document.getElementById('vmForm').addEventListener('submit', async event => {
       event.preventDefault();
       const data = Object.fromEntries(new FormData(event.target).entries());
+      data.enabled = event.target.elements.enabled.checked;
       data.profiles = [];
       await request('/vms', { method: 'POST', body: JSON.stringify(data) });
       status('VM saved. Restart required.');
@@ -294,17 +402,20 @@ public static class OperationsApiExtensions
       const data = Object.fromEntries(new FormData(event.target).entries());
       await request(`/vms/${encodeURIComponent(data.vmName)}/profiles`, {
         method: 'POST',
-        body: JSON.stringify({ profileId: data.profileId, profileName: data.profileName })
+        body: JSON.stringify({ profileId: data.profileId, profileName: data.profileName, snapshotName: data.snapshotName || '' })
       });
       status('Profile saved. Restart required.');
+      selectedVmName = data.vmName;
       await load();
     });
 
     function editVm(vm) {
       const form = document.getElementById('vmForm');
       for (const [key, value] of Object.entries(vm)) {
-        if (form.elements[key] && key !== 'profiles') form.elements[key].value = value || '';
+        if (form.elements[key] && key !== 'profiles' && key !== 'enabled') form.elements[key].value = value || '';
       }
+      form.elements.enabled.checked = vm.enabled !== false;
+      showProfiles(vm.name);
     }
 
     function editProfile(vmName, profile) {
@@ -312,12 +423,14 @@ public static class OperationsApiExtensions
       form.elements.vmName.value = vmName;
       form.elements.profileId.value = profile.profileId || '';
       form.elements.profileName.value = profile.profileName || '';
+      form.elements.snapshotName.value = profile.snapshotName || '';
     }
 
     async function deleteVm(name) {
       if (!confirm(`Delete VM ${name}?`)) return;
       await request(`/vms/${encodeURIComponent(name)}`, { method: 'DELETE' });
       status('VM deleted. Restart required.');
+      if (selectedVmName === name) selectedVmName = '';
       await load();
     }
 
@@ -325,6 +438,7 @@ public static class OperationsApiExtensions
       if (!confirm(`Delete profile ${profileId}?`)) return;
       await request(`/vms/${encodeURIComponent(vmName)}/profiles/${encodeURIComponent(profileId)}`, { method: 'DELETE' });
       status('Profile deleted. Restart required.');
+      selectedVmName = vmName;
       await load();
     }
 
@@ -335,14 +449,32 @@ public static class OperationsApiExtensions
       status(result.success ? `Snapshot updated: ${result.newSnapshotName || ''}` : `Snapshot update failed: ${result.errorCode || result.errorMessage || 'unknown error'}`);
     }
 
-    function renderVmProfiles(vm) {
-      const profiles = vm.profiles || [];
-      if (profiles.length === 0) return '<span class="muted">No profiles</span>';
-      return profiles.map(profile => `
-        <div class="row">
-          <span>${escapeHtml(profile.profileId)}</span>
-          <button class="primary" onclick='updateSnapshot(${JSON.stringify(vm.name)}, ${JSON.stringify(profile.profileId)})'>Update Snapshot</button>
-        </div>`).join('');
+    async function updateSelectedSnapshot() {
+      const form = document.getElementById('profileForm');
+      const vmName = form.elements.vmName.value;
+      const profileId = form.elements.profileId.value;
+      if (!vmName || !profileId) {
+        status('Select a profile first.');
+        return;
+      }
+
+      await updateSnapshot(vmName, profileId);
+    }
+
+    function renderEnabled(vm) {
+      return vm.enabled === false
+        ? '<span class="muted">Disabled</span>'
+        : '<span>Enabled</span>';
+    }
+
+    function snapshotForProfile(vm, profile) {
+      return profile.snapshotName || (profile.profileId === vm.currentProfileId ? vm.currentSnapshotName || '' : '');
+    }
+
+    function formatDateTime(value) {
+      if (!value) return '';
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
     }
 
     function clearVmForm() { document.getElementById('vmForm').reset(); }

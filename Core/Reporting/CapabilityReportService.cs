@@ -33,7 +33,7 @@ public sealed class CapabilityReportService : BackgroundService
     {
         try
         {
-            _logger.LogInformation("Capability report started. HostId={HostId}, VmCount={VmCount}", _options.Agent.HostId, _options.VirtualMachines.Count);
+            _logger.LogInformation("Capability report started. HostId={HostId}, VmCount={VmCount}", _options.Agent.HostId, EnabledVirtualMachines().Count);
             var capabilities = await BuildProfileCapabilitiesAsync(cancellationToken).ConfigureAwait(false);
             _logger.LogInformation("Capability report payload built. HostId={HostId}, CapabilityCount={CapabilityCount}", _options.Agent.HostId, capabilities.Count);
             await _schedulerClient.ReportCapabilitiesAsync(capabilities, cancellationToken).ConfigureAwait(false);
@@ -78,7 +78,7 @@ public sealed class CapabilityReportService : BackgroundService
         var hostName = FirstNonEmpty(_options.Agent.AgentName, _options.Agent.HostId);
         var capabilities = new List<HostProfileCapabilityRequest>();
 
-        foreach (var vm in _options.VirtualMachines)
+        foreach (var vm in EnabledVirtualMachines())
         {
             IReadOnlyList<string> snapshots;
             try
@@ -120,5 +120,10 @@ public sealed class CapabilityReportService : BackgroundService
     private static string FirstNonEmpty(params string[] values)
     {
         return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "";
+    }
+
+    private IReadOnlyList<VirtualMachineOptions> EnabledVirtualMachines()
+    {
+        return _options.VirtualMachines.Where(vm => vm.Enabled).ToList();
     }
 }

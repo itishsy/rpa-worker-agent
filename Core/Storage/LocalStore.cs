@@ -106,7 +106,9 @@ INSERT INTO local_vm_state (
     NULL,
     $updated_at
 )
-ON CONFLICT(host_id, vm_name) DO NOTHING;
+ON CONFLICT(host_id, vm_name) DO UPDATE SET
+    worker_id = excluded.worker_id,
+    updated_at = excluded.updated_at;
 """;
             Add(command, "$host_id", hostId);
             Add(command, "$vm_name", state.VmName);

@@ -19,6 +19,7 @@ public sealed class VmSwitchService : IVmSwitchService
     private readonly ILogBackupService _logBackupService;
     private readonly IVmrunService _vmrunService;
     private readonly ILocalStore _localStore;
+    private readonly IVirtualMachineRegistry? _virtualMachineRegistry;
     private readonly WorkerAgentOptions _options;
     private readonly TimeProvider _timeProvider;
     private readonly TimeSpan _snapshotRevertRetryDelay;
@@ -32,12 +33,14 @@ public sealed class VmSwitchService : IVmSwitchService
         WorkerAgentOptions options,
         TimeProvider? timeProvider = null,
         TimeSpan? snapshotRevertRetryDelay = null,
-        ILogger<VmSwitchService>? logger = null)
+        ILogger<VmSwitchService>? logger = null,
+        IVirtualMachineRegistry? virtualMachineRegistry = null)
     {
         _guestWorkerClient = guestWorkerClient;
         _logBackupService = logBackupService;
         _vmrunService = vmrunService;
         _localStore = localStore;
+        _virtualMachineRegistry = virtualMachineRegistry;
         _options = options;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _snapshotRevertRetryDelay = snapshotRevertRetryDelay ?? TimeSpan.FromSeconds(5);
@@ -180,6 +183,22 @@ public sealed class VmSwitchService : IVmSwitchService
             RunnerStatusCode = readyStatus.RunnerStatusCode,
             UpdatedAt = request.Timestamp
         }, cancellationToken);
+
+        var profile = request.Vm.Profiles.FirstOrDefault(item =>
+            string.Equals(item.ProfileId, request.TargetProfileId, StringComparison.OrdinalIgnoreCase));
+        if (profile is not null)
+        {
+            profile.SnapshotName = request.TargetSnapshotName;
+        }
+
+        if (_virtualMachineRegistry is not null)
+        {
+            await _virtualMachineRegistry.UpdateProfileSnapshotAsync(
+                request.Vm.Name,
+                request.TargetProfileId,
+                request.TargetSnapshotName,
+                cancellationToken).ConfigureAwait(false);
+        }
 
         await UpdateAsync(tx, SwitchTransactionStatus.SUCCESS, "success", null, null, request.Timestamp, cancellationToken);
         _logger.LogInformation(
