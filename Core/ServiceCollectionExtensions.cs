@@ -114,6 +114,14 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IVmStateRefreshService, VmStateRefreshService>();
         services.AddSingleton<IPoolSchedulerService, PoolSchedulerService>();
         services.AddSingleton<ISnapshotUpdateService, SnapshotUpdateService>();
+        services.AddSingleton<IInitFileUpdateService>(provider =>
+            new InitFileUpdateService(
+                provider.GetRequiredService<IVmrunService>(),
+                provider.GetRequiredService<IVmOperationLock>(),
+                provider.GetRequiredService<IProfileSnapshotResolver>(),
+                provider.GetRequiredService<WorkerAgentOptions>(),
+                provider.GetRequiredService<IVirtualMachineRegistry>(),
+                logger: provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<InitFileUpdateService>>()));
         services.AddSingleton<CapabilityReportService>();
         services.AddHostedService(sp => sp.GetRequiredService<CapabilityReportService>());
 

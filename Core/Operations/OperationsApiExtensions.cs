@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Snapshot;
 using Seebot.WorkerAgent.Core.Storage;
+using Seebot.WorkerAgent.Core.Vmware;
 
 namespace Seebot.WorkerAgent.Core.Operations;
 
@@ -196,6 +197,18 @@ public static class OperationsApiExtensions
             });
         });
 
+        group.MapPost("/vms/{vmName}/update-init-workerid", async (
+            string vmName,
+            IInitFileUpdateService initFileUpdateService,
+            CancellationToken cancellationToken) =>
+        {
+            var result = await initFileUpdateService.UpdateWorkerIdInSnapshotsAsync(vmName, cancellationToken)
+                .ConfigureAwait(false);
+            return result.Success
+                ? Results.Ok(result)
+                : Results.UnprocessableEntity(result);
+        });
+
         group.MapPost("/snapshots/{vmName}/{profileId}/update", async (
             string vmName,
             string profileId,
@@ -353,6 +366,7 @@ public static class OperationsApiExtensions
           <label><input name="enabled" type="checkbox" checked style="width:auto"> Enabled</label>
           <div class="row">
             <button class="primary" type="submit">Save VM</button>
+            <button type="button" id="updateInitBtn" onclick="updateInitWorkerId()">Update WorkerId in Snapshots</button>
             <button type="button" onclick="clearVmForm()">Clear</button>
           </div>
         </form>
@@ -408,6 +422,7 @@ public static class OperationsApiExtensions
           <td>${escapeHtml(vm.currentProfileId || '')}<div class="muted">${escapeHtml(vm.currentSnapshotName || '')}</div></td>
           <td>
             <button data-action="edit-vm" data-vm-name="${escapeHtml(vm.name)}">Edit</button>
+            <button data-action="copy-vm" data-vm-name="${escapeHtml(vm.name)}">Copy</button>
             ${vm.isQuarantined
               ? `<button data-action="unquarantine-vm" data-vm-name="${escapeHtml(vm.name)}">Unquarantine</button>`
               : `<button data-action="quarantine-vm" data-vm-name="${escapeHtml(vm.name)}">Quarantine</button>`}
@@ -453,6 +468,8 @@ public static class OperationsApiExtensions
       const vm = vms.find(item => item.name === vmName);
       if (button.dataset.action === 'edit-vm' && vm) {
         editVm(vm);
+      } else if (button.dataset.action === 'copy-vm' && vm) {
+        await copyVm(vm);
       } else if (button.dataset.action === 'quarantine-vm') {
         await quarantineVm(vmName, true);
       } else if (button.dataset.action === 'unquarantine-vm') {
@@ -501,6 +518,30 @@ public static class OperationsApiExtensions
       await load();
     });
 
+    async function updateInitWorkerId() {
+      const form = document.getElementById('vmForm');
+      const vmName = form.elements.name?.value || '';
+      if (!vmName) { status('Please save or select a VM first.'); return; }
+      if (!confirm(`Update WorkerId in all snapshots for VM "${vmName}"?\n\nThis will revert each snapshot, start the VM, kill rpa-client/java, write rpa.init, then rebuild the snapshot.\nThe VM will be powered off when done.\nThis may take several minutes per profile.`)) return;
+
+      const btn = document.getElementById('updateInitBtn');
+      if (btn) { btn.disabled = true; btn.textContent = 'Updating…'; }
+      status(`Updating WorkerId in snapshots for "${vmName}"…`);
+
+      try {
+        const result = await request(`/vms/${encodeURIComponent(vmName)}/update-init-workerid`, { method: 'POST' });
+        const lines = (result.profiles || []).map(p =>
+          `  ${p.profileId}: ${p.success ? `OK → ${p.newSnapshotName}` : `FAILED (${p.errorCode}: ${p.errorMessage})`}`
+        );
+        status((result.success ? 'All profiles updated.' : `Partial failure: ${result.errorMessage}`) + (lines.length ? '\n' + lines.join('\n') : ''));
+        await load();
+      } catch (err) {
+        status(`Update failed: ${err.message}`);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Update WorkerId in Snapshots'; }
+      }
+    }
+
     function editVm(vm) {
       const form = document.getElementById('vmForm');
       for (const [key, value] of Object.entries(vm)) {
@@ -516,6 +557,39 @@ public static class OperationsApiExtensions
       form.elements.profileId.value = profile.profileId || '';
       form.elements.profileName.value = profile.profileName || '';
       form.elements.snapshotName.value = profile.snapshotName || '';
+    }
+
+    function applyCopySuffix(value) {
+      if (!value) return value;
+      return value.length > 4 ? value.slice(0, -4) + 'COPY' : 'COPY';
+    }
+
+    async function copyVm(vm) {
+      const newName = applyCopySuffix(vm.name);
+      const newWorkerId = applyCopySuffix(vm.workerId);
+      if (!confirm(`Copy VM "${vm.name}" as "${newName}" (WorkerId: "${newWorkerId}")?`)) return;
+      const newVm = {
+        name: newName,
+        vmxPath: vm.vmxPath || '',
+        baseSnapshotName: vm.baseSnapshotName || '',
+        workerId: newWorkerId,
+        guestUser: vm.guestUser || '',
+        guestPasswordSecret: '',
+        guestWorkPath: vm.guestWorkPath || '',
+        guestBackupPaths: vm.guestBackupPaths || 'cache,db,file,logs',
+        enabled: false,
+        profiles: []
+      };
+      await request('/vms', { method: 'POST', body: JSON.stringify(newVm) });
+      for (const profile of (vm.profiles || [])) {
+        await request(`/vms/${encodeURIComponent(newName)}/profiles`, {
+          method: 'POST',
+          body: JSON.stringify({ profileId: profile.profileId, profileName: profile.profileName, snapshotName: profile.snapshotName || '' })
+        });
+      }
+      status(`VM copied as "${newName}". Restart required.`);
+      selectedVmName = newName;
+      await load();
     }
 
     async function deleteVm(name) {

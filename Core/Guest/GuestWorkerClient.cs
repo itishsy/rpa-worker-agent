@@ -116,6 +116,9 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
                 result.Data,
                 killResult.ErrorCode,
                 Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+
+            await ForceKillGuestProcessesAsync(vm, cancellationToken);
+
             return killResult;
         }
         catch (GuestWorkerClientException)
@@ -131,6 +134,41 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
                 txId,
                 Stopwatch.GetElapsedTime(started).TotalMilliseconds);
             throw new GuestWorkerClientException("KillRunner", url, exception.Message, exception);
+        }
+    }
+
+    // 通过 vmrun taskkill 强杀 rpa-client.exe 及 java.exe，释放所有文件句柄
+    // 设计为 best-effort：VMware Tools 异常时仅记录警告，不影响调用方流程
+    private async Task ForceKillGuestProcessesAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(vm.GuestUser) || string.IsNullOrWhiteSpace(vm.VmxPath))
+        {
+            return;
+        }
+
+        var targets = new[] { "rpa-client.exe", "java.exe" };
+        foreach (var processName in targets)
+        {
+            try
+            {
+                await _vmrunService.RunProgramInGuestAsync(
+                    vm.VmxPath,
+                    vm.GuestUser,
+                    vm.GuestPasswordSecret,
+                    @"C:\Windows\System32\taskkill.exe",
+                    ["/F", "/IM", processName],
+                    cancellationToken);
+                _logger.LogInformation(
+                    "Force killed guest process. VmName={VmName}, Process={Process}",
+                    vm.Name, processName);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // taskkill 进程不存在时 exit code 非零，属于正常情况，降级为 Debug
+                _logger.LogDebug(ex,
+                    "Force kill guest process did not succeed (process may not exist). VmName={VmName}, Process={Process}",
+                    vm.Name, processName);
+            }
         }
     }
 

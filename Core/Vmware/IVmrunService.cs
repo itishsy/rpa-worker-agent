@@ -1,5 +1,7 @@
 namespace Seebot.WorkerAgent.Core.Vmware;
 
+public sealed record GuestProcess(int Pid, string Owner, string CommandLine);
+
 public interface IVmrunService
 {
     Task<IReadOnlyList<string>> ListSnapshotsAsync(string vmxPath, CancellationToken cancellationToken);
@@ -31,4 +33,6 @@ public interface IVmrunService
     Task<VmrunCommandResult> CreateSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken);
 
     Task<VmrunCommandResult> DeleteSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken);
+
+    Task<IReadOnlyList<GuestProcess>> ListProcessesInGuestAsync(string vmxPath, string guestUser, string guestPassword, CancellationToken cancellationToken);
 }

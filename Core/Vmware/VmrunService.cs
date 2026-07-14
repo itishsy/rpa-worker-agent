@@ -304,6 +304,83 @@ public sealed class VmrunService : IVmrunService
         return RunVmrunAsync("deleteSnapshot", [vmxPath, snapshotName], cancellationToken);
     }
 
+    public async Task<IReadOnlyList<GuestProcess>> ListProcessesInGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        CancellationToken cancellationToken)
+    {
+        // vmrun -T ws -gu user -gp pass listProcessesInGuest vmx
+        // stdout 格式：
+        //   Process list: N
+        //   pid=1234, owner=SYSTEM, cmd=C:\Windows\System32\services.exe
+        var args = new List<string>
+        {
+            "-T", _hostType,
+            "-gu", guestUser,
+            "-gp", guestPassword,
+            "listProcessesInGuest",
+            vmxPath
+        };
+
+        var result = await RunProcessAsync(new ProcessCommand(_vmrunPath, args, _fileOperationTimeout, "listProcessesInGuest"), args, cancellationToken);
+
+        if (result.ExitCode != 0)
+        {
+            throw new VmrunCommandException(result);
+        }
+
+        return ParseGuestProcesses(result.StandardOutput);
+    }
+
+    private static IReadOnlyList<GuestProcess> ParseGuestProcesses(string standardOutput)
+    {
+        var processes = new List<GuestProcess>();
+        foreach (var line in standardOutput.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            // 跳过 "Process list: N" 标题行
+            if (line.StartsWith("Process list:", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            // 解析 "pid=1234, owner=SYSTEM, cmd=C:\Windows\..."
+            var pid = 0;
+            var owner = "";
+            var cmd = "";
+            foreach (var segment in line.Split(','))
+            {
+                var trimmed = segment.Trim();
+                if (trimmed.StartsWith("pid=", StringComparison.OrdinalIgnoreCase))
+                {
+                    int.TryParse(trimmed[4..], out pid);
+                }
+                else if (trimmed.StartsWith("owner=", StringComparison.OrdinalIgnoreCase))
+                {
+                    owner = trimmed[6..];
+                }
+                else if (trimmed.StartsWith("cmd=", StringComparison.OrdinalIgnoreCase))
+                {
+                    // cmd 可能包含逗号（路径），取首个 "cmd=" 后的所有内容
+                    var cmdIndex = line.IndexOf("cmd=", StringComparison.OrdinalIgnoreCase);
+                    if (cmdIndex >= 0)
+                    {
+                        cmd = line[(cmdIndex + 4)..].Trim();
+                    }
+
+                    break;
+                }
+            }
+
+            if (pid > 0)
+            {
+                processes.Add(new GuestProcess(pid, owner, cmd));
+            }
+        }
+
+        return processes;
+    }
+
     private static IReadOnlyList<string> ParseSnapshots(string standardOutput)
     {
         return standardOutput

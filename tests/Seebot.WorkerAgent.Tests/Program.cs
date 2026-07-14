@@ -2561,6 +2561,11 @@ internal sealed class FakeVmrunService : IVmrunService
     {
         throw new NotSupportedException();
     }
+
+    public Task<IReadOnlyList<GuestProcess>> ListProcessesInGuestAsync(string vmxPath, string guestUser, string guestPassword, CancellationToken cancellationToken)
+    {
+        return Task.FromResult<IReadOnlyList<GuestProcess>>([]);
+    }
 }
 
 internal sealed record CopyCall(
@@ -2782,6 +2787,11 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
     public Task<VmrunCommandResult> DeleteSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
     {
         throw new NotSupportedException();
+    }
+
+    public Task<IReadOnlyList<GuestProcess>> ListProcessesInGuestAsync(string vmxPath, string guestUser, string guestPassword, CancellationToken cancellationToken)
+    {
+        return Task.FromResult<IReadOnlyList<GuestProcess>>([]);
     }
 }
 
@@ -3136,6 +3146,11 @@ internal sealed class RecordingSnapshotUpdateVmrunService : IVmrunService
     {
         _recorder.Actions.Add("vmrun-delete");
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "deleteSnapshot"));
+    }
+
+    public Task<IReadOnlyList<GuestProcess>> ListProcessesInGuestAsync(string vmxPath, string guestUser, string guestPassword, CancellationToken cancellationToken)
+    {
+        return Task.FromResult<IReadOnlyList<GuestProcess>>([]);
     }
 }
 
