@@ -14,6 +14,7 @@ public sealed class VmSwitchService : IVmSwitchService
     // vmrun stop soft 返回后，vmware-vmx.exe 释放 vmdk/lck 文件锁存在短暂延迟，
     // revertToSnapshot 紧接着执行会报“文件正在使用中”，重试可以规避这个瞬时竞争
     private const int SnapshotRevertMaxAttempts = 3;
+    private static readonly TimeSpan DefaultVmStoppedPollInterval = TimeSpan.FromSeconds(2);
 
     private readonly IGuestWorkerClient _guestWorkerClient;
     private readonly ILogBackupService _logBackupService;
@@ -24,6 +25,8 @@ public sealed class VmSwitchService : IVmSwitchService
     private readonly TimeProvider _timeProvider;
     private readonly TimeSpan _snapshotRevertRetryDelay;
     private readonly ILogger<VmSwitchService> _logger;
+    private readonly TimeSpan _vmStoppedPollInterval;
+    private readonly TimeSpan? _vmStopTimeoutOverride;
 
     public VmSwitchService(
         IGuestWorkerClient guestWorkerClient,
@@ -33,6 +36,8 @@ public sealed class VmSwitchService : IVmSwitchService
         WorkerAgentOptions options,
         TimeProvider? timeProvider = null,
         TimeSpan? snapshotRevertRetryDelay = null,
+        TimeSpan? vmStoppedPollInterval = null,
+        TimeSpan? vmStopTimeout = null,
         ILogger<VmSwitchService>? logger = null,
         IVirtualMachineRegistry? virtualMachineRegistry = null)
     {
@@ -44,6 +49,8 @@ public sealed class VmSwitchService : IVmSwitchService
         _options = options;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _snapshotRevertRetryDelay = snapshotRevertRetryDelay ?? TimeSpan.FromSeconds(5);
+        _vmStoppedPollInterval = vmStoppedPollInterval ?? DefaultVmStoppedPollInterval;
+        _vmStopTimeoutOverride = vmStopTimeout;
         _logger = logger ?? NullLogger<VmSwitchService>.Instance;
     }
 
@@ -117,14 +124,10 @@ public sealed class VmSwitchService : IVmSwitchService
 
         await UpdateAsync(tx, SwitchTransactionStatus.LOG_BACKUP_DONE, "log-backup-done", backup.ErrorCode, backup.ErrorMessage, request.Timestamp, cancellationToken);
 
-        try
+        var stopError = await StopVmSafelyAsync(request.Vm.VmxPath, request.Vm.Name, tx.TransactionId, cancellationToken);
+        if (stopError is not null)
         {
-            _logger.LogInformation("Stopping VM before snapshot revert. TxId={TxId}, VmName={VmName}, VmxPath={VmxPath}", tx.TransactionId, request.Vm.Name, request.Vm.VmxPath);
-            await _vmrunService.StopVmAsync(request.Vm.VmxPath, VmStopMode.Soft, cancellationToken);
-        }
-        catch (Exception exception) when (exception is not OperationCanceledException)
-        {
-            return await FailAndMarkVmErrorAsync(tx, request, ErrorCodes.VmStopFailed, exception.Message, cancellationToken);
+            return await FailAndMarkVmErrorAsync(tx, request, ErrorCodes.VmStopFailed, stopError, cancellationToken);
         }
 
         await UpdateAsync(tx, SwitchTransactionStatus.VM_STOP_DONE, "vm-stop-done", null, null, request.Timestamp, cancellationToken);
@@ -243,6 +246,86 @@ public sealed class VmSwitchService : IVmSwitchService
                 await Task.Delay(_snapshotRevertRetryDelay, _timeProvider, cancellationToken).ConfigureAwait(false);
             }
         }
+    }
+
+    private async Task<string?> StopVmSafelyAsync(
+        string vmxPath,
+        string vmName,
+        string txId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (!await _vmrunService.IsVmRunningAsync(vmxPath, cancellationToken).ConfigureAwait(false))
+            {
+                _logger.LogInformation("VM is already stopped before snapshot operation. TxId={TxId}, VmName={VmName}, VmxPath={VmxPath}", txId, vmName, vmxPath);
+                return null;
+            }
+
+            _logger.LogInformation("Stopping VM before snapshot operation. TxId={TxId}, VmName={VmName}, VmxPath={VmxPath}, Mode={Mode}", txId, vmName, vmxPath, VmStopMode.Soft);
+            await _vmrunService.StopVmAsync(vmxPath, VmStopMode.Soft, cancellationToken).ConfigureAwait(false);
+
+            var softTimeout = GetStopTimeout();
+            if (await WaitUntilVmStoppedAsync(vmxPath, vmName, txId, softTimeout, cancellationToken).ConfigureAwait(false))
+            {
+                return null;
+            }
+
+            if (!_options.Vmrun.AllowHardStopAfterSoftTimeout)
+            {
+                return $"VM did not power off within {softTimeout.TotalSeconds:0} seconds after soft stop.";
+            }
+
+            _logger.LogWarning("Soft stop timed out; attempting hard stop. TxId={TxId}, VmName={VmName}, VmxPath={VmxPath}", txId, vmName, vmxPath);
+            await _vmrunService.StopVmAsync(vmxPath, VmStopMode.Hard, cancellationToken).ConfigureAwait(false);
+
+            if (await WaitUntilVmStoppedAsync(vmxPath, vmName, txId, softTimeout, cancellationToken).ConfigureAwait(false))
+            {
+                return null;
+            }
+
+            return $"VM did not power off within {softTimeout.TotalSeconds:0} seconds after hard stop.";
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            return exception.Message;
+        }
+    }
+
+    private async Task<bool> WaitUntilVmStoppedAsync(
+        string vmxPath,
+        string vmName,
+        string txId,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        var deadline = _timeProvider.GetUtcNow().Add(timeout);
+        while (true)
+        {
+            var isRunning = await _vmrunService.IsVmRunningAsync(vmxPath, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("VM stop polling result. TxId={TxId}, VmName={VmName}, IsRunning={IsRunning}", txId, vmName, isRunning);
+            if (!isRunning)
+            {
+                return true;
+            }
+
+            if (_timeProvider.GetUtcNow() >= deadline)
+            {
+                return false;
+            }
+
+            await Task.Delay(_vmStoppedPollInterval, _timeProvider, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private TimeSpan GetStopTimeout()
+    {
+        if (_vmStopTimeoutOverride is not null)
+        {
+            return _vmStopTimeoutOverride.Value;
+        }
+
+        return TimeSpan.FromSeconds(_options.Vmrun.StopSoftTimeoutSeconds > 0 ? _options.Vmrun.StopSoftTimeoutSeconds : 60);
     }
 
     private SwitchTransaction CreateTransaction(VmSwitchRequest request)

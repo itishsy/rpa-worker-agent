@@ -4,6 +4,8 @@ public interface IVmrunService
 {
     Task<IReadOnlyList<string>> ListSnapshotsAsync(string vmxPath, CancellationToken cancellationToken);
 
+    Task<bool> IsVmRunningAsync(string vmxPath, CancellationToken cancellationToken);
+
     Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken);
 
     Task<string> GetGuestIPAddressAsync(string vmxPath, CancellationToken cancellationToken);

@@ -58,6 +58,7 @@ var tests = new (string Name, Action Body)[]
     ("VirtualMachineRegistry upserts and queries VM profiles", VirtualMachineRegistryUpsertsAndQueriesVmProfiles),
     ("WorkerAgent configuration loads VirtualMachines from SQLite registry", WorkerAgentConfigurationLoadsVirtualMachinesFromSqliteRegistry),
     ("VmrunService passes listSnapshots arguments in order and parses output", VmrunServicePassesListSnapshotsArgumentsInOrderAndParsesOutput),
+    ("VmrunService detects running VM from list output", VmrunServiceDetectsRunningVmFromListOutput),
     ("VmrunService passes stop soft and hard arguments", VmrunServicePassesStopSoftAndHardArguments),
     ("VmrunService passes revertToSnapshot arguments", VmrunServicePassesRevertToSnapshotArguments),
     ("VmrunService passes start nogui arguments", VmrunServicePassesStartNoguiArguments),
@@ -86,6 +87,8 @@ var tests = new (string Name, Action Body)[]
     ("VmSwitchService does not backup or vmrun when kill returns WORKER_RUNNING", VmSwitchServiceDoesNotBackupOrVmrunWhenKillReturnsWorkerRunning),
     ("VmSwitchService stops before VM stop when backup fails and force revert is false", VmSwitchServiceStopsBeforeVmStopWhenBackupFailsAndForceRevertIsFalse),
     ("VmSwitchService success path executes ordered external actions", VmSwitchServiceSuccessPathExecutesOrderedExternalActions),
+    ("VmSwitchService fails before revert when VM does not stop", VmSwitchServiceFailsBeforeRevertWhenVmDoesNotStop),
+    ("VmSwitchService hard stops when soft stop times out and fallback is allowed", VmSwitchServiceHardStopsWhenSoftStopTimesOutAndFallbackAllowed),
     ("VmSwitchService marks mismatch after ready as WORKER_PROFILE_MISMATCH", VmSwitchServiceMarksMismatchAfterReadyAsWorkerProfileMismatch),
     ("PoolSchedulerService does not switch when no pending tasks", PoolSchedulerServiceDoesNotSwitchWhenNoPendingTasks),
     ("PoolSchedulerService switches a compatible idle VM when pending", PoolSchedulerServiceSwitchesCompatibleIdleVmWhenPending),
@@ -657,6 +660,26 @@ rpa-sh-tax-etax
     Assert.SequenceEqual(new[] { "BaseClean", "rpa-sh-tax-etax" }, snapshots, "listSnapshots output should skip the Total snapshots line.");
 }
 
+static void VmrunServiceDetectsRunningVmFromListOutput()
+{
+    var runner = new FakeProcessRunner(new VmrunCommandResult(
+        ExitCode: 0,
+        StandardOutput: """
+Total running VMs: 2
+D:\VMs\Other\Other.vmx
+D:\VMs With Spaces\SR20\SR20.vmx
+""",
+        StandardError: "",
+        Duration: TimeSpan.FromMilliseconds(25),
+        CommandName: "list"));
+    var service = NewVmrunService(runner);
+
+    var isRunning = service.IsVmRunningAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.True(isRunning, "VM should be considered running when vmrun list contains the VMX path.");
+    Assert.SequenceEqual(new[] { "-T", "ws", "list" }, runner.LastCommand!.Arguments, "list arguments should match vmrun contract.");
+}
+
 static void VmrunServicePassesStopSoftAndHardArguments()
 {
     var runner = new FakeProcessRunner(SuccessResult("stop"));
@@ -1159,7 +1182,9 @@ static void VmSwitchServiceSuccessPathExecutesOrderedExternalActions()
             "update:STOP_RUNNER_DONE",
             "backup",
             "update:LOG_BACKUP_DONE",
+            "vmrun-is-running",
             "vmrun-stop",
+            "vmrun-is-running",
             "update:VM_STOP_DONE",
             "vmrun-revert",
             "update:SNAPSHOT_REVERT_DONE",
@@ -1171,6 +1196,45 @@ static void VmSwitchServiceSuccessPathExecutesOrderedExternalActions()
         },
         recorder.Actions,
         "Successful switch should call external actions in strict order.");
+}
+
+static void VmSwitchServiceFailsBeforeRevertWhenVmDoesNotStop()
+{
+    var recorder = new ActionRecorder();
+    var guest = ReadyGuest(recorder);
+    var vmrun = new RecordingSwitchVmrunService(recorder)
+    {
+        RunningResponses = [true, true]
+    };
+
+    var result = NewVmSwitchService(guest, new RecordingBackupService(recorder), vmrun, new RecordingLocalStore(recorder), stopSoftTimeoutSeconds: 0)
+        .SwitchAsync(SwitchRequest(), CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.False(result.Success, "Switch should fail before revert when the VM never powers off.");
+    Assert.Equal(ErrorCodes.VmStopFailed, result.ErrorCode, "Stop timeout should report VM_STOP_FAILED.");
+    Assert.False(recorder.Actions.Contains("vmrun-revert"), "Revert must not run while the VM is still running.");
+}
+
+static void VmSwitchServiceHardStopsWhenSoftStopTimesOutAndFallbackAllowed()
+{
+    var recorder = new ActionRecorder();
+    var guest = ReadyGuest(recorder);
+    var vmrun = new RecordingSwitchVmrunService(recorder)
+    {
+        RunningResponses = [true, true, false]
+    };
+
+    var result = NewVmSwitchService(
+            guest,
+            new RecordingBackupService(recorder),
+            vmrun,
+            new RecordingLocalStore(recorder),
+            allowHardStopAfterSoftTimeout: true,
+            stopSoftTimeoutSeconds: 0)
+        .SwitchAsync(SwitchRequest(), CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.True(result.Success, "Hard stop fallback should allow switch to continue once the VM is powered off.");
+    Assert.SequenceEqual(new[] { VmStopMode.Soft, VmStopMode.Hard }, vmrun.StopModes, "Soft stop should be attempted before hard stop.");
 }
 
 static void VmSwitchServiceMarksMismatchAfterReadyAsWorkerProfileMismatch()
@@ -1471,7 +1535,7 @@ static void SnapshotUpdateServiceSuccessPathExecutesStepsInOrder()
     Assert.True(result.Success, "Snapshot update should succeed when all steps complete.");
     Assert.Equal("rpa-sh-tax-etax.v260624.2", result.NewSnapshotName, "New snapshot name should increment sequence from existing.");
     Assert.SequenceEqual(
-        new[] { "list-snapshots", "vmrun-revert", "vmrun-start", "get-status", "vmrun-stop", "list-snapshots", "vmrun-create", "vmrun-delete", "vmrun-start" },
+        new[] { "list-snapshots", "vmrun-is-running", "vmrun-stop", "vmrun-is-running", "vmrun-revert", "vmrun-start", "get-status", "vmrun-is-running", "vmrun-stop", "vmrun-is-running", "list-snapshots", "vmrun-create", "vmrun-delete", "vmrun-start" },
         recorder.Actions,
         "Steps should execute in the correct order and restart the VM after snapshot update.");
 }
@@ -1503,7 +1567,7 @@ static void SnapshotUpdateServiceCreatesSnapshotDirectlyWhenCurrentSnapshotMatch
 
     Assert.True(result.Success, "Snapshot update should succeed when current snapshot already matches and runner is idle.");
     Assert.SequenceEqual(
-        new[] { "list-snapshots", "get-status", "vmrun-stop", "list-snapshots", "vmrun-create", "vmrun-delete", "vmrun-start" },
+        new[] { "list-snapshots", "get-status", "vmrun-is-running", "vmrun-stop", "vmrun-is-running", "list-snapshots", "vmrun-create", "vmrun-delete", "vmrun-start" },
         recorder.Actions,
         "Direct snapshot update should skip revert and pre-update VM start.");
 }
@@ -1570,7 +1634,7 @@ static void SnapshotUpdateServiceDoesNotCreateSnapshotWhenRunnerStaysRunningAfte
     Assert.False(result.Success, "Snapshot update should not stop the VM while runner is Running.");
     Assert.Equal(ErrorCodes.RunnerNotReady, result.ErrorCode, "Running runner should be treated as not idle for snapshot creation.");
     Assert.SequenceEqual(
-        new[] { "list-snapshots", "vmrun-revert", "vmrun-start", "get-status", "get-status" },
+        new[] { "list-snapshots", "vmrun-is-running", "vmrun-stop", "vmrun-is-running", "vmrun-revert", "vmrun-start", "get-status", "get-status" },
         recorder.Actions,
         "Snapshot creation should not start until runner becomes Runnable.");
 }
@@ -1592,7 +1656,7 @@ static void SnapshotUpdateServiceFailsAtRevert()
 
     Assert.False(result.Success, "Snapshot update should fail when revert fails.");
     Assert.Equal(ErrorCodes.SnapshotRevertFailed, result.ErrorCode, "Error code should be SNAPSHOT_REVERT_FAILED.");
-    Assert.SequenceEqual(new[] { "list-snapshots", "vmrun-revert" }, recorder.Actions, "Only snapshot resolution and revert should be attempted before failure.");
+    Assert.SequenceEqual(new[] { "list-snapshots", "vmrun-is-running", "vmrun-stop", "vmrun-is-running", "vmrun-revert" }, recorder.Actions, "Only snapshot resolution, safe stop, and revert should be attempted before failure.");
 }
 
 static void SnapshotUpdateServiceFailsWhenRunnerNotReady()
@@ -1625,7 +1689,7 @@ static void SnapshotUpdateServiceFailsWhenRunnerNotReady()
 
     Assert.False(result.Success, "Snapshot update should fail when runner is not ready.");
     Assert.Equal(ErrorCodes.RunnerNotReady, result.ErrorCode, "Error code should be RUNNER_NOT_READY.");
-    Assert.SequenceEqual(new[] { "list-snapshots", "vmrun-revert", "vmrun-start", "get-status", "get-status", "get-status" }, recorder.Actions, "Stop should not execute until runner becomes ready.");
+    Assert.SequenceEqual(new[] { "list-snapshots", "vmrun-is-running", "vmrun-stop", "vmrun-is-running", "vmrun-revert", "vmrun-start", "get-status", "get-status", "get-status" }, recorder.Actions, "Snapshot creation stop should not execute until runner becomes ready.");
 }
 
 static WorkerAgentOptions SnapshotUpdateOptions()
@@ -1692,7 +1756,7 @@ static void P0IntegrationSuccessClosesConfigToSwitchAndReportingLoop()
 
     Assert.True(result.SwitchStarted, "Pending profile should start the integrated switch.");
     Assert.SequenceEqual(
-        new[] { "create-tx", "get-status", "kill", "update:STOP_RUNNER_DONE", "backup", "update:LOG_BACKUP_DONE", "vmrun-stop", "update:VM_STOP_DONE", "vmrun-revert", "update:SNAPSHOT_REVERT_DONE", "vmrun-start", "update:VM_START_DONE", "get-status", "update:WORKER_READY_DONE", "update:SUCCESS" },
+        new[] { "create-tx", "get-status", "kill", "update:STOP_RUNNER_DONE", "backup", "update:LOG_BACKUP_DONE", "vmrun-is-running", "vmrun-stop", "vmrun-is-running", "update:VM_STOP_DONE", "vmrun-revert", "update:SNAPSHOT_REVERT_DONE", "vmrun-start", "update:VM_START_DONE", "get-status", "update:WORKER_READY_DONE", "update:SUCCESS" },
         recorder.Actions,
         "Integrated success path should stop runner, backup, vmrun stop/revert/start, wait ready, then succeed.");
 }
@@ -1908,7 +1972,9 @@ static VmSwitchService NewVmSwitchService(
     RecordingBackupService backup,
     RecordingSwitchVmrunService vmrun,
     RecordingLocalStore store,
-    bool forceRevertWhenBackupFailed = false)
+    bool forceRevertWhenBackupFailed = false,
+    bool allowHardStopAfterSoftTimeout = false,
+    int stopSoftTimeoutSeconds = 60)
 {
     return new VmSwitchService(guest, backup, vmrun, store, new WorkerAgentOptions
     {
@@ -1919,9 +1985,11 @@ static VmSwitchService NewVmSwitchService(
         },
         Vmrun = new VmrunOptions
         {
-            DefaultStartNoGui = true
+            DefaultStartNoGui = true,
+            AllowHardStopAfterSoftTimeout = allowHardStopAfterSoftTimeout,
+            StopSoftTimeoutSeconds = stopSoftTimeoutSeconds
         }
-    }, snapshotRevertRetryDelay: TimeSpan.Zero);
+    }, snapshotRevertRetryDelay: TimeSpan.Zero, vmStoppedPollInterval: TimeSpan.Zero, vmStopTimeout: TimeSpan.FromSeconds(stopSoftTimeoutSeconds));
 }
 
 static VmSwitchRequest SwitchRequest()
@@ -2385,6 +2453,11 @@ internal sealed class FakeVmrunService : IVmrunService
         return Task.FromResult(_snapshots);
     }
 
+    public Task<bool> IsVmRunningAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        return Task.FromResult(false);
+    }
+
     public Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken)
     {
         return Task.FromResult<string?>(_snapshots.FirstOrDefault());
@@ -2589,11 +2662,25 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
 
     public bool FailOnRevert { get; set; }
     public int FailRevertTimes { get; set; }
+    public IReadOnlyList<bool> RunningResponses { get; set; } = [true, false];
+    public List<VmStopMode> StopModes { get; } = [];
     private int _revertAttempts;
+    private int _runningResponseIndex;
 
     public Task<IReadOnlyList<string>> ListSnapshotsAsync(string vmxPath, CancellationToken cancellationToken)
     {
         throw new NotSupportedException();
+    }
+
+    public Task<bool> IsVmRunningAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-is-running");
+        if (_runningResponseIndex < RunningResponses.Count)
+        {
+            return Task.FromResult(RunningResponses[_runningResponseIndex++]);
+        }
+
+        return Task.FromResult(false);
     }
 
     public Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken)
@@ -2609,6 +2696,7 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
     public Task<VmrunCommandResult> StopVmAsync(string vmxPath, VmStopMode mode, CancellationToken cancellationToken)
     {
         _recorder.Actions.Add("vmrun-stop");
+        StopModes.Add(mode);
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "stop"));
     }
 
@@ -2938,11 +3026,24 @@ internal sealed class RecordingSnapshotUpdateVmrunService : IVmrunService
     public bool FailOnRevert { get; set; }
 
     public string? CurrentSnapshotName { get; set; }
+    public IReadOnlyList<bool> RunningResponses { get; set; } = [true, false, true, false];
+    private int _runningResponseIndex;
 
     public Task<IReadOnlyList<string>> ListSnapshotsAsync(string vmxPath, CancellationToken cancellationToken)
     {
         _recorder.Actions.Add("list-snapshots");
         return Task.FromResult(_nextSnapshots);
+    }
+
+    public Task<bool> IsVmRunningAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("vmrun-is-running");
+        if (_runningResponseIndex < RunningResponses.Count)
+        {
+            return Task.FromResult(RunningResponses[_runningResponseIndex++]);
+        }
+
+        return Task.FromResult(false);
     }
 
     public Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken)

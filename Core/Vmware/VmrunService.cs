@@ -35,6 +35,16 @@ public sealed class VmrunService : IVmrunService
         return ParseSnapshots(result.StandardOutput);
     }
 
+    public async Task<bool> IsVmRunningAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        var result = await RunVmrunAsync("list", [], cancellationToken);
+        var targetPath = NormalizeVmPath(vmxPath);
+        return result.StandardOutput
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(line => !line.StartsWith("Total running VMs:", StringComparison.OrdinalIgnoreCase))
+            .Any(line => string.Equals(NormalizeVmPath(line), targetPath, StringComparison.OrdinalIgnoreCase));
+    }
+
     public Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken)
     {
         return Task.FromResult(ReadCurrentSnapshotFromVmsd(vmxPath));
@@ -300,6 +310,22 @@ public sealed class VmrunService : IVmrunService
             .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(line => !line.StartsWith("Total snapshots:", StringComparison.OrdinalIgnoreCase))
             .ToArray();
+    }
+
+    private static string NormalizeVmPath(string path)
+    {
+        var normalized = path.Trim().Trim('"');
+        try
+        {
+            normalized = Path.GetFullPath(normalized);
+        }
+        catch (Exception) when (
+            normalized.IndexOfAny(Path.GetInvalidPathChars()) >= 0
+            || string.IsNullOrWhiteSpace(normalized))
+        {
+        }
+
+        return normalized.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     }
 
     private async Task<VmrunCommandResult> RunProcessAsync(

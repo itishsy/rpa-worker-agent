@@ -13,6 +13,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
     private const int DefaultRunnerStatusCheckMaxAttempts = 12;
     private static readonly TimeSpan DefaultInitialRunnerStatusDelay = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan DefaultRunnerStatusCheckInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DefaultVmStoppedPollInterval = TimeSpan.FromSeconds(2);
 
     private readonly IVmrunService _vmrunService;
     private readonly IGuestWorkerClient _guestWorkerClient;
@@ -25,6 +26,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
     private readonly TimeSpan _runnerStatusCheckInterval;
     private readonly int _runnerStatusCheckMaxAttempts;
     private readonly ILogger<SnapshotUpdateService> _logger;
+    private readonly TimeSpan _vmStoppedPollInterval;
 
     public SnapshotUpdateService(
         IVmrunService vmrunService,
@@ -37,7 +39,8 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         IVirtualMachineRegistry? virtualMachineRegistry = null,
         TimeSpan? initialRunnerStatusDelay = null,
         TimeSpan? runnerStatusCheckInterval = null,
-        int? runnerStatusCheckMaxAttempts = null)
+        int? runnerStatusCheckMaxAttempts = null,
+        TimeSpan? vmStoppedPollInterval = null)
     {
         _vmrunService = vmrunService;
         _guestWorkerClient = guestWorkerClient;
@@ -50,6 +53,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         _runnerStatusCheckInterval = runnerStatusCheckInterval ?? DefaultRunnerStatusCheckInterval;
         _runnerStatusCheckMaxAttempts = runnerStatusCheckMaxAttempts.GetValueOrDefault(DefaultRunnerStatusCheckMaxAttempts);
         _logger = logger ?? NullLogger<SnapshotUpdateService>.Instance;
+        _vmStoppedPollInterval = vmStoppedPollInterval ?? DefaultVmStoppedPollInterval;
     }
 
     public async Task<SnapshotUpdateResult> UpdateSnapshotAsync(
@@ -106,6 +110,12 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
 
         if (!await CanCreateSnapshotFromCurrentVmStateAsync(vm, profileId, cancellationToken))
         {
+            var stopFailure = await StopVmSafelyAsync(vm, "stop-before-revert", cancellationToken).ConfigureAwait(false);
+            if (stopFailure is not null)
+            {
+                return stopFailure;
+            }
+
             try
             {
                 _logger.LogInformation("Reverting VM before snapshot update. VmName={VmName}, SnapshotName={SnapshotName}", vm.Name, currentSnapshotName);
@@ -146,14 +156,10 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         string currentSnapshotName,
         CancellationToken cancellationToken)
     {
-        try
+        var stopFailure = await StopVmSafelyAsync(vm, "stop-before-create", cancellationToken).ConfigureAwait(false);
+        if (stopFailure is not null)
         {
-            _logger.LogInformation("Stopping VM before creating new snapshot. VmName={VmName}", vm.Name);
-            await _vmrunService.StopVmAsync(vm.VmxPath, VmStopMode.Soft, cancellationToken);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            return Fail(ErrorCodes.VmStopFailed, ex.Message, "stop");
+            return stopFailure;
         }
 
         var existingSnapshots = await _vmrunService.ListSnapshotsAsync(vm.VmxPath, cancellationToken);
@@ -332,6 +338,79 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         }
 
         return null;
+    }
+
+    private async Task<SnapshotUpdateResult?> StopVmSafelyAsync(
+        VirtualMachineOptions vm,
+        string step,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (!await _vmrunService.IsVmRunningAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false))
+            {
+                _logger.LogInformation("VM is already stopped before snapshot update step. VmName={VmName}, Step={Step}", vm.Name, step);
+                return null;
+            }
+
+            _logger.LogInformation("Stopping VM before snapshot update step. VmName={VmName}, Step={Step}, Mode={Mode}", vm.Name, step, VmStopMode.Soft);
+            await _vmrunService.StopVmAsync(vm.VmxPath, VmStopMode.Soft, cancellationToken).ConfigureAwait(false);
+
+            var timeout = GetStopTimeout();
+            if (await WaitUntilVmStoppedAsync(vm, step, timeout, cancellationToken).ConfigureAwait(false))
+            {
+                return null;
+            }
+
+            if (!_options.Vmrun.AllowHardStopAfterSoftTimeout)
+            {
+                return Fail(ErrorCodes.VmStopFailed, $"VM did not power off within {timeout.TotalSeconds:0} seconds after soft stop.", step);
+            }
+
+            _logger.LogWarning("Soft stop timed out during snapshot update; attempting hard stop. VmName={VmName}, Step={Step}", vm.Name, step);
+            await _vmrunService.StopVmAsync(vm.VmxPath, VmStopMode.Hard, cancellationToken).ConfigureAwait(false);
+
+            if (await WaitUntilVmStoppedAsync(vm, step, timeout, cancellationToken).ConfigureAwait(false))
+            {
+                return null;
+            }
+
+            return Fail(ErrorCodes.VmStopFailed, $"VM did not power off within {timeout.TotalSeconds:0} seconds after hard stop.", step);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return Fail(ErrorCodes.VmStopFailed, ex.Message, step);
+        }
+    }
+
+    private async Task<bool> WaitUntilVmStoppedAsync(
+        VirtualMachineOptions vm,
+        string step,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        var deadline = _timeProvider.GetUtcNow().Add(timeout);
+        while (true)
+        {
+            var isRunning = await _vmrunService.IsVmRunningAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("VM stop polling result during snapshot update. VmName={VmName}, Step={Step}, IsRunning={IsRunning}", vm.Name, step, isRunning);
+            if (!isRunning)
+            {
+                return true;
+            }
+
+            if (_timeProvider.GetUtcNow() >= deadline)
+            {
+                return false;
+            }
+
+            await Task.Delay(_vmStoppedPollInterval, _timeProvider, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private TimeSpan GetStopTimeout()
+    {
+        return TimeSpan.FromSeconds(_options.Vmrun.StopSoftTimeoutSeconds > 0 ? _options.Vmrun.StopSoftTimeoutSeconds : 60);
     }
 
     private SnapshotUpdateResult Fail(string errorCode, string errorMessage, string step)
