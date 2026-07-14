@@ -559,17 +559,15 @@ public static class OperationsApiExtensions
       form.elements.snapshotName.value = profile.snapshotName || '';
     }
 
-    function applyCopySuffix(value) {
-      if (!value) return value;
-      return value.length > 4 ? value.slice(0, -4) + 'COPY' : 'COPY';
-    }
-
     async function copyVm(vm) {
-      const newName = applyCopySuffix(vm.name);
-      const newWorkerId = applyCopySuffix(vm.workerId);
-      if (!confirm(`Copy VM "${vm.name}" as "${newName}" (WorkerId: "${newWorkerId}")?`)) return;
+      const newName = prompt(`Copy VM "${vm.name}"\n\nEnter new VM name:`, '');
+      if (newName === null) return;
+      if (!newName.trim()) { status('VM name cannot be empty.'); return; }
+      if (vms.some(v => v.name === newName.trim())) { status(`VM "${newName.trim()}" already exists.`); return; }
+      const trimmedName = newName.trim();
+      const newWorkerId = vm.workerId && vm.workerId.length > 4 ? vm.workerId.slice(0, -4) + 'COPY' : 'COPY';
       const newVm = {
-        name: newName,
+        name: trimmedName,
         vmxPath: vm.vmxPath || '',
         baseSnapshotName: vm.baseSnapshotName || '',
         workerId: newWorkerId,
@@ -582,13 +580,13 @@ public static class OperationsApiExtensions
       };
       await request('/vms', { method: 'POST', body: JSON.stringify(newVm) });
       for (const profile of (vm.profiles || [])) {
-        await request(`/vms/${encodeURIComponent(newName)}/profiles`, {
+        await request(`/vms/${encodeURIComponent(trimmedName)}/profiles`, {
           method: 'POST',
           body: JSON.stringify({ profileId: profile.profileId, profileName: profile.profileName, snapshotName: profile.snapshotName || '' })
         });
       }
-      status(`VM copied as "${newName}". Restart required.`);
-      selectedVmName = newName;
+      status(`VM copied as "${trimmedName}". Restart required.`);
+      selectedVmName = trimmedName;
       await load();
     }
 
