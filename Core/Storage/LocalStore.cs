@@ -189,6 +189,64 @@ ON CONFLICT(host_id, vm_name) DO UPDATE SET
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    public async Task UpdateVmQuarantineAsync(
+        string hostId,
+        string vmName,
+        string workerId,
+        bool isQuarantined,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+INSERT INTO local_vm_state (
+    host_id,
+    vm_name,
+    worker_id,
+    current_profile_id,
+    current_snapshot_name,
+    runner_status_code,
+    runner_status_name,
+    agent_vm_status,
+    last_idle_at,
+    last_switch_at,
+    is_quarantined,
+    error_code,
+    error_message,
+    updated_at
+) VALUES (
+    $host_id,
+    $vm_name,
+    $worker_id,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    $agent_vm_status,
+    NULL,
+    NULL,
+    $is_quarantined,
+    NULL,
+    NULL,
+    $updated_at
+)
+ON CONFLICT(host_id, vm_name) DO UPDATE SET
+    worker_id = excluded.worker_id,
+    is_quarantined = excluded.is_quarantined,
+    updated_at = excluded.updated_at;
+""";
+
+        Add(command, "$host_id", hostId);
+        Add(command, "$vm_name", vmName);
+        Add(command, "$worker_id", workerId);
+        Add(command, "$agent_vm_status", AgentVmStatus.UNKNOWN.ToString());
+        Add(command, "$is_quarantined", isQuarantined ? 1 : 0);
+        Add(command, "$updated_at", Format(DateTimeOffset.Now));
+
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     public async Task<IReadOnlyList<VmCurrentState>> GetVmStatesAsync(string hostId, CancellationToken cancellationToken = default)
     {
         await using var connection = CreateConnection();

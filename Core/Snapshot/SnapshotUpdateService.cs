@@ -10,8 +10,9 @@ namespace Seebot.WorkerAgent.Core.Snapshot;
 
 public sealed class SnapshotUpdateService : ISnapshotUpdateService
 {
-    private const int RunnerStatusCheckMaxAttempts = 5;
-    private static readonly TimeSpan RunnerStatusCheckInterval = TimeSpan.FromSeconds(20);
+    private const int DefaultRunnerStatusCheckMaxAttempts = 12;
+    private static readonly TimeSpan DefaultInitialRunnerStatusDelay = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan DefaultRunnerStatusCheckInterval = TimeSpan.FromSeconds(30);
 
     private readonly IVmrunService _vmrunService;
     private readonly IGuestWorkerClient _guestWorkerClient;
@@ -20,6 +21,9 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
     private readonly IVirtualMachineRegistry? _virtualMachineRegistry;
     private readonly WorkerAgentOptions _options;
     private readonly TimeProvider _timeProvider;
+    private readonly TimeSpan _initialRunnerStatusDelay;
+    private readonly TimeSpan _runnerStatusCheckInterval;
+    private readonly int _runnerStatusCheckMaxAttempts;
     private readonly ILogger<SnapshotUpdateService> _logger;
 
     public SnapshotUpdateService(
@@ -30,7 +34,10 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         WorkerAgentOptions options,
         TimeProvider? timeProvider = null,
         ILogger<SnapshotUpdateService>? logger = null,
-        IVirtualMachineRegistry? virtualMachineRegistry = null)
+        IVirtualMachineRegistry? virtualMachineRegistry = null,
+        TimeSpan? initialRunnerStatusDelay = null,
+        TimeSpan? runnerStatusCheckInterval = null,
+        int? runnerStatusCheckMaxAttempts = null)
     {
         _vmrunService = vmrunService;
         _guestWorkerClient = guestWorkerClient;
@@ -39,6 +46,9 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         _virtualMachineRegistry = virtualMachineRegistry;
         _options = options;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _initialRunnerStatusDelay = initialRunnerStatusDelay ?? DefaultInitialRunnerStatusDelay;
+        _runnerStatusCheckInterval = runnerStatusCheckInterval ?? DefaultRunnerStatusCheckInterval;
+        _runnerStatusCheckMaxAttempts = runnerStatusCheckMaxAttempts.GetValueOrDefault(DefaultRunnerStatusCheckMaxAttempts);
         _logger = logger ?? NullLogger<SnapshotUpdateService>.Instance;
     }
 
@@ -94,62 +104,48 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
             profileId,
             currentSnapshotName);
 
-        try
-        {
-            _logger.LogInformation("Reverting VM before snapshot update. VmName={VmName}, SnapshotName={SnapshotName}", vm.Name, currentSnapshotName);
-            await _vmrunService.RevertToSnapshotAsync(vm.VmxPath, currentSnapshotName, cancellationToken);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            return Fail(ErrorCodes.SnapshotRevertFailed, ex.Message, "revert");
-        }
-
-        try
-        {
-            _logger.LogInformation("Starting VM before snapshot update validation. VmName={VmName}", vm.Name);
-            await _vmrunService.StartVmAsync(vm.VmxPath, noGui: true, cancellationToken);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            return Fail(ErrorCodes.VmStartFailed, ex.Message, "start");
-        }
-
-        await Task.Delay(TimeSpan.FromMinutes(1), _timeProvider, cancellationToken);
-        _logger.LogInformation("Initial wait before runner status checks completed. VmName={VmName}, WaitSeconds={WaitSeconds}", vm.Name, 60);
-
-        RunnerStatusResponse? status = null;
-        Exception? lastException = null;
-        for (var attempt = 1; attempt <= RunnerStatusCheckMaxAttempts; attempt++)
+        if (!await CanCreateSnapshotFromCurrentVmStateAsync(vm, profileId, cancellationToken))
         {
             try
             {
-                _logger.LogInformation("Checking runner status for snapshot update. VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}", vm.Name, attempt, RunnerStatusCheckMaxAttempts);
-                status = await _guestWorkerClient.GetRunnerStatusAsync(vm, cancellationToken);
-                lastException = null;
-                break;
+                _logger.LogInformation("Reverting VM before snapshot update. VmName={VmName}, SnapshotName={SnapshotName}", vm.Name, currentSnapshotName);
+                await _vmrunService.RevertToSnapshotAsync(vm.VmxPath, currentSnapshotName, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                lastException = ex;
-                _logger.LogWarning(ex, "Runner status check failed during snapshot update. VmName={VmName}, Attempt={Attempt}", vm.Name, attempt);
-                if (attempt < RunnerStatusCheckMaxAttempts)
-                {
-                    await Task.Delay(RunnerStatusCheckInterval, _timeProvider, cancellationToken);
-                }
+                return Fail(ErrorCodes.SnapshotRevertFailed, ex.Message, "revert");
+            }
+
+            try
+            {
+                _logger.LogInformation("Starting VM before snapshot update validation. VmName={VmName}", vm.Name);
+                await _vmrunService.StartVmAsync(vm.VmxPath, noGui: false, cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return Fail(ErrorCodes.VmStartFailed, ex.Message, "start");
+            }
+
+            await Task.Delay(_initialRunnerStatusDelay, _timeProvider, cancellationToken);
+            _logger.LogInformation("Initial wait before runner status checks completed. VmName={VmName}, WaitSeconds={WaitSeconds}", vm.Name, _initialRunnerStatusDelay.TotalSeconds);
+
+            var runnerReadyFailure = await WaitForRunnerReadyAfterStartAsync(vm, cancellationToken);
+            if (runnerReadyFailure is not null)
+            {
+                return runnerReadyFailure;
             }
         }
 
-        if (lastException is not null || status is null)
-        {
-            return Fail(ErrorCodes.RunnerStatusCheckFailed, lastException?.Message ?? "Unknown error.", "check-status");
-        }
+        return await CreateUpdatedSnapshotAsync(vm, profile, profileId, currentSnapshotName, cancellationToken);
+    }
 
-        if (status.RunnerStatusCode is not (RunnerStatusCode.Runnable or RunnerStatusCode.Running))
-        {
-            return Fail(ErrorCodes.RunnerNotReady,
-                $"Runner status is {status.RunnerStatusCode} after VM start.", "check-status");
-        }
-
+    private async Task<SnapshotUpdateResult> CreateUpdatedSnapshotAsync(
+        VirtualMachineOptions vm,
+        ProfileOptions profile,
+        string profileId,
+        string currentSnapshotName,
+        CancellationToken cancellationToken)
+    {
         try
         {
             _logger.LogInformation("Stopping VM before creating new snapshot. VmName={VmName}", vm.Name);
@@ -160,7 +156,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
             return Fail(ErrorCodes.VmStopFailed, ex.Message, "stop");
         }
 
-        existingSnapshots = await _vmrunService.ListSnapshotsAsync(vm.VmxPath, cancellationToken);
+        var existingSnapshots = await _vmrunService.ListSnapshotsAsync(vm.VmxPath, cancellationToken);
         var now = _timeProvider.GetUtcNow().ToLocalTime();
         var newSnapshotName = SnapshotNameGenerator.Generate(
             profileId,
@@ -207,7 +203,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         try
         {
             _logger.LogInformation("Starting VM after snapshot update completed. VmName={VmName}", vm.Name);
-            await _vmrunService.StartVmAsync(vm.VmxPath, noGui: true, cancellationToken);
+            await _vmrunService.StartVmAsync(vm.VmxPath, noGui: false, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -227,6 +223,115 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
             NewSnapshotName = newSnapshotName,
             Step = "done"
         };
+    }
+
+    private async Task<bool> CanCreateSnapshotFromCurrentVmStateAsync(
+        VirtualMachineOptions vm,
+        string profileId,
+        CancellationToken cancellationToken)
+    {
+        string? currentVmSnapshotName;
+        try
+        {
+            _logger.LogInformation("Reading current VM snapshot before snapshot update. VmName={VmName}", vm.Name);
+            currentVmSnapshotName = await _vmrunService.GetCurrentSnapshotAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Current VM snapshot read failed before snapshot update; falling back to revert path. VmName={VmName}", vm.Name);
+            return false;
+        }
+
+        if (!_snapshotResolver.IsProfileSnapshotName(profileId, currentVmSnapshotName ?? ""))
+        {
+            _logger.LogInformation(
+                "Current VM snapshot does not match target profile; falling back to revert path. VmName={VmName}, ProfileId={ProfileId}, CurrentVmSnapshotName={CurrentVmSnapshotName}",
+                vm.Name,
+                profileId,
+                currentVmSnapshotName);
+            return false;
+        }
+
+        RunnerStatusResponse status;
+        try
+        {
+            _logger.LogInformation("Checking runner status before fast snapshot update. VmName={VmName}, ProfileId={ProfileId}", vm.Name, profileId);
+            status = await _guestWorkerClient.GetRunnerStatusAsync(vm, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Runner status check failed before fast snapshot update; falling back to revert path. VmName={VmName}", vm.Name);
+            return false;
+        }
+
+        if (status.RunnerStatusCode != RunnerStatusCode.Runnable)
+        {
+            _logger.LogInformation(
+                "Runner is not idle before fast snapshot update; falling back to revert path. VmName={VmName}, ProfileId={ProfileId}, RunnerStatusCode={RunnerStatusCode}",
+                vm.Name,
+                profileId,
+                status.RunnerStatusCode);
+            return false;
+        }
+
+        _logger.LogInformation(
+            "Current VM snapshot matches target profile and runner is idle; creating snapshot without revert. VmName={VmName}, ProfileId={ProfileId}, CurrentVmSnapshotName={CurrentVmSnapshotName}, RunnerStatusCode={RunnerStatusCode}",
+            vm.Name,
+            profileId,
+            currentVmSnapshotName,
+            status.RunnerStatusCode);
+        return true;
+    }
+
+    private async Task<SnapshotUpdateResult?> WaitForRunnerReadyAfterStartAsync(
+        VirtualMachineOptions vm,
+        CancellationToken cancellationToken)
+    {
+        RunnerStatusResponse? status = null;
+        Exception? lastException = null;
+        for (var attempt = 1; attempt <= _runnerStatusCheckMaxAttempts; attempt++)
+        {
+            try
+            {
+                _logger.LogInformation("Checking runner status for snapshot update. VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}", vm.Name, attempt, _runnerStatusCheckMaxAttempts);
+                status = await _guestWorkerClient.GetRunnerStatusAsync(vm, cancellationToken);
+                lastException = null;
+                if (status.RunnerStatusCode == RunnerStatusCode.Runnable)
+                {
+                    break;
+                }
+
+                _logger.LogInformation(
+                    "Runner is not idle during snapshot update, will retry if attempts remain. VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}, RunnerStatusCode={RunnerStatusCode}",
+                    vm.Name,
+                    attempt,
+                    _runnerStatusCheckMaxAttempts,
+                    status.RunnerStatusCode);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                lastException = ex;
+                _logger.LogWarning(ex, "Runner status check failed during snapshot update. VmName={VmName}, Attempt={Attempt}", vm.Name, attempt);
+            }
+
+            if (attempt < _runnerStatusCheckMaxAttempts)
+            {
+                await Task.Delay(_runnerStatusCheckInterval, _timeProvider, cancellationToken);
+            }
+        }
+
+        if (status is null)
+        {
+            return Fail(ErrorCodes.RunnerStatusCheckFailed, lastException?.Message ?? "Unknown error.", "check-status");
+        }
+
+        if (status.RunnerStatusCode != RunnerStatusCode.Runnable)
+        {
+            return Fail(ErrorCodes.RunnerNotReady,
+                $"Runner status is {status.RunnerStatusCode} after VM start.", "check-status");
+        }
+
+        return null;
     }
 
     private SnapshotUpdateResult Fail(string errorCode, string errorMessage, string step)

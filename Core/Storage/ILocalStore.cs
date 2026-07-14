@@ -10,6 +10,13 @@ public interface ILocalStore
 
     Task UpsertVmStateAsync(string hostId, VmCurrentState state, CancellationToken cancellationToken = default);
 
+    Task UpdateVmQuarantineAsync(
+        string hostId,
+        string vmName,
+        string workerId,
+        bool isQuarantined,
+        CancellationToken cancellationToken = default);
+
     Task<IReadOnlyList<VmCurrentState>> GetVmStatesAsync(string hostId, CancellationToken cancellationToken = default);
 
     Task<VmCurrentState?> GetVmStateAsync(string hostId, string vmName, CancellationToken cancellationToken = default);

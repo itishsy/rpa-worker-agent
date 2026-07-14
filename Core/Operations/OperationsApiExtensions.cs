@@ -57,6 +57,7 @@ public static class OperationsApiExtensions
                     CurrentSnapshotName = state?.CurrentSnapshotName,
                     RunnerStatus = state?.RunnerStatusCode?.ToString(),
                     VmStatus = state?.VmStatus.ToString(),
+                    IsQuarantined = state?.IsQuarantined ?? false,
                     StateUpdatedAt = state?.UpdatedAt
                 };
             }));
@@ -100,6 +101,58 @@ public static class OperationsApiExtensions
             {
                 message = "VM configuration deleted. Restart the service to apply runtime changes.",
                 restartRequired = true
+            });
+        });
+
+        group.MapPost("/vms/{vmName}/quarantine", async (
+            string vmName,
+            IVirtualMachineRegistry registry,
+            ILocalStore localStore,
+            WorkerAgentOptions options,
+            CancellationToken cancellationToken) =>
+        {
+            var vm = await registry.GetByNameAsync(vmName, cancellationToken).ConfigureAwait(false);
+            if (vm is null)
+            {
+                return Results.NotFound(new { message = $"VM '{vmName}' was not found." });
+            }
+
+            await localStore.UpdateVmQuarantineAsync(
+                options.Agent.HostId,
+                vm.Name,
+                vm.WorkerId,
+                isQuarantined: true,
+                cancellationToken).ConfigureAwait(false);
+            return Results.Ok(new
+            {
+                message = $"VM '{vm.Name}' quarantined.",
+                restartRequired = false
+            });
+        });
+
+        group.MapPost("/vms/{vmName}/unquarantine", async (
+            string vmName,
+            IVirtualMachineRegistry registry,
+            ILocalStore localStore,
+            WorkerAgentOptions options,
+            CancellationToken cancellationToken) =>
+        {
+            var vm = await registry.GetByNameAsync(vmName, cancellationToken).ConfigureAwait(false);
+            if (vm is null)
+            {
+                return Results.NotFound(new { message = $"VM '{vmName}' was not found." });
+            }
+
+            await localStore.UpdateVmQuarantineAsync(
+                options.Agent.HostId,
+                vm.Name,
+                vm.WorkerId,
+                isQuarantined: false,
+                cancellationToken).ConfigureAwait(false);
+            return Results.Ok(new
+            {
+                message = $"VM '{vm.Name}' unquarantined.",
+                restartRequired = false
             });
         });
 
@@ -354,8 +407,11 @@ public static class OperationsApiExtensions
           <td>${renderEnabled(vm)}</td>
           <td>${escapeHtml(vm.currentProfileId || '')}<div class="muted">${escapeHtml(vm.currentSnapshotName || '')}</div></td>
           <td>
-            <button onclick='editVm(${JSON.stringify(vm)})'>Edit</button>
-            <button class="danger" onclick='deleteVm(${JSON.stringify(vm.name)})'>Delete</button>
+            <button data-action="edit-vm" data-vm-name="${escapeHtml(vm.name)}">Edit</button>
+            ${vm.isQuarantined
+              ? `<button data-action="unquarantine-vm" data-vm-name="${escapeHtml(vm.name)}">Unquarantine</button>`
+              : `<button data-action="quarantine-vm" data-vm-name="${escapeHtml(vm.name)}">Quarantine</button>`}
+            <button class="danger" data-action="delete-vm" data-vm-name="${escapeHtml(vm.name)}">Delete</button>
           </td>
         </tr>`).join('');
       renderSelectedProfiles();
@@ -378,14 +434,50 @@ public static class OperationsApiExtensions
           <td>${escapeHtml(snapshotForProfile(vm, profile))}</td>
           <td>${escapeHtml(formatDateTime(profile.updatedAt))}</td>
           <td>
-            <button onclick='editProfile(${JSON.stringify(vm.name)}, ${JSON.stringify(profile)})'>Edit</button>
-            <button class="danger" onclick='deleteProfile(${JSON.stringify(vm.name)}, ${JSON.stringify(profile.profileId)})'>Delete</button>
+            <button data-action="edit-profile" data-vm-name="${escapeHtml(vm.name)}" data-profile-id="${escapeHtml(profile.profileId)}">Edit</button>
+            <button class="danger" data-action="delete-profile" data-vm-name="${escapeHtml(vm.name)}" data-profile-id="${escapeHtml(profile.profileId)}">Delete</button>
           </td>
         </tr>`)
         : [];
 
       document.getElementById('profileRows').innerHTML = rows.join('');
     }
+
+    document.getElementById('vmRows').addEventListener('click', async event => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const button = target.closest('button[data-action]');
+      if (!button) return;
+
+      const vmName = button.dataset.vmName || '';
+      const vm = vms.find(item => item.name === vmName);
+      if (button.dataset.action === 'edit-vm' && vm) {
+        editVm(vm);
+      } else if (button.dataset.action === 'quarantine-vm') {
+        await quarantineVm(vmName, true);
+      } else if (button.dataset.action === 'unquarantine-vm') {
+        await quarantineVm(vmName, false);
+      } else if (button.dataset.action === 'delete-vm') {
+        await deleteVm(vmName);
+      }
+    });
+
+    document.getElementById('profileRows').addEventListener('click', async event => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const button = target.closest('button[data-action]');
+      if (!button) return;
+
+      const vmName = button.dataset.vmName || '';
+      const profileId = button.dataset.profileId || '';
+      const vm = vms.find(item => item.name === vmName);
+      const profile = vm?.profiles?.find(item => item.profileId === profileId);
+      if (button.dataset.action === 'edit-profile' && profile) {
+        editProfile(vmName, profile);
+      } else if (button.dataset.action === 'delete-profile') {
+        await deleteProfile(vmName, profileId);
+      }
+    });
 
     document.getElementById('vmForm').addEventListener('submit', async event => {
       event.preventDefault();
@@ -434,6 +526,14 @@ public static class OperationsApiExtensions
       await load();
     }
 
+    async function quarantineVm(name, quarantined) {
+      const action = quarantined ? 'quarantine' : 'unquarantine';
+      if (!confirm(`${quarantined ? 'Quarantine' : 'Unquarantine'} VM ${name}?`)) return;
+      await request(`/vms/${encodeURIComponent(name)}/${action}`, { method: 'POST' });
+      status(quarantined ? 'VM quarantined.' : 'VM unquarantined.');
+      await load();
+    }
+
     async function deleteProfile(vmName, profileId) {
       if (!confirm(`Delete profile ${profileId}?`)) return;
       await request(`/vms/${encodeURIComponent(vmName)}/profiles/${encodeURIComponent(profileId)}`, { method: 'DELETE' });
@@ -462,9 +562,13 @@ public static class OperationsApiExtensions
     }
 
     function renderEnabled(vm) {
-      return vm.enabled === false
+      const configStatus = vm.enabled === false
         ? '<span class="muted">Disabled</span>'
         : '<span>Enabled</span>';
+      const quarantineStatus = vm.isQuarantined
+        ? '<div class="muted">Quarantined</div>'
+        : '';
+      return configStatus + quarantineStatus;
     }
 
     function snapshotForProfile(vm, profile) {

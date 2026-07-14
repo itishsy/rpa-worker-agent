@@ -107,7 +107,7 @@ public sealed class CapabilityReportService : BackgroundService
                 {
                     HostName = hostName,
                     MachineCode = machineCode,
-                    ProfileId = profile.ProfileId,
+                    ProfileCode = profile.ProfileId,
                     ProfileName = FirstNonEmpty(profile.ProfileName, profile.ProfileId),
                     SnapshotName = resolution.SnapshotName ?? ""
                 });

@@ -84,11 +84,13 @@ public sealed class SchedulerClient : ISchedulerClient
     private async Task PostAsync<T>(string relativePath, T payload, string operationName, CancellationToken cancellationToken)
     {
         var uri = BuildUri(relativePath);
+        var payloadJson = SerializePayload(payload);
         _logger.LogInformation(
-            "Scheduler post started. Operation={Operation}, Url={Url}, PayloadType={PayloadType}",
+            "Scheduler post started. Operation={Operation}, Url={Url}, PayloadType={PayloadType}, Payload={Payload}",
             operationName,
             uri,
-            typeof(T).Name);
+            typeof(T).Name,
+            payloadJson);
         using var response = await SendWithRetryAsync(
             HttpMethod.Post,
             uri,
@@ -217,5 +219,17 @@ public sealed class SchedulerClient : ISchedulerClient
     private static string EnsureTrailingSlash(string value)
     {
         return value.EndsWith("/", StringComparison.Ordinal) ? value : value + "/";
+    }
+
+    private static string SerializePayload<T>(T payload)
+    {
+        try
+        {
+            return JsonSerializer.Serialize(payload, JsonOptions);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            return $"<failed to serialize payload: {exception.Message}>";
+        }
     }
 }

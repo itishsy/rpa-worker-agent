@@ -67,6 +67,7 @@ var tests = new (string Name, Action Body)[]
     ("VmrunService passes deleteSnapshot arguments", VmrunServicePassesDeleteSnapshotArguments),
     ("SchedulerClient pending query includes profileId and bearer token", SchedulerClientPendingQueryIncludesProfileIdAndBearerToken),
     ("SchedulerClient capabilities posts profile capability list", SchedulerClientCapabilitiesPostsProfileCapabilityList),
+    ("SchedulerClient logs report payload", SchedulerClientLogsReportPayload),
     ("SchedulerClient VM status includes current profile snapshot and runner status", SchedulerClientVmStatusIncludesCurrentProfileSnapshotAndRunnerStatus),
     ("SchedulerClient backup result includes backedUpDirectories", SchedulerClientBackupResultIncludesBackedUpDirectories),
     ("SchedulerClient non-success response exposes diagnostic error", SchedulerClientNonSuccessResponseExposesDiagnosticError),
@@ -101,6 +102,9 @@ var tests = new (string Name, Action Body)[]
     ("SnapshotNameGenerator does not conflict with same profile on different date", SnapshotNameGeneratorIgnoresDifferentDate),
     ("SnapshotNameGenerator picks max sequence when multiple exist for today", SnapshotNameGeneratorPicksMaxPlusOne),
     ("SnapshotUpdateService success path executes steps in order", SnapshotUpdateServiceSuccessPathExecutesStepsInOrder),
+    ("SnapshotUpdateService creates snapshot directly when current snapshot matches and runner is idle", SnapshotUpdateServiceCreatesSnapshotDirectlyWhenCurrentSnapshotMatchesAndRunnerIsIdle),
+    ("SnapshotUpdateService retries non-ready runner status until ready", SnapshotUpdateServiceRetriesNonReadyRunnerStatusUntilReady),
+    ("SnapshotUpdateService does not create snapshot when runner stays running after start", SnapshotUpdateServiceDoesNotCreateSnapshotWhenRunnerStaysRunningAfterStart),
     ("SnapshotUpdateService fails at revert when snapshot not found", SnapshotUpdateServiceFailsAtRevert),
     ("SnapshotUpdateService fails when runner is not ready after start", SnapshotUpdateServiceFailsWhenRunnerNotReady),
     ("P0 integration success closes config to switch and reporting loop", P0IntegrationSuccessClosesConfigToSwitchAndReportingLoop),
@@ -481,6 +485,11 @@ static void LocalStoreUpsertsAndQueriesVmState()
     Assert.Equal("rpa-sh-tax-etax-02", seededState!.WorkerId, "Seed should sync WorkerId from current VM config.");
     Assert.Equal("rpa-sh-tax-etax", seededState.CurrentProfileId, "Seed should preserve runtime current profile.");
     Assert.Equal("rpa-sh-tax-etax", seededState.CurrentSnapshotName, "Seed should preserve runtime current snapshot.");
+
+    store.UpdateVmQuarantineAsync("SB-VM-001", "SR20-2026-6HQ8", "rpa-sh-tax-etax-02", isQuarantined: true).GetAwaiter().GetResult();
+    var quarantinedState = store.GetVmStateAsync("SB-VM-001", "SR20-2026-6HQ8").GetAwaiter().GetResult();
+    Assert.True(quarantinedState!.IsQuarantined, "VM quarantine flag should be updateable without replacing runtime state.");
+    Assert.Equal("rpa-sh-tax-etax", quarantinedState.CurrentProfileId, "Quarantine update should preserve current profile.");
 }
 
 static void LocalStoreCreatesAndQueriesSwitchTransactions()
@@ -765,7 +774,7 @@ static void SchedulerClientCapabilitiesPostsProfileCapabilityList()
         {
             HostName = "SR20 Host Agent",
             MachineCode = "rpa-sh-tax-etax-001",
-            ProfileId = "rpa-sh-tax-etax",
+            ProfileCode = "rpa-sh-tax-etax",
             ProfileName = "上海税务电子税局",
             SnapshotName = "rpa-sh-tax-etax.v260624.1"
         }
@@ -779,9 +788,35 @@ static void SchedulerClientCapabilitiesPostsProfileCapabilityList()
     var item = json.RootElement[0];
     Assert.Equal("SR20 Host Agent", item.GetProperty("hostName").GetString(), "Capability hostName should be serialized.");
     Assert.Equal("rpa-sh-tax-etax-001", item.GetProperty("machineCode").GetString(), "Capability machineCode should be serialized.");
-    Assert.Equal("rpa-sh-tax-etax", item.GetProperty("profileId").GetString(), "Capability profileId should be serialized.");
+    Assert.Equal("rpa-sh-tax-etax", item.GetProperty("profileCode").GetString(), "Capability profileCode should be serialized.");
     Assert.Equal("上海税务电子税局", item.GetProperty("profileName").GetString(), "Capability profileName should be serialized.");
     Assert.Equal("rpa-sh-tax-etax.v260624.1", item.GetProperty("snapshotName").GetString(), "Capability snapshotName should be serialized.");
+}
+
+static void SchedulerClientLogsReportPayload()
+{
+    var handler = new FakeHttpMessageHandler(OkResponse());
+    var logger = new ListLogger<SchedulerClient>();
+    var client = NewSchedulerClient(handler, logger);
+
+    client.ReportCapabilitiesAsync(
+    [
+        new HostProfileCapabilityRequest
+        {
+            HostName = "SR20 Host Agent",
+            MachineCode = "rpa-sh-tax-etax-001",
+            ProfileCode = "rpa-sh-tax-etax",
+            ProfileName = "Shanghai Tax",
+            SnapshotName = "rpa-sh-tax-etax.v260624.1"
+        }
+    ], CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.True(
+        logger.Messages.Any(message =>
+            message.Contains("Payload=", StringComparison.Ordinal)
+            && message.Contains("\"profileCode\":\"rpa-sh-tax-etax\"", StringComparison.Ordinal)
+            && message.Contains("\"snapshotName\":\"rpa-sh-tax-etax.v260624.1\"", StringComparison.Ordinal)),
+        "Scheduler report logs should include the serialized request payload.");
 }
 
 static void SchedulerClientVmStatusIncludesCurrentProfileSnapshotAndRunnerStatus()
@@ -1370,7 +1405,7 @@ static void CapabilityReportServiceReportsAllVmProfileCapabilities()
     Assert.Equal(4, scheduler.ReportedCapabilities[0].Count, "Capability report should include all configured VM profiles.");
     Assert.Equal("SR20 Host Agent", scheduler.ReportedCapabilities[0][0].HostName, "Capability should include hostName.");
     Assert.Equal("rpa-sh-tax-etax-01", scheduler.ReportedCapabilities[0][0].MachineCode, "Capability should include machineCode.");
-    Assert.Equal("rpa-sh-tax-etax", scheduler.ReportedCapabilities[0][0].ProfileId, "Capability should include profileId.");
+    Assert.Equal("rpa-sh-tax-etax", scheduler.ReportedCapabilities[0][0].ProfileCode, "Capability should include profileCode.");
     Assert.Equal("Shanghai Tax", scheduler.ReportedCapabilities[0][0].ProfileName, "Capability should include profileName.");
     Assert.Equal("rpa-sh-tax-etax.v260624.1", scheduler.ReportedCapabilities[0][0].SnapshotName, "Capability should include snapshotName.");
 }
@@ -1421,7 +1456,15 @@ static void SnapshotUpdateServiceSuccessPathExecutesStepsInOrder()
         KillResponse = KillSuccess()
     };
     var options = SnapshotUpdateOptions();
-    var service = new SnapshotUpdateService(vmrunService, guest, new ProfileSnapshotResolver(), new VmOperationLock(), options, new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")));
+    var service = new SnapshotUpdateService(
+        vmrunService,
+        guest,
+        new ProfileSnapshotResolver(),
+        new VmOperationLock(),
+        options,
+        new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")),
+        initialRunnerStatusDelay: TimeSpan.Zero,
+        runnerStatusCheckInterval: TimeSpan.Zero);
 
     var result = service.UpdateSnapshotAsync("SR20-2026-6HQ8", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
 
@@ -1431,6 +1474,105 @@ static void SnapshotUpdateServiceSuccessPathExecutesStepsInOrder()
         new[] { "list-snapshots", "vmrun-revert", "vmrun-start", "get-status", "vmrun-stop", "list-snapshots", "vmrun-create", "vmrun-delete", "vmrun-start" },
         recorder.Actions,
         "Steps should execute in the correct order and restart the VM after snapshot update.");
+}
+
+static void SnapshotUpdateServiceCreatesSnapshotDirectlyWhenCurrentSnapshotMatchesAndRunnerIsIdle()
+{
+    var recorder = new ActionRecorder();
+    var vmrunService = new RecordingSnapshotUpdateVmrunService(recorder, nextSnapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1"])
+    {
+        CurrentSnapshotName = "rpa-sh-tax-etax.v260624.1"
+    };
+    var guest = new RecordingGuestWorkerClient(recorder)
+    {
+        StatusResponses = [RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Runnable)],
+        KillResponse = KillSuccess()
+    };
+    var options = SnapshotUpdateOptions();
+    var service = new SnapshotUpdateService(
+        vmrunService,
+        guest,
+        new ProfileSnapshotResolver(),
+        new VmOperationLock(),
+        options,
+        new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")),
+        initialRunnerStatusDelay: TimeSpan.Zero,
+        runnerStatusCheckInterval: TimeSpan.Zero);
+
+    var result = service.UpdateSnapshotAsync("SR20-2026-6HQ8", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.True(result.Success, "Snapshot update should succeed when current snapshot already matches and runner is idle.");
+    Assert.SequenceEqual(
+        new[] { "list-snapshots", "get-status", "vmrun-stop", "list-snapshots", "vmrun-create", "vmrun-delete", "vmrun-start" },
+        recorder.Actions,
+        "Direct snapshot update should skip revert and pre-update VM start.");
+}
+
+static void SnapshotUpdateServiceRetriesNonReadyRunnerStatusUntilReady()
+{
+    var recorder = new ActionRecorder();
+    var vmrunService = new RecordingSnapshotUpdateVmrunService(recorder, nextSnapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1"]);
+    var guest = new RecordingGuestWorkerClient(recorder)
+    {
+        StatusResponses =
+        [
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Closed),
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Offline),
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Runnable)
+        ],
+        KillResponse = KillSuccess()
+    };
+    var options = SnapshotUpdateOptions();
+    var service = new SnapshotUpdateService(
+        vmrunService,
+        guest,
+        new ProfileSnapshotResolver(),
+        new VmOperationLock(),
+        options,
+        new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")),
+        initialRunnerStatusDelay: TimeSpan.Zero,
+        runnerStatusCheckInterval: TimeSpan.Zero,
+        runnerStatusCheckMaxAttempts: 3);
+
+    var result = service.UpdateSnapshotAsync("SR20-2026-6HQ8", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.True(result.Success, "Snapshot update should keep polling until runner becomes ready.");
+    Assert.Equal(3, recorder.Actions.Count(action => action == "get-status"), "Runner status should be retried until ready.");
+}
+
+static void SnapshotUpdateServiceDoesNotCreateSnapshotWhenRunnerStaysRunningAfterStart()
+{
+    var recorder = new ActionRecorder();
+    var vmrunService = new RecordingSnapshotUpdateVmrunService(recorder, nextSnapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1"]);
+    var guest = new RecordingGuestWorkerClient(recorder)
+    {
+        StatusResponses =
+        [
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Running),
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Running)
+        ],
+        KillResponse = KillSuccess()
+    };
+    var options = SnapshotUpdateOptions();
+    var service = new SnapshotUpdateService(
+        vmrunService,
+        guest,
+        new ProfileSnapshotResolver(),
+        new VmOperationLock(),
+        options,
+        new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")),
+        initialRunnerStatusDelay: TimeSpan.Zero,
+        runnerStatusCheckInterval: TimeSpan.Zero,
+        runnerStatusCheckMaxAttempts: 2);
+
+    var result = service.UpdateSnapshotAsync("SR20-2026-6HQ8", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.False(result.Success, "Snapshot update should not stop the VM while runner is Running.");
+    Assert.Equal(ErrorCodes.RunnerNotReady, result.ErrorCode, "Running runner should be treated as not idle for snapshot creation.");
+    Assert.SequenceEqual(
+        new[] { "list-snapshots", "vmrun-revert", "vmrun-start", "get-status", "get-status" },
+        recorder.Actions,
+        "Snapshot creation should not start until runner becomes Runnable.");
 }
 
 static void SnapshotUpdateServiceFailsAtRevert()
@@ -1459,17 +1601,31 @@ static void SnapshotUpdateServiceFailsWhenRunnerNotReady()
     var vmrunService = new RecordingSnapshotUpdateVmrunService(recorder, nextSnapshots: ["SR20-2026-6HQ8", "rpa-sh-tax-etax.v260624.1"]);
     var guest = new RecordingGuestWorkerClient(recorder)
     {
-        StatusResponses = [RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Closed)],
+        StatusResponses =
+        [
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Closed),
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Closed),
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Closed)
+        ],
         KillResponse = KillSuccess()
     };
     var options = SnapshotUpdateOptions();
-    var service = new SnapshotUpdateService(vmrunService, guest, new ProfileSnapshotResolver(), new VmOperationLock(), options, new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")));
+    var service = new SnapshotUpdateService(
+        vmrunService,
+        guest,
+        new ProfileSnapshotResolver(),
+        new VmOperationLock(),
+        options,
+        new FixedTimeProvider(DateTimeOffset.Parse("2026-06-24T10:00:00+08:00")),
+        initialRunnerStatusDelay: TimeSpan.Zero,
+        runnerStatusCheckInterval: TimeSpan.Zero,
+        runnerStatusCheckMaxAttempts: 3);
 
     var result = service.UpdateSnapshotAsync("SR20-2026-6HQ8", "rpa-sh-tax-etax", CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.False(result.Success, "Snapshot update should fail when runner is not ready.");
     Assert.Equal(ErrorCodes.RunnerNotReady, result.ErrorCode, "Error code should be RUNNER_NOT_READY.");
-    Assert.SequenceEqual(new[] { "list-snapshots", "vmrun-revert", "vmrun-start", "get-status" }, recorder.Actions, "Stop should not execute when runner is not ready.");
+    Assert.SequenceEqual(new[] { "list-snapshots", "vmrun-revert", "vmrun-start", "get-status", "get-status", "get-status" }, recorder.Actions, "Stop should not execute until runner becomes ready.");
 }
 
 static WorkerAgentOptions SnapshotUpdateOptions()
@@ -1934,7 +2090,7 @@ static VirtualMachineOptions GuestVm()
     };
 }
 
-static SchedulerClient NewSchedulerClient(FakeHttpMessageHandler handler)
+static SchedulerClient NewSchedulerClient(FakeHttpMessageHandler handler, ILogger<SchedulerClient>? logger = null)
 {
     var httpClient = new HttpClient(handler)
     {
@@ -1944,7 +2100,7 @@ static SchedulerClient NewSchedulerClient(FakeHttpMessageHandler handler)
     return new SchedulerClient(httpClient, new SchedulerOptions
     {
         BaseUrl = "http://seebot-server/api/rpa"
-    }, new StaticSchedulerTokenProvider("scheduler-token"));
+    }, new StaticSchedulerTokenProvider("scheduler-token"), logger);
 }
 
 static HttpContent JsonContent(string json)
@@ -2572,6 +2728,27 @@ internal sealed class RecordingLocalStore : ILocalStore
         return Task.CompletedTask;
     }
 
+    public Task UpdateVmQuarantineAsync(
+        string hostId,
+        string vmName,
+        string workerId,
+        bool isQuarantined,
+        CancellationToken cancellationToken = default)
+    {
+        var state = VmStates.FirstOrDefault(item => string.Equals(item.VmName, vmName, StringComparison.OrdinalIgnoreCase))
+            ?? new VmCurrentState
+            {
+                VmName = vmName,
+                WorkerId = workerId,
+                VmStatus = AgentVmStatus.UNKNOWN,
+                UpdatedAt = DateTimeOffset.Now
+            };
+
+        state.WorkerId = workerId;
+        state.IsQuarantined = isQuarantined;
+        return Task.CompletedTask;
+    }
+
     public Task<IReadOnlyList<VmCurrentState>> GetVmStatesAsync(string hostId, CancellationToken cancellationToken = default)
     {
         return Task.FromResult(VmStates);
@@ -2760,6 +2937,8 @@ internal sealed class RecordingSnapshotUpdateVmrunService : IVmrunService
 
     public bool FailOnRevert { get; set; }
 
+    public string? CurrentSnapshotName { get; set; }
+
     public Task<IReadOnlyList<string>> ListSnapshotsAsync(string vmxPath, CancellationToken cancellationToken)
     {
         _recorder.Actions.Add("list-snapshots");
@@ -2768,7 +2947,7 @@ internal sealed class RecordingSnapshotUpdateVmrunService : IVmrunService
 
     public Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken)
     {
-        return Task.FromResult<string?>(_nextSnapshots.FirstOrDefault());
+        return Task.FromResult(CurrentSnapshotName);
     }
 
     public Task<string> GetGuestIPAddressAsync(string vmxPath, CancellationToken cancellationToken)
