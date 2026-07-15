@@ -182,8 +182,8 @@ Revert -> Start -> Wait -> Check Runner -> Stop -> Create -> Delete -> Start
 1. `vmrun revertToSnapshot {vmxPath} {currentSnapshotName}`
 2. `vmrun start {vmxPath} nogui`
 3. 等待 `2 分钟`
-4. 检查 runner 状态，最多 `12 次`
-5. 每次检查间隔 `30 秒`
+4. 检查 runner 状态，最多 `30 次`
+5. 每次检查间隔 `10 秒`
 6. runner 状态为 `Runnable` 时继续
 7. 多次检查后仍未 ready，则失败
 

@@ -10,9 +10,9 @@ namespace Seebot.WorkerAgent.Core.Snapshot;
 
 public sealed class SnapshotUpdateService : ISnapshotUpdateService
 {
-    private const int DefaultRunnerStatusCheckMaxAttempts = 12;
+    private const int DefaultRunnerStatusCheckMaxAttempts = 30;
     private static readonly TimeSpan DefaultInitialRunnerStatusDelay = TimeSpan.FromMinutes(2);
-    private static readonly TimeSpan DefaultRunnerStatusCheckInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DefaultRunnerStatusCheckInterval = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan DefaultVmStoppedPollInterval = TimeSpan.FromSeconds(2);
 
     private readonly IVmrunService _vmrunService;
