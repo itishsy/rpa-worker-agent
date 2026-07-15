@@ -79,7 +79,7 @@ public static class ServiceCollectionExtensions
                 client.BaseAddress = new Uri(options.BaseUrl);
             }
         });
-        // 单例是为了让所有 SchedulerClient 消费者共享同一份 token 缓存，避免各自触发重复登录
+        // Share one scheduler token cache across SchedulerClient consumers.
         services.AddSingleton<ISchedulerTokenProvider>(provider =>
         {
             var httpClient = provider.GetRequiredService<IHttpClientFactory>().CreateClient(SchedulerAuthHttpClientName);
@@ -98,6 +98,7 @@ public static class ServiceCollectionExtensions
             }
         });
         services.AddHttpClient<IGuestWorkerClient, GuestWorkerClient>();
+        services.AddSingleton<IGuestTokenProvisioningService, GuestTokenProvisioningService>();
         services.AddSingleton<ILocalStore>(provider =>
         {
             var agentOptions = provider.GetRequiredService<WorkerAgentOptions>().Agent;
@@ -121,7 +122,8 @@ public static class ServiceCollectionExtensions
                 provider.GetRequiredService<IProfileSnapshotResolver>(),
                 provider.GetRequiredService<WorkerAgentOptions>(),
                 provider.GetRequiredService<IVirtualMachineRegistry>(),
-                logger: provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<InitFileUpdateService>>()));
+                logger: provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<InitFileUpdateService>>(),
+                guestTokenProvisioningService: provider.GetRequiredService<IGuestTokenProvisioningService>()));
         services.AddSingleton<CapabilityReportService>();
         services.AddHostedService(sp => sp.GetRequiredService<CapabilityReportService>());
 

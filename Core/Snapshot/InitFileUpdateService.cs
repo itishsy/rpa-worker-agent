@@ -2,6 +2,7 @@ using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Seebot.WorkerAgent.Core.Configuration;
+using Seebot.WorkerAgent.Core.Guest;
 using Seebot.WorkerAgent.Core.Storage;
 using Seebot.WorkerAgent.Core.Vmware;
 
@@ -9,7 +10,7 @@ namespace Seebot.WorkerAgent.Core.Snapshot;
 
 public sealed class InitFileUpdateService : IInitFileUpdateService
 {
-    // guest 内 rpa.init 的固定路径
+    // Guest path for the worker id consumed by the legacy client.
     private const string GuestInitFilePath = @"C:\Program Files\rpa\rpa.init";
 
     private static readonly TimeSpan DefaultProcessWaitTimeout = TimeSpan.FromMinutes(5);
@@ -20,6 +21,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
     private readonly IVmrunService _vmrunService;
     private readonly IVmOperationLock _vmOperationLock;
     private readonly IProfileSnapshotResolver _snapshotResolver;
+    private readonly IGuestTokenProvisioningService? _guestTokenProvisioningService;
     private readonly IVirtualMachineRegistry? _registry;
     private readonly WorkerAgentOptions _options;
     private readonly TimeProvider _timeProvider;
@@ -36,11 +38,13 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         TimeProvider? timeProvider = null,
         TimeSpan? processWaitTimeout = null,
         TimeSpan? processPollInterval = null,
-        ILogger<InitFileUpdateService>? logger = null)
+        ILogger<InitFileUpdateService>? logger = null,
+        IGuestTokenProvisioningService? guestTokenProvisioningService = null)
     {
         _vmrunService = vmrunService;
         _vmOperationLock = vmOperationLock;
         _snapshotResolver = snapshotResolver;
+        _guestTokenProvisioningService = guestTokenProvisioningService;
         _options = options;
         _registry = registry;
         _timeProvider = timeProvider ?? TimeProvider.System;
@@ -124,7 +128,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         ProfileOptions profile,
         CancellationToken cancellationToken)
     {
-        // 1. 解析当前快照名
+        // 1. Resolve the profile snapshot to update.
         List<string> snapshots;
         try
         {
@@ -144,7 +148,10 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
 
         var oldSnapshotName = resolution.SnapshotName!;
 
-        // 2. 回滚到 profile 快照
+        // Ensure VMware releases the VMX before reverting to a profile snapshot.
+        await SafeStopAsync(vm, cancellationToken).ConfigureAwait(false);
+
+        // 2. Revert to the profile snapshot.
         try
         {
             await _vmrunService.RevertToSnapshotAsync(vm.VmxPath, oldSnapshotName, cancellationToken).ConfigureAwait(false);
@@ -154,7 +161,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             return FailProfile(profile.ProfileId, "SNAPSHOT_REVERT_FAILED", ex.Message);
         }
 
-        // 3. 启动 VM
+        // 3. Start the VM.
         try
         {
             await _vmrunService.StartVmAsync(vm.VmxPath, noGui: true, cancellationToken).ConfigureAwait(false);
@@ -164,22 +171,31 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             return FailProfile(profile.ProfileId, "VM_START_FAILED", ex.Message);
         }
 
-        // 4. 等待 rpa-client.exe 进程出现
-        var processFound = await WaitForProcessAsync(vm, "rpa-client.exe", cancellationToken).ConfigureAwait(false);
-        if (!processFound)
+        var tokenFailure = await ProvisionGuestTokenAsync(vm, profile.ProfileId, cancellationToken).ConfigureAwait(false);
+        if (tokenFailure is not null)
         {
             await SafeStopAsync(vm, cancellationToken).ConfigureAwait(false);
-            return FailProfile(profile.ProfileId, "PROCESS_WAIT_TIMEOUT",
-                $"Timed out waiting for rpa-client.exe to start (timeout={_processWaitTimeout.TotalMinutes:F0}min).");
+            return tokenFailure;
         }
 
-        // 5. 强杀 rpa-client.exe 和 java.exe，释放 rpa.init 文件句柄
-        await ForceKillProcessesAsync(vm, cancellationToken).ConfigureAwait(false);
+        // 4. Wait until VMware Tools guest operations are available.
+        var guestOperationsReady = await WaitForGuestOperationsReadyAsync(vm, cancellationToken).ConfigureAwait(false);
+        if (!guestOperationsReady)
+        {
+            await SafeStopAsync(vm, cancellationToken).ConfigureAwait(false);
+            return FailProfile(profile.ProfileId, "GUEST_OPERATIONS_TIMEOUT",
+                $"Timed out waiting for VMware Tools guest operations to become available (timeout={_processWaitTimeout.TotalMinutes:F0}min).");
+        }
 
-        // 6. 写入新 workerId 到 rpa.init
+        // 5. Write and verify rpa.init; stop robot.exe only when direct update fails.
         try
         {
-            await WriteInitFileAsync(vm, cancellationToken).ConfigureAwait(false);
+            var initUpdate = await UpdateInitFileWithFallbackAsync(vm, cancellationToken).ConfigureAwait(false);
+            if (!initUpdate.Success)
+            {
+                await SafeStopAsync(vm, cancellationToken).ConfigureAwait(false);
+                return FailProfile(profile.ProfileId, "WRITE_INIT_FAILED", initUpdate.ErrorMessage ?? "Failed to update rpa.init.");
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -187,10 +203,10 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             return FailProfile(profile.ProfileId, "WRITE_INIT_FAILED", ex.Message);
         }
 
-        // 7. 停机
+        // 7. Stop VM before creating the updated snapshot.
         await SafeStopAsync(vm, cancellationToken).ConfigureAwait(false);
 
-        // 8. 生成新快照名并创建快照
+        // 8. Generate a new snapshot name and create the updated snapshot.
         string newSnapshotName;
         try
         {
@@ -204,7 +220,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             return FailProfile(profile.ProfileId, "SNAPSHOT_CREATE_FAILED", ex.Message);
         }
 
-        // 9. 删除旧快照（失败只记录警告，不影响整体结果）
+    // Stop guest processes best-effort; failures are logged and ignored.
         try
         {
             await _vmrunService.DeleteSnapshotAsync(vm.VmxPath, oldSnapshotName, cancellationToken).ConfigureAwait(false);
@@ -216,7 +232,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
                 vm.Name, profile.ProfileId, oldSnapshotName);
         }
 
-        // 10. 更新注册表中的快照名称
+        // 10. Persist the new snapshot mapping when a registry is configured.
         if (_registry is not null)
         {
             try
@@ -241,10 +257,9 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         };
     }
 
-    // 轮询 listProcessesInGuest 直到目标进程出现或超时
-    private async Task<bool> WaitForProcessAsync(
+    // Poll listProcessesInGuest until VMware Tools guest operations are available.
+    private async Task<bool> WaitForGuestOperationsReadyAsync(
         VirtualMachineOptions vm,
-        string processName,
         CancellationToken cancellationToken)
     {
         var deadline = _timeProvider.GetUtcNow() + _processWaitTimeout;
@@ -257,17 +272,15 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
                     .ListProcessesInGuestAsync(vm.VmxPath, vm.GuestUser, vm.GuestPasswordSecret, cancellationToken)
                     .ConfigureAwait(false);
 
-                if (processes.Any(p => p.CommandLine.Contains(processName, StringComparison.OrdinalIgnoreCase)))
-                {
-                    _logger.LogInformation(
-                        "Guest process found. VmName={VmName}, Process={Process}",
-                        vm.Name, processName);
-                    return true;
-                }
+                _logger.LogInformation(
+                    "VMware Tools guest operations are available. VmName={VmName}, ProcessCount={ProcessCount}",
+                    vm.Name,
+                    processes.Count);
+                return true;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // VMware Tools 尚未就绪时正常失败，继续等待
+                // VMware Tools may still be initializing; keep polling.
                 _logger.LogDebug(ex,
                     "listProcessesInGuest not yet available. VmName={VmName}", vm.Name);
             }
@@ -278,10 +291,10 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         return false;
     }
 
-    // 强杀 Guest 内进程，best-effort：失败只记 debug 日志，不中断流程
+    // Stop guest processes best-effort; failures are logged and ignored.
     private async Task ForceKillProcessesAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
     {
-        foreach (var processName in new[] { "rpa-client.exe", "java.exe" })
+        foreach (var processName in new[] { "robot.exe" })
         {
             try
             {
@@ -306,27 +319,164 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         }
     }
 
-    // 通过 PowerShell EncodedCommand 写入 rpa.init
-    private Task WriteInitFileAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
+    private async Task<InitFileWriteAttempt> UpdateInitFileWithFallbackAsync(
+        VirtualMachineOptions vm,
+        CancellationToken cancellationToken)
     {
-        // 单引号内的 workerId 不含特殊字符，直接嵌入；如需转义可扩展
-        var psCommand = $"Set-Content -Path '{GuestInitFilePath}' -Value '{vm.WorkerId}' -Encoding UTF8 -Force";
+        var directAttempt = await TryWriteAndVerifyInitFileAsync(vm, useTemporaryFile: false, cancellationToken)
+            .ConfigureAwait(false);
+        if (directAttempt.Success)
+        {
+            return directAttempt;
+        }
+
+        _logger.LogWarning(
+            "Direct rpa.init update failed; stopping robot.exe before retry. VmName={VmName}, Error={Error}",
+            vm.Name,
+            directAttempt.ErrorMessage);
+
+        await ForceKillProcessesAsync(vm, cancellationToken).ConfigureAwait(false);
+        if (!await WaitForProcessExitAsync(vm, "robot.exe", cancellationToken).ConfigureAwait(false))
+        {
+            return new InitFileWriteAttempt(false, "Timed out waiting for robot.exe to exit before writing rpa.init.");
+        }
+
+        var retryAttempt = await TryWriteAndVerifyInitFileAsync(vm, useTemporaryFile: true, cancellationToken)
+            .ConfigureAwait(false);
+        if (retryAttempt.Success)
+        {
+            return retryAttempt;
+        }
+
+        return new InitFileWriteAttempt(
+            false,
+            $"Direct write failed: {directAttempt.ErrorMessage}; retry after stopping robot.exe failed: {retryAttempt.ErrorMessage}");
+    }
+
+    private async Task<InitFileWriteAttempt> TryWriteAndVerifyInitFileAsync(
+        VirtualMachineOptions vm,
+        bool useTemporaryFile,
+        CancellationToken cancellationToken)
+    {
+        var psCommand = BuildWriteAndVerifyInitFileCommand(vm.WorkerId, useTemporaryFile);
         var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(psCommand));
 
         _logger.LogInformation(
-            "Writing rpa.init. VmName={VmName}, WorkerId={WorkerId}",
-            vm.Name, vm.WorkerId);
+            "Writing and verifying rpa.init. VmName={VmName}, WorkerId={WorkerId}, UseTemporaryFile={UseTemporaryFile}",
+            vm.Name,
+            vm.WorkerId,
+            useTemporaryFile);
 
-        return _vmrunService.RunProgramInGuestAsync(
-            vm.VmxPath,
-            vm.GuestUser,
-            vm.GuestPasswordSecret,
-            @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-            ["-NonInteractive", "-EncodedCommand", encoded],
-            cancellationToken);
+        try
+        {
+            await _vmrunService.RunProgramInGuestAsync(
+                vm.VmxPath,
+                vm.GuestUser,
+                vm.GuestPasswordSecret,
+                @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                cancellationToken).ConfigureAwait(false);
+            return new InitFileWriteAttempt(true, null);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return new InitFileWriteAttempt(false, ex.Message);
+        }
     }
 
-    // soft stop → 等待停止；超时后补一次 hard stop
+    private static string BuildWriteAndVerifyInitFileCommand(string workerId, bool useTemporaryFile)
+    {
+        var escapedPath = EscapePowerShellSingleQuotedString(GuestInitFilePath);
+        var escapedWorkerId = EscapePowerShellSingleQuotedString(workerId);
+        var writeCommand = useTemporaryFile
+            ? """
+$tmp = "$target.tmp"
+[System.IO.File]::WriteAllText($tmp, $expected, [System.Text.Encoding]::UTF8)
+Move-Item -LiteralPath $tmp -Destination $target -Force
+"""
+            : """
+[System.IO.File]::WriteAllText($target, $expected, [System.Text.Encoding]::UTF8)
+""";
+
+        return $$"""
+$ErrorActionPreference = 'Stop'
+$target = '{{escapedPath}}'
+$expected = '{{escapedWorkerId}}'
+{{writeCommand}}
+$actual = [System.IO.File]::ReadAllText($target, [System.Text.Encoding]::UTF8).TrimEnd("`r", "`n")
+if ($actual -ne $expected) {
+    Write-Error "rpa.init verification failed. Expected '$expected' but read '$actual'."
+    exit 10
+}
+""";
+    }
+
+    private static string EscapePowerShellSingleQuotedString(string value)
+    {
+        return value.Replace("'", "''", StringComparison.Ordinal);
+    }
+
+    private async Task<bool> WaitForProcessExitAsync(
+        VirtualMachineOptions vm,
+        string processName,
+        CancellationToken cancellationToken)
+    {
+        var deadline = _timeProvider.GetUtcNow() + _processWaitTimeout;
+        while (_timeProvider.GetUtcNow() < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var processes = await _vmrunService
+                    .ListProcessesInGuestAsync(vm.VmxPath, vm.GuestUser, vm.GuestPasswordSecret, cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (!processes.Any(p => p.CommandLine.Contains(processName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    _logger.LogInformation(
+                        "Guest process exited. VmName={VmName}, Process={Process}",
+                        vm.Name,
+                        processName);
+                    return true;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "listProcessesInGuest failed while waiting for process exit. VmName={VmName}", vm.Name);
+            }
+
+            await Task.Delay(_processPollInterval, cancellationToken).ConfigureAwait(false);
+        }
+
+        return false;
+    }
+
+    private sealed record InitFileWriteAttempt(bool Success, string? ErrorMessage);
+
+    private async Task<ProfileInitUpdateResult?> ProvisionGuestTokenAsync(
+        VirtualMachineOptions vm,
+        string profileId,
+        CancellationToken cancellationToken)
+    {
+        if (_guestTokenProvisioningService is null)
+        {
+            return null;
+        }
+
+        var result = await _guestTokenProvisioningService.ProvisionAsync(vm, cancellationToken)
+            .ConfigureAwait(false);
+        return result.Success
+            ? null
+            : new ProfileInitUpdateResult
+            {
+                ProfileId = profileId,
+                Success = false,
+                ErrorCode = result.ErrorCode ?? "WRITE_TOKEN_FAILED",
+                ErrorMessage = result.ErrorMessage ?? "Failed to provision scheduler token in guest."
+            };
+    }
+
+    // soft stop first; fall back to hard stop when the VM does not stop.
     private async Task SafeStopAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
     {
         try
@@ -348,7 +498,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             return;
         }
 
-        // 等待 VM 确认停止
+        // Wait until VMware reports the VM as stopped.
         var deadline = _timeProvider.GetUtcNow() + DefaultVmStopTimeout;
         while (_timeProvider.GetUtcNow() < deadline)
         {
@@ -368,7 +518,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             await Task.Delay(DefaultVmStoppedPollInterval, cancellationToken).ConfigureAwait(false);
         }
 
-        // 超时后 hard stop 兜底
+        // Use hard stop as the final fallback after the timeout.
         _logger.LogWarning("VM did not stop within timeout, sending hard stop. VmName={VmName}", vm.Name);
         try
         {

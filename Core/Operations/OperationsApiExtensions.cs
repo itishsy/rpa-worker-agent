@@ -3,8 +3,10 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Seebot.WorkerAgent.Core.Configuration;
+using Seebot.WorkerAgent.Core.Domain;
 using Seebot.WorkerAgent.Core.Snapshot;
 using Seebot.WorkerAgent.Core.Storage;
+using Seebot.WorkerAgent.Core.Switching;
 using Seebot.WorkerAgent.Core.Vmware;
 
 namespace Seebot.WorkerAgent.Core.Operations;
@@ -221,6 +223,68 @@ public static class OperationsApiExtensions
                 : Results.UnprocessableEntity(result);
         });
 
+        group.MapPost("/snapshots/{vmName}/{profileId}/switch", async (
+            string vmName,
+            string profileId,
+            WorkerAgentOptions options,
+            ILocalStore localStore,
+            IVmrunService vmrunService,
+            IProfileSnapshotResolver snapshotResolver,
+            IVmSwitchService switchService,
+            CancellationToken cancellationToken) =>
+        {
+            var vm = options.VirtualMachines
+                .Where(v => v.Enabled)
+                .FirstOrDefault(v => string.Equals(v.Name, vmName, StringComparison.OrdinalIgnoreCase));
+            if (vm is null)
+            {
+                return Results.NotFound(new { success = false, errorCode = ErrorCodes.VmNotFound, errorMessage = $"VM '{vmName}' not found in runtime configuration." });
+            }
+
+            var profile = vm.Profiles
+                .FirstOrDefault(p => string.Equals(p.ProfileId, profileId, StringComparison.OrdinalIgnoreCase));
+            if (profile is null)
+            {
+                return Results.NotFound(new { success = false, errorCode = ErrorCodes.ProfileNotFound, errorMessage = $"Profile '{profileId}' not found in VM '{vmName}'." });
+            }
+
+            IReadOnlyList<string> snapshots;
+            try
+            {
+                snapshots = await vmrunService.ListSnapshotsAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return Results.UnprocessableEntity(new { success = false, errorCode = ErrorCodes.SnapshotNotFound, errorMessage = ex.Message });
+            }
+
+            var resolution = snapshotResolver.Resolve(vm, profile, snapshots);
+            if (!resolution.IsReady)
+            {
+                var errorCode = resolution.Status == ProfileSnapshotResolutionStatus.Duplicate
+                    ? ErrorCodes.SnapshotAmbiguous
+                    : ErrorCodes.SnapshotNotFound;
+                return Results.UnprocessableEntity(new { success = false, errorCode, errorMessage = resolution.Message ?? "Profile snapshot is not ready." });
+            }
+
+            var states = await localStore.GetVmStatesAsync(options.Agent.HostId, cancellationToken).ConfigureAwait(false);
+            var state = states.FirstOrDefault(s => string.Equals(s.VmName, vm.Name, StringComparison.OrdinalIgnoreCase));
+            var result = await switchService.SwitchAsync(new VmSwitchRequest
+            {
+                HostId = options.Agent.HostId,
+                Vm = vm,
+                FromProfileId = state?.CurrentProfileId,
+                FromSnapshotName = state?.CurrentSnapshotName,
+                TargetProfileId = profile.ProfileId,
+                TargetSnapshotName = resolution.SnapshotName!,
+                Timestamp = DateTimeOffset.Now
+            }, cancellationToken).ConfigureAwait(false);
+
+            return result.Success
+                ? Results.Ok(result)
+                : Results.UnprocessableEntity(result);
+        });
+
         return app;
     }
 
@@ -312,7 +376,7 @@ public static class OperationsApiExtensions
     th, td { border-bottom: 1px solid #e5e7eb; padding: 8px; text-align: left; vertical-align: top; }
     th { position: sticky; top: 0; z-index: 1; background: #f8fafc; font-size: 12px; }
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
-    .status { min-height: 20px; font-size: 13px; color: #475569; }
+    .status { min-height: 20px; font-size: 13px; color: #475569; white-space: pre-wrap; }
     .muted { color: #64748b; font-size: 12px; }
     @media (max-width: 1100px) {
       main {
@@ -366,7 +430,8 @@ public static class OperationsApiExtensions
           <label><input name="enabled" type="checkbox" checked style="width:auto"> Enabled</label>
           <div class="row">
             <button class="primary" type="submit">Save VM</button>
-            <button type="button" id="updateInitBtn" onclick="updateInitWorkerId()">Update WorkerId in Snapshots</button>
+            <button type="button" id="updateVmSnapshotsBtn" onclick="updateVmSnapshots()">Upgrade Snapshots</button>
+            <button type="button" id="updateInitBtn" onclick="updateInitWorkerId()">Rename WorkerId</button>
             <button type="button" onclick="clearVmForm()">Clear</button>
           </div>
         </form>
@@ -382,7 +447,8 @@ public static class OperationsApiExtensions
           <label>Snapshot Name</label><input name="snapshotName">
           <div class="row">
             <button class="primary" type="submit">Save Profile</button>
-            <button type="button" onclick="updateSelectedSnapshot()">Update Snapshot</button>
+            <button type="button" onclick="switchSelectedSnapshot()">Switch Snapshot</button>
+            <button type="button" onclick="updateSelectedSnapshot()">Upgrade Snapshot</button>
             <button type="button" onclick="clearProfileForm()">Clear</button>
           </div>
         </form>
@@ -522,23 +588,64 @@ public static class OperationsApiExtensions
       const form = document.getElementById('vmForm');
       const vmName = form.elements.name?.value || '';
       if (!vmName) { status('Please save or select a VM first.'); return; }
-      if (!confirm(`Update WorkerId in all snapshots for VM "${vmName}"?\n\nThis will revert each snapshot, start the VM, kill rpa-client/java, write rpa.init, then rebuild the snapshot.\nThe VM will be powered off when done.\nThis may take several minutes per profile.`)) return;
+      if (!confirm(`Update WorkerId in all snapshots for VM "${vmName}"?\n\nThis will revert each snapshot, start the VM, update rpa.init, then rebuild the snapshot.\nThe VM will be powered off when done.\nThis may take several minutes per profile.`)) return;
 
       const btn = document.getElementById('updateInitBtn');
-      if (btn) { btn.disabled = true; btn.textContent = 'Updating…'; }
-      status(`Updating WorkerId in snapshots for "${vmName}"…`);
+      if (btn) { btn.disabled = true; btn.textContent = 'Updating...'; }
+      status(`Updating WorkerId in snapshots for "${vmName}"...`);
 
       try {
         const result = await request(`/vms/${encodeURIComponent(vmName)}/update-init-workerid`, { method: 'POST' });
         const lines = (result.profiles || []).map(p =>
-          `  ${p.profileId}: ${p.success ? `OK → ${p.newSnapshotName}` : `FAILED (${p.errorCode}: ${p.errorMessage})`}`
+          `  ${p.profileId}: ${p.success ? `OK -> ${p.newSnapshotName}` : `FAILED (${p.errorCode}: ${p.errorMessage})`}`
         );
         status((result.success ? 'All profiles updated.' : `Partial failure: ${result.errorMessage}`) + (lines.length ? '\n' + lines.join('\n') : ''));
         await load();
       } catch (err) {
         status(`Update failed: ${err.message}`);
       } finally {
-        if (btn) { btn.disabled = false; btn.textContent = 'Update WorkerId in Snapshots'; }
+        if (btn) { btn.disabled = false; btn.textContent = 'Rename WorkerId'; }
+      }
+    }
+
+    async function updateVmSnapshots() {
+      const form = document.getElementById('vmForm');
+      const vmName = form.elements.name?.value || selectedVmName || '';
+      if (!vmName) { status('Please save or select a VM first.'); return; }
+
+      const vm = vms.find(item => item.name === vmName);
+      const profiles = vm?.profiles || [];
+      if (profiles.length === 0) {
+        status(`VM "${vmName}" has no profiles to update.`);
+        return;
+      }
+
+      if (!confirm(`Update all snapshots for VM "${vmName}"?\n\nThis will run the existing Upgrade Snapshot flow for ${profiles.length} profile(s), one after another.`)) return;
+
+      const btn = document.getElementById('updateVmSnapshotsBtn');
+      if (btn) { btn.disabled = true; btn.textContent = 'Updating...'; }
+
+      const results = [];
+      try {
+        for (let index = 0; index < profiles.length; index++) {
+          const profile = profiles[index];
+          status(`Updating snapshots for "${vmName}" (${index + 1}/${profiles.length})...\n${profile.profileId}`);
+          try {
+            const result = await executeSnapshotUpdate(vmName, profile.profileId);
+            results.push({ profileId: profile.profileId, success: true, newSnapshotName: result.newSnapshotName || '' });
+          } catch (err) {
+            results.push({ profileId: profile.profileId, success: false, errorMessage: err.message || String(err) });
+          }
+        }
+
+        const successCount = results.filter(item => item.success).length;
+        const lines = results.map(item =>
+          `  ${item.profileId}: ${item.success ? `OK -> ${item.newSnapshotName}` : `FAILED (${item.errorMessage})`}`
+        );
+        status(`Snapshot updates completed for "${vmName}". Success: ${successCount}/${profiles.length}.` + (lines.length ? '\n' + lines.join('\n') : ''));
+        await load();
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Upgrade Snapshots'; }
       }
     }
 
@@ -614,10 +721,14 @@ public static class OperationsApiExtensions
       await load();
     }
 
+    async function executeSnapshotUpdate(vmName, profileId) {
+      return request(`/snapshots/${encodeURIComponent(vmName)}/${encodeURIComponent(profileId)}/update`, { method: 'POST' });
+    }
+
     async function updateSnapshot(vmName, profileId) {
       if (!confirm(`Update snapshot for ${vmName} / ${profileId}?`)) return;
       status(`Updating snapshot for ${vmName} / ${profileId}...`);
-      const result = await request(`/snapshots/${encodeURIComponent(vmName)}/${encodeURIComponent(profileId)}/update`, { method: 'POST' });
+      const result = await executeSnapshotUpdate(vmName, profileId);
       status(result.success ? `Snapshot updated: ${result.newSnapshotName || ''}` : `Snapshot update failed: ${result.errorCode || result.errorMessage || 'unknown error'}`);
     }
 
@@ -631,6 +742,27 @@ public static class OperationsApiExtensions
       }
 
       await updateSnapshot(vmName, profileId);
+    }
+
+    async function switchSelectedSnapshot() {
+      const form = document.getElementById('profileForm');
+      const vmName = form.elements.vmName.value;
+      const profileId = form.elements.profileId.value;
+      if (!vmName || !profileId) {
+        status('Select a profile first.');
+        return;
+      }
+
+      if (!confirm(`Switch VM "${vmName}" to profile "${profileId}" snapshot?`)) return;
+
+      status(`Switching snapshot for ${vmName} / ${profileId}...`);
+      try {
+        const result = await request(`/snapshots/${encodeURIComponent(vmName)}/${encodeURIComponent(profileId)}/switch`, { method: 'POST' });
+        status(result.success ? `Snapshot switched. TxId: ${result.txId || ''}` : `Snapshot switch failed: ${result.errorCode || result.errorMessage || 'unknown error'}`);
+        await load();
+      } catch (err) {
+        status(`Snapshot switch failed: ${err.message}`);
+      }
     }
 
     function renderEnabled(vm) {

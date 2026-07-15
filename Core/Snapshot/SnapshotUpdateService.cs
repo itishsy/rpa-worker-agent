@@ -17,6 +17,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
 
     private readonly IVmrunService _vmrunService;
     private readonly IGuestWorkerClient _guestWorkerClient;
+    private readonly IGuestTokenProvisioningService? _guestTokenProvisioningService;
     private readonly IProfileSnapshotResolver _snapshotResolver;
     private readonly IVmOperationLock _vmOperationLock;
     private readonly IVirtualMachineRegistry? _virtualMachineRegistry;
@@ -40,10 +41,12 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         TimeSpan? initialRunnerStatusDelay = null,
         TimeSpan? runnerStatusCheckInterval = null,
         int? runnerStatusCheckMaxAttempts = null,
-        TimeSpan? vmStoppedPollInterval = null)
+        TimeSpan? vmStoppedPollInterval = null,
+        IGuestTokenProvisioningService? guestTokenProvisioningService = null)
     {
         _vmrunService = vmrunService;
         _guestWorkerClient = guestWorkerClient;
+        _guestTokenProvisioningService = guestTokenProvisioningService;
         _snapshotResolver = snapshotResolver;
         _vmOperationLock = vmOperationLock;
         _virtualMachineRegistry = virtualMachineRegistry;
@@ -136,6 +139,13 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
                 return Fail(ErrorCodes.VmStartFailed, ex.Message, "start");
             }
 
+            var tokenFailure = await ProvisionGuestTokenAsync(vm, "write-token-before-validation", cancellationToken)
+                .ConfigureAwait(false);
+            if (tokenFailure is not null)
+            {
+                return tokenFailure;
+            }
+
             await Task.Delay(_initialRunnerStatusDelay, _timeProvider, cancellationToken);
             _logger.LogInformation("Initial wait before runner status checks completed. VmName={VmName}, WaitSeconds={WaitSeconds}", vm.Name, _initialRunnerStatusDelay.TotalSeconds);
 
@@ -216,6 +226,13 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
             return Fail(ErrorCodes.VmStartFailed, ex.Message, "start-after-update");
         }
 
+        var tokenFailure = await ProvisionGuestTokenAsync(vm, "write-token-after-update", cancellationToken)
+            .ConfigureAwait(false);
+        if (tokenFailure is not null)
+        {
+            return tokenFailure;
+        }
+
         profile.SnapshotName = newSnapshotName;
         if (_virtualMachineRegistry is not null)
         {
@@ -229,6 +246,26 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
             NewSnapshotName = newSnapshotName,
             Step = "done"
         };
+    }
+
+    private async Task<SnapshotUpdateResult?> ProvisionGuestTokenAsync(
+        VirtualMachineOptions vm,
+        string step,
+        CancellationToken cancellationToken)
+    {
+        if (_guestTokenProvisioningService is null)
+        {
+            return null;
+        }
+
+        var result = await _guestTokenProvisioningService.ProvisionAsync(vm, cancellationToken)
+            .ConfigureAwait(false);
+        return result.Success
+            ? null
+            : Fail(
+                result.ErrorCode ?? ErrorCodes.ConfigUpdateFailed,
+                result.ErrorMessage ?? "Failed to provision scheduler token in guest.",
+                step);
     }
 
     private async Task<bool> CanCreateSnapshotFromCurrentVmStateAsync(

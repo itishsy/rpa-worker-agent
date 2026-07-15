@@ -18,7 +18,7 @@
 GET /vms
 ```
 
-页面上的 Profile 编辑区提供 `Update Snapshot` 按钮。点击后调用实际更新接口：
+页面上的 Profile 编辑区提供 `Upgrade Snapshot` 按钮。点击后调用实际更新接口：
 
 ```http
 POST /operations/snapshots/{vmName}/{profileId}/update

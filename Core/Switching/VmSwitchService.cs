@@ -19,6 +19,7 @@ public sealed class VmSwitchService : IVmSwitchService
     private readonly IGuestWorkerClient _guestWorkerClient;
     private readonly ILogBackupService _logBackupService;
     private readonly IVmrunService _vmrunService;
+    private readonly IGuestTokenProvisioningService? _guestTokenProvisioningService;
     private readonly ILocalStore _localStore;
     private readonly IVirtualMachineRegistry? _virtualMachineRegistry;
     private readonly WorkerAgentOptions _options;
@@ -39,11 +40,13 @@ public sealed class VmSwitchService : IVmSwitchService
         TimeSpan? vmStoppedPollInterval = null,
         TimeSpan? vmStopTimeout = null,
         ILogger<VmSwitchService>? logger = null,
-        IVirtualMachineRegistry? virtualMachineRegistry = null)
+        IVirtualMachineRegistry? virtualMachineRegistry = null,
+        IGuestTokenProvisioningService? guestTokenProvisioningService = null)
     {
         _guestWorkerClient = guestWorkerClient;
         _logBackupService = logBackupService;
         _vmrunService = vmrunService;
+        _guestTokenProvisioningService = guestTokenProvisioningService;
         _localStore = localStore;
         _virtualMachineRegistry = virtualMachineRegistry;
         _options = options;
@@ -154,6 +157,21 @@ public sealed class VmSwitchService : IVmSwitchService
         }
 
         await UpdateAsync(tx, SwitchTransactionStatus.VM_START_DONE, "vm-start-done", null, null, request.Timestamp, cancellationToken);
+
+        if (_guestTokenProvisioningService is not null)
+        {
+            var tokenResult = await _guestTokenProvisioningService.ProvisionAsync(request.Vm, cancellationToken)
+                .ConfigureAwait(false);
+            if (!tokenResult.Success)
+            {
+                return await FailAsync(
+                    tx,
+                    tokenResult.ErrorCode ?? ErrorCodes.ConfigUpdateFailed,
+                    tokenResult.ErrorMessage ?? "Failed to provision scheduler token in guest.",
+                    request.Timestamp,
+                    cancellationToken);
+            }
+        }
 
         _logger.LogInformation("Waiting for runner ready after VM start. TxId={TxId}, VmName={VmName}", tx.TransactionId, request.Vm.Name);
         var (readyStatus, ready) = await WaitUntilRunnerReadyAsync(request.Vm, cancellationToken);
