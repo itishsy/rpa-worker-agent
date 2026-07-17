@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Seebot.WorkerAgent.Core.Configuration;
+using Seebot.WorkerAgent.Core.Health;
 using Seebot.WorkerAgent.Core.Reporting;
 using Seebot.WorkerAgent.Core.Scheduling;
 
@@ -10,17 +11,20 @@ public sealed class WorkerAgent : BackgroundService
 {
     private readonly IPoolSchedulerService _poolSchedulerService;
     private readonly CapabilityReportService _capabilityReportService;
+    private readonly IVmHealthCheckService _vmHealthCheckService;
     private readonly WorkerAgentOptions _options;
     private readonly ILogger<WorkerAgent> _logger;
 
     public WorkerAgent(
         IPoolSchedulerService poolSchedulerService,
         CapabilityReportService capabilityReportService,
+        IVmHealthCheckService vmHealthCheckService,
         WorkerAgentOptions options,
         ILogger<WorkerAgent> logger)
     {
         _poolSchedulerService = poolSchedulerService;
         _capabilityReportService = capabilityReportService;
+        _vmHealthCheckService = vmHealthCheckService;
         _options = options;
         _logger = logger;
     }
@@ -35,6 +39,7 @@ public sealed class WorkerAgent : BackgroundService
         {
             try
             {
+                await _vmHealthCheckService.CheckAsync(stoppingToken).ConfigureAwait(false);
                 var result = await _poolSchedulerService.RunOneCycleAsync(stoppingToken).ConfigureAwait(false);
                 if (result.SwitchStarted)
                 {

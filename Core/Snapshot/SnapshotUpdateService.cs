@@ -64,7 +64,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         string profileId,
         CancellationToken cancellationToken)
     {
-        _logger.LogInformation("Snapshot update started. VmName={VmName}, ProfileId={ProfileId}", vmName, profileId);
+        _logger.LogInformation("快照画像升级开始。VmName={VmName}, ProfileId={ProfileId}", vmName, profileId);
         var vm = _options.VirtualMachines
             .Where(v => v.Enabled)
             .FirstOrDefault(v => string.Equals(v.Name, vmName, StringComparison.OrdinalIgnoreCase));
@@ -82,12 +82,12 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
 
         await using var vmLock = await _vmOperationLock.AcquireAsync(vm.VmxPath, cancellationToken)
             .ConfigureAwait(false);
-        _logger.LogInformation("Snapshot update acquired VM operation lock. VmName={VmName}, VmxPath={VmxPath}", vm.Name, vm.VmxPath);
+        _logger.LogInformation("快照画像升级已获取 VM 操作锁。VmName={VmName}, VmxPath={VmxPath}", vm.Name, vm.VmxPath);
 
         IReadOnlyList<string> existingSnapshots;
         try
         {
-            _logger.LogInformation("Listing snapshots for snapshot update. VmName={VmName}, ProfileId={ProfileId}", vm.Name, profileId);
+            _logger.LogInformation("快照画像升级开始读取快照列表。VmName={VmName}, ProfileId={ProfileId}", vm.Name, profileId);
             existingSnapshots = await _vmrunService.ListSnapshotsAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -106,7 +106,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
 
         var currentSnapshotName = currentResolution.SnapshotName!;
         _logger.LogInformation(
-            "Current profile snapshot resolved for update. VmName={VmName}, ProfileId={ProfileId}, CurrentSnapshotName={CurrentSnapshotName}",
+            "已解析当前画像快照。VmName={VmName}, ProfileId={ProfileId}, CurrentSnapshotName={CurrentSnapshotName}",
             vm.Name,
             profileId,
             currentSnapshotName);
@@ -121,7 +121,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
 
             try
             {
-                _logger.LogInformation("Reverting VM before snapshot update. VmName={VmName}, SnapshotName={SnapshotName}", vm.Name, currentSnapshotName);
+                _logger.LogInformation("快照画像升级前回滚 VM。VmName={VmName}, SnapshotName={SnapshotName}", vm.Name, currentSnapshotName);
                 await _vmrunService.RevertToSnapshotAsync(vm.VmxPath, currentSnapshotName, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -131,7 +131,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
 
             try
             {
-                _logger.LogInformation("Starting VM before snapshot update validation. VmName={VmName}", vm.Name);
+                _logger.LogInformation("快照画像升级校验前启动 VM。VmName={VmName}", vm.Name);
                 await _vmrunService.StartVmAsync(vm.VmxPath, noGui: false, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -147,7 +147,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
             }
 
             await Task.Delay(_initialRunnerStatusDelay, _timeProvider, cancellationToken);
-            _logger.LogInformation("Initial wait before runner status checks completed. VmName={VmName}, WaitSeconds={WaitSeconds}", vm.Name, _initialRunnerStatusDelay.TotalSeconds);
+            _logger.LogInformation("runner 状态检查前初始等待完成。VmName={VmName}, WaitSeconds={WaitSeconds}", vm.Name, _initialRunnerStatusDelay.TotalSeconds);
 
             var runnerReadyFailure = await WaitForRunnerReadyAfterStartAsync(vm, cancellationToken);
             if (runnerReadyFailure is not null)
@@ -179,14 +179,14 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
             DateOnly.FromDateTime(now.DateTime),
             existingSnapshots);
         _logger.LogInformation(
-            "New snapshot name generated. VmName={VmName}, ProfileId={ProfileId}, NewSnapshotName={NewSnapshotName}",
+            "已生成新快照名称。VmName={VmName}, ProfileId={ProfileId}, NewSnapshotName={NewSnapshotName}",
             vm.Name,
             profileId,
             newSnapshotName);
 
         try
         {
-            _logger.LogInformation("Creating new snapshot. VmName={VmName}, SnapshotName={SnapshotName}", vm.Name, newSnapshotName);
+            _logger.LogInformation("正在创建新快照。VmName={VmName}, SnapshotName={SnapshotName}", vm.Name, newSnapshotName);
             await _vmrunService.CreateSnapshotAsync(vm.VmxPath, newSnapshotName, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -196,7 +196,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
 
         try
         {
-            _logger.LogInformation("Deleting previous profile snapshot. VmName={VmName}, SnapshotName={SnapshotName}", vm.Name, currentSnapshotName);
+            _logger.LogInformation("正在删除旧画像快照。VmName={VmName}, SnapshotName={SnapshotName}", vm.Name, currentSnapshotName);
             await _vmrunService.DeleteSnapshotAsync(vm.VmxPath, currentSnapshotName, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -218,7 +218,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
 
         try
         {
-            _logger.LogInformation("Starting VM after snapshot update completed. VmName={VmName}", vm.Name);
+            _logger.LogInformation("快照画像升级完成后启动 VM。VmName={VmName}", vm.Name);
             await _vmrunService.StartVmAsync(vm.VmxPath, noGui: false, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -276,19 +276,19 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         string? currentVmSnapshotName;
         try
         {
-            _logger.LogInformation("Reading current VM snapshot before snapshot update. VmName={VmName}", vm.Name);
+            _logger.LogInformation("快照画像升级前读取当前 VM 快照。VmName={VmName}", vm.Name);
             currentVmSnapshotName = await _vmrunService.GetCurrentSnapshotAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogWarning(ex, "Current VM snapshot read failed before snapshot update; falling back to revert path. VmName={VmName}", vm.Name);
+            _logger.LogWarning(ex, "快照画像升级前读取当前 VM 快照失败，回退到回滚路径。VmName={VmName}", vm.Name);
             return false;
         }
 
         if (!_snapshotResolver.IsProfileSnapshotName(profileId, currentVmSnapshotName ?? ""))
         {
             _logger.LogInformation(
-                "Current VM snapshot does not match target profile; falling back to revert path. VmName={VmName}, ProfileId={ProfileId}, CurrentVmSnapshotName={CurrentVmSnapshotName}",
+                "当前 VM 快照不匹配目标画像，回退到回滚路径。VmName={VmName}, ProfileId={ProfileId}, CurrentVmSnapshotName={CurrentVmSnapshotName}",
                 vm.Name,
                 profileId,
                 currentVmSnapshotName);
@@ -298,19 +298,19 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         RunnerStatusResponse status;
         try
         {
-            _logger.LogInformation("Checking runner status before fast snapshot update. VmName={VmName}, ProfileId={ProfileId}", vm.Name, profileId);
+            _logger.LogInformation("快速快照画像升级前检查 runner 状态。VmName={VmName}, ProfileId={ProfileId}", vm.Name, profileId);
             status = await _guestWorkerClient.GetRunnerStatusAsync(vm, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogWarning(ex, "Runner status check failed before fast snapshot update; falling back to revert path. VmName={VmName}", vm.Name);
+            _logger.LogWarning(ex, "快速快照画像升级前检查 runner 状态失败，回退到回滚路径。VmName={VmName}", vm.Name);
             return false;
         }
 
         if (status.RunnerStatusCode != RunnerStatusCode.Runnable)
         {
             _logger.LogInformation(
-                "Runner is not idle before fast snapshot update; falling back to revert path. VmName={VmName}, ProfileId={ProfileId}, RunnerStatusCode={RunnerStatusCode}",
+                "快速快照画像升级前 runner 未空闲，回退到回滚路径。VmName={VmName}, ProfileId={ProfileId}, RunnerStatusCode={RunnerStatusCode}",
                 vm.Name,
                 profileId,
                 status.RunnerStatusCode);
@@ -318,7 +318,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         }
 
         _logger.LogInformation(
-            "Current VM snapshot matches target profile and runner is idle; creating snapshot without revert. VmName={VmName}, ProfileId={ProfileId}, CurrentVmSnapshotName={CurrentVmSnapshotName}, RunnerStatusCode={RunnerStatusCode}",
+            "当前 VM 快照匹配目标画像且 runner 空闲，将直接创建快照。VmName={VmName}, ProfileId={ProfileId}, CurrentVmSnapshotName={CurrentVmSnapshotName}, RunnerStatusCode={RunnerStatusCode}",
             vm.Name,
             profileId,
             currentVmSnapshotName,
@@ -336,16 +336,20 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         {
             try
             {
-                _logger.LogInformation("Checking runner status for snapshot update. VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}", vm.Name, attempt, _runnerStatusCheckMaxAttempts);
+                _logger.LogInformation("快照画像升级检查 runner 状态。VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}", vm.Name, attempt, _runnerStatusCheckMaxAttempts);
                 status = await _guestWorkerClient.GetRunnerStatusAsync(vm, cancellationToken);
                 lastException = null;
                 if (status.RunnerStatusCode == RunnerStatusCode.Runnable)
                 {
+                    _logger.LogInformation(
+                        "runner 已空闲，准备停止 VM 并创建新快照。VmName={VmName}, RunnerStatusCode={RunnerStatusCode}",
+                        vm.Name,
+                        status.RunnerStatusCode);
                     break;
                 }
 
                 _logger.LogInformation(
-                    "Runner is not idle during snapshot update, will retry if attempts remain. VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}, RunnerStatusCode={RunnerStatusCode}",
+                    "快照画像升级时 runner 未空闲，如未达到上限将继续重试。VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}, RunnerStatusCode={RunnerStatusCode}",
                     vm.Name,
                     attempt,
                     _runnerStatusCheckMaxAttempts,
@@ -354,7 +358,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 lastException = ex;
-                _logger.LogWarning(ex, "Runner status check failed during snapshot update. VmName={VmName}, Attempt={Attempt}", vm.Name, attempt);
+                _logger.LogWarning(ex, "快照画像升级时检查 runner 状态失败。VmName={VmName}, Attempt={Attempt}", vm.Name, attempt);
             }
 
             if (attempt < _runnerStatusCheckMaxAttempts)
@@ -386,11 +390,11 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         {
             if (!await _vmrunService.IsVmRunningAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false))
             {
-                _logger.LogInformation("VM is already stopped before snapshot update step. VmName={VmName}, Step={Step}", vm.Name, step);
+                _logger.LogInformation("快照画像升级步骤前 VM 已停止。VmName={VmName}, Step={Step}", vm.Name, step);
                 return null;
             }
 
-            _logger.LogInformation("Stopping VM before snapshot update step. VmName={VmName}, Step={Step}, Mode={Mode}", vm.Name, step, VmStopMode.Soft);
+            _logger.LogInformation("快照画像升级步骤前停止 VM。VmName={VmName}, Step={Step}, Mode={Mode}", vm.Name, step, VmStopMode.Soft);
             await _vmrunService.StopVmAsync(vm.VmxPath, VmStopMode.Soft, cancellationToken).ConfigureAwait(false);
 
             var timeout = GetStopTimeout();
@@ -404,7 +408,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
                 return Fail(ErrorCodes.VmStopFailed, $"VM did not power off within {timeout.TotalSeconds:0} seconds after soft stop.", step);
             }
 
-            _logger.LogWarning("Soft stop timed out during snapshot update; attempting hard stop. VmName={VmName}, Step={Step}", vm.Name, step);
+            _logger.LogWarning("快照画像升级软关机超时，尝试硬关机。VmName={VmName}, Step={Step}", vm.Name, step);
             await _vmrunService.StopVmAsync(vm.VmxPath, VmStopMode.Hard, cancellationToken).ConfigureAwait(false);
 
             if (await WaitUntilVmStoppedAsync(vm, step, timeout, cancellationToken).ConfigureAwait(false))
@@ -430,7 +434,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         while (true)
         {
             var isRunning = await _vmrunService.IsVmRunningAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
-            _logger.LogInformation("VM stop polling result during snapshot update. VmName={VmName}, Step={Step}, IsRunning={IsRunning}", vm.Name, step, isRunning);
+            _logger.LogInformation("快照画像升级 VM 停止轮询结果。VmName={VmName}, Step={Step}, IsRunning={IsRunning}", vm.Name, step, isRunning);
             if (!isRunning)
             {
                 return true;
@@ -453,7 +457,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
     private SnapshotUpdateResult Fail(string errorCode, string errorMessage, string step)
     {
         _logger.LogWarning(
-            "Snapshot update failed. Step={Step}, ErrorCode={ErrorCode}, ErrorMessage={ErrorMessage}",
+            "快照画像升级失败。Step={Step}, ErrorCode={ErrorCode}, ErrorMessage={ErrorMessage}",
             step,
             errorCode,
             errorMessage);

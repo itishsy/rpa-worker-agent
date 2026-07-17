@@ -229,6 +229,7 @@ public static class OperationsApiExtensions
             WorkerAgentOptions options,
             ILocalStore localStore,
             IVmrunService vmrunService,
+            IVmOperationLock vmOperationLock,
             IProfileSnapshotResolver snapshotResolver,
             IVmSwitchService switchService,
             CancellationToken cancellationToken) =>
@@ -269,6 +270,7 @@ public static class OperationsApiExtensions
 
             var states = await localStore.GetVmStatesAsync(options.Agent.HostId, cancellationToken).ConfigureAwait(false);
             var state = states.FirstOrDefault(s => string.Equals(s.VmName, vm.Name, StringComparison.OrdinalIgnoreCase));
+            await using var vmLock = await vmOperationLock.AcquireAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
             var result = await switchService.SwitchAsync(new VmSwitchRequest
             {
                 HostId = options.Agent.HostId,
@@ -375,6 +377,8 @@ public static class OperationsApiExtensions
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { border-bottom: 1px solid #e5e7eb; padding: 8px; text-align: left; vertical-align: top; }
     th { position: sticky; top: 0; z-index: 1; background: #f8fafc; font-size: 12px; }
+    tr.selected-row td { background: #eff6ff; }
+    tr.selected-row td:first-child { box-shadow: inset 3px 0 0 #2563eb; }
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
     .status { min-height: 20px; font-size: 13px; color: #475569; white-space: pre-wrap; }
     .muted { color: #64748b; font-size: 12px; }
@@ -480,27 +484,40 @@ public static class OperationsApiExtensions
       if (selectedVmName && !vms.some(vm => vm.name === selectedVmName)) {
         selectedVmName = '';
       }
-      document.getElementById('vmRows').innerHTML = vms.map(vm => `
-        <tr>
+      document.getElementById('vmRows').innerHTML = vms.map(vm => {
+        const vmName = vm.name || '';
+        const escapedName = escapeHtml(vmName);
+        const isBaseVm = vmName.toUpperCase().endsWith('BASE');
+        return `
+        <tr class="${vmName === selectedVmName ? 'selected-row' : ''}" data-vm-name="${escapedName}">
           <td>${escapeHtml(vm.name)}<div class="muted">${escapeHtml(vm.vmxPath)}</div></td>
           <td>${escapeHtml(vm.workerId)}</td>
           <td>${renderEnabled(vm)}</td>
           <td>${escapeHtml(vm.currentProfileId || '')}<div class="muted">${escapeHtml(vm.currentSnapshotName || '')}</div></td>
           <td>
-            <button data-action="edit-vm" data-vm-name="${escapeHtml(vm.name)}">Edit</button>
-            <button data-action="copy-vm" data-vm-name="${escapeHtml(vm.name)}">Copy</button>
+            <button data-action="edit-vm" data-vm-name="${escapedName}">Edit</button>
+            ${isBaseVm ? `<button data-action="copy-vm" data-vm-name="${escapedName}">Copy</button>` : ''}
             ${vm.isQuarantined
-              ? `<button data-action="unquarantine-vm" data-vm-name="${escapeHtml(vm.name)}">Unquarantine</button>`
-              : `<button data-action="quarantine-vm" data-vm-name="${escapeHtml(vm.name)}">Quarantine</button>`}
-            <button class="danger" data-action="delete-vm" data-vm-name="${escapeHtml(vm.name)}">Delete</button>
+              ? `<button data-action="unquarantine-vm" data-vm-name="${escapedName}">Unquarantine</button>`
+              : `<button data-action="quarantine-vm" data-vm-name="${escapedName}">Quarantine</button>`}
+            ${isBaseVm ? '' : `<button class="danger" data-action="delete-vm" data-vm-name="${escapedName}">Delete</button>`}
           </td>
-        </tr>`).join('');
+        </tr>`;
+      }).join('');
+      updateSelectedVmRow();
       renderSelectedProfiles();
+    }
+
+    function updateSelectedVmRow() {
+      document.querySelectorAll('#vmRows tr[data-vm-name]').forEach(row => {
+        row.classList.toggle('selected-row', row.dataset.vmName === selectedVmName);
+      });
     }
 
     function showProfiles(vmName) {
       selectedVmName = vmName;
       document.getElementById('profileForm').elements.vmName.value = vmName;
+      updateSelectedVmRow();
       renderSelectedProfiles();
     }
 
@@ -533,6 +550,7 @@ public static class OperationsApiExtensions
       const vmName = button.dataset.vmName || '';
       const vm = vms.find(item => item.name === vmName);
       if (button.dataset.action === 'edit-vm' && vm) {
+        selectedVmName = vmName;
         editVm(vm);
       } else if (button.dataset.action === 'copy-vm' && vm) {
         await copyVm(vm);

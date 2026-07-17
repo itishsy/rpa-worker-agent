@@ -15,4 +15,6 @@ public sealed class AgentOptions
     public bool ForceRevertWhenBackupFailed { get; set; }
     public bool AllowRevertWhenRunnerError { get; set; }
     public int MaxSwitchesPerCycle { get; set; }
+    public int VmAutoStartAfterMinutes { get; set; } = 30;
+    public int VmAutoStartRetryIntervalSeconds { get; set; } = 60;
 }

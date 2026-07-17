@@ -4,6 +4,7 @@ using Microsoft.Extensions.Options;
 using Seebot.WorkerAgent.Core.Backup;
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Guest;
+using Seebot.WorkerAgent.Core.Health;
 using Seebot.WorkerAgent.Core.Reporting;
 using Seebot.WorkerAgent.Core.Scheduler;
 using Seebot.WorkerAgent.Core.Scheduling;
@@ -113,6 +114,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IVmOperationLock, VmOperationLock>();
         services.AddSingleton<IVmSwitchService, VmSwitchService>();
         services.AddSingleton<IVmStateRefreshService, VmStateRefreshService>();
+        services.AddSingleton<IVmHealthCheckService, VmHealthCheckService>();
         services.AddSingleton<IPoolSchedulerService, PoolSchedulerService>();
         services.AddSingleton<ISnapshotUpdateService, SnapshotUpdateService>();
         services.AddSingleton<IInitFileUpdateService>(provider =>

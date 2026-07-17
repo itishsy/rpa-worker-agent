@@ -3,7 +3,9 @@
     [string]$DisplayName = "Seebot Worker Agent Service",
     [string]$Description = "Seebot Worker Agent service.",
     [string]$ExePath = "C:\Program Files\Seebot Worker Agent\service\Seebot.WorkerAgent.Service.exe",
-    [string[]]$AdditionalGrantPaths = @()
+    [string[]]$AdditionalGrantPaths = @(),
+    [string]$ServiceUser,
+    [Security.SecureString]$ServicePassword
 )
 
 Write-Host "Installing Windows service: $ServiceName"
@@ -66,22 +68,43 @@ function Add-ParentGrantPath {
     Add-GrantPath $PathSet $parent
 }
 
-function Grant-LocalSystemAccess {
-    param([string]$PathValue)
+function Resolve-ServiceIdentity {
+    param([string]$AccountName)
+
+    if ($AccountName -eq "LocalSystem") {
+        return "*S-1-5-18"
+    }
+
+    try {
+        $account = [Security.Principal.NTAccount]::new($AccountName)
+        $sid = $account.Translate([Security.Principal.SecurityIdentifier])
+        return "*$($sid.Value)"
+    }
+    catch {
+        Write-Host "ERROR: Windows account could not be resolved: $AccountName" -ForegroundColor Red
+        exit 1
+    }
+}
+
+function Grant-ServiceAccountAccess {
+    param(
+        [string]$PathValue,
+        [string]$Identity
+    )
 
     if ([string]::IsNullOrWhiteSpace($PathValue)) {
         return
     }
 
     if (-not (Test-Path -LiteralPath $PathValue)) {
-        Write-Host "Skipping LocalSystem ACL, path does not exist: $PathValue" -ForegroundColor Yellow
+        Write-Host "Skipping service account ACL, path does not exist: $PathValue" -ForegroundColor Yellow
         return
     }
 
-    Write-Host "Granting LocalSystem full control: $PathValue"
-    & icacls $PathValue /grant "*S-1-5-18:(OI)(CI)F" /T /C | Out-Host
+    Write-Host "Granting service account full control: $PathValue"
+    & icacls $PathValue /grant "${Identity}:(OI)(CI)F" /T /C | Out-Host
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "WARNING: Failed to grant LocalSystem ACL: $PathValue" -ForegroundColor Yellow
+        Write-Host "WARNING: Failed to grant service account ACL: $PathValue" -ForegroundColor Yellow
     }
 }
 
@@ -134,9 +157,28 @@ foreach ($path in $AdditionalGrantPaths) {
     Add-GrantPath $grantPaths $path
 }
 
-Write-Host "Granting LocalSystem permissions..."
+if ([string]::IsNullOrWhiteSpace($ServiceUser)) {
+    $ServiceUser = Read-Host "Windows service account (for example .\seebot-service or DOMAIN\user; press Enter for LocalSystem)"
+}
+
+if ([string]::IsNullOrWhiteSpace($ServiceUser)) {
+    $ServiceUser = "LocalSystem"
+}
+
+$useLocalSystem = $ServiceUser -eq "LocalSystem" -or $ServiceUser -eq "NT AUTHORITY\SYSTEM"
+if ($useLocalSystem) {
+    $ServiceUser = "LocalSystem"
+    $ServicePassword = $null
+}
+elseif ($null -eq $ServicePassword) {
+    $ServicePassword = Read-Host "Password for $ServiceUser" -AsSecureString
+}
+
+$serviceIdentity = Resolve-ServiceIdentity $ServiceUser
+
+Write-Host "Granting permissions to service account: $ServiceUser"
 foreach ($path in $grantPaths) {
-    Grant-LocalSystemAccess $path
+    Grant-ServiceAccountAccess $path $serviceIdentity
 }
 
 $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
@@ -154,11 +196,31 @@ Write-Host "Creating service..."
 
 $QuotedExePath = "`"$ExePath`""
 
-sc.exe create $ServiceName `
-    binPath= $QuotedExePath `
-    start= auto `
-    obj= LocalSystem `
-    DisplayName= $DisplayName
+$plainTextPassword = $null
+$passwordPointer = [IntPtr]::Zero
+try {
+    $createArguments = @(
+        "create", $ServiceName,
+        "binPath=", $QuotedExePath,
+        "start=", "auto",
+        "obj=", $ServiceUser,
+        "DisplayName=", $DisplayName
+    )
+
+    if (-not $useLocalSystem) {
+        $passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ServicePassword)
+        $plainTextPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointer)
+        $createArguments += @("password=", $plainTextPassword)
+    }
+
+    & sc.exe $createArguments
+}
+finally {
+    $plainTextPassword = $null
+    if ($passwordPointer -ne [IntPtr]::Zero) {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
+    }
+}
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Service creation failed." -ForegroundColor Red
@@ -174,6 +236,7 @@ sc.exe query $ServiceName
 
 Write-Host ""
 Write-Host "Install completed."
+Write-Host "Service account: $ServiceUser"
 Write-Host "Start service: Start-Service $ServiceName"
 Write-Host "If VM configs are stored in SQLite, pass VM roots explicitly, for example:"
 Write-Host "  .\install-service.ps1 -ExePath D:\seebot\rpa-worker-agent\Seebot.WorkerAgent.Service.exe -AdditionalGrantPaths E:\vms,D:\VMware"

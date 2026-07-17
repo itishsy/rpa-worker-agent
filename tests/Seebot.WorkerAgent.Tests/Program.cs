@@ -87,6 +87,7 @@ var tests = new (string Name, Action Body)[]
     ("VmSwitchService does not backup or vmrun when kill returns WORKER_RUNNING", VmSwitchServiceDoesNotBackupOrVmrunWhenKillReturnsWorkerRunning),
     ("VmSwitchService stops before VM stop when backup fails and force revert is false", VmSwitchServiceStopsBeforeVmStopWhenBackupFailsAndForceRevertIsFalse),
     ("VmSwitchService success path executes ordered external actions", VmSwitchServiceSuccessPathExecutesOrderedExternalActions),
+    ("VmSwitchService switches and starts a powered-off VM without guest operations", VmSwitchServiceSwitchesPoweredOffVmWithoutGuestOperations),
     ("VmSwitchService fails before revert when VM does not stop", VmSwitchServiceFailsBeforeRevertWhenVmDoesNotStop),
     ("VmSwitchService hard stops when soft stop times out and fallback is allowed", VmSwitchServiceHardStopsWhenSoftStopTimesOutAndFallbackAllowed),
     ("VmSwitchService marks mismatch after ready as WORKER_PROFILE_MISMATCH", VmSwitchServiceMarksMismatchAfterReadyAsWorkerProfileMismatch),
@@ -1135,7 +1136,7 @@ static void VmSwitchServiceDoesNotBackupOrVmrunWhenKillReturnsWorkerRunning()
 
     Assert.False(result.Success, "WORKER_RUNNING kill result should cancel switch.");
     Assert.Equal(ErrorCodes.WorkerRunning, result.ErrorCode, "Kill WORKER_RUNNING should be preserved.");
-    Assert.SequenceEqual(new[] { "create-tx", "get-status", "kill", "update:FAILED" }, recorder.Actions, "Kill running path should stop before backup/vmrun.");
+    Assert.SequenceEqual(new[] { "create-tx", "vmrun-is-running", "get-status", "kill", "update:FAILED" }, recorder.Actions, "Kill running path should stop before backup/vmrun.");
 }
 
 static void VmSwitchServiceStopsBeforeVmStopWhenBackupFailsAndForceRevertIsFalse()
@@ -1159,7 +1160,9 @@ static void VmSwitchServiceStopsBeforeVmStopWhenBackupFailsAndForceRevertIsFalse
 
     Assert.False(result.Success, "Backup failure should fail switch when force revert is false.");
     Assert.Equal(ErrorCodes.LogBackupFailed, result.ErrorCode, "Backup failure should report LOG_BACKUP_FAILED.");
-    Assert.False(recorder.Actions.Any(action => action.StartsWith("vmrun-", StringComparison.Ordinal)), "Backup failure should not stop/revert/start VM.");
+    Assert.False(
+        recorder.Actions.Any(action => action is "vmrun-stop" or "vmrun-revert" or "vmrun-start"),
+        "Backup failure should not stop/revert/start VM.");
 }
 
 static void VmSwitchServiceSuccessPathExecutesOrderedExternalActions()
@@ -1177,6 +1180,7 @@ static void VmSwitchServiceSuccessPathExecutesOrderedExternalActions()
         new[]
         {
             "create-tx",
+            "vmrun-is-running",
             "get-status",
             "kill",
             "update:STOP_RUNNER_DONE",
@@ -1198,13 +1202,55 @@ static void VmSwitchServiceSuccessPathExecutesOrderedExternalActions()
         "Successful switch should call external actions in strict order.");
 }
 
+static void VmSwitchServiceSwitchesPoweredOffVmWithoutGuestOperations()
+{
+    var recorder = new ActionRecorder();
+    var guest = new RecordingGuestWorkerClient(recorder)
+    {
+        StatusResponses =
+        [
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Runnable)
+        ]
+    };
+    var vmrun = new RecordingSwitchVmrunService(recorder)
+    {
+        RunningResponses = [false]
+    };
+
+    var result = NewVmSwitchService(guest, new RecordingBackupService(recorder), vmrun, new RecordingLocalStore(recorder))
+        .SwitchAsync(SwitchRequest(), CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.True(result.Success, "A powered-off VM should switch snapshots and start successfully.");
+    Assert.SequenceEqual(
+        new[]
+        {
+            "create-tx",
+            "vmrun-is-running",
+            "update:STOP_RUNNER_DONE",
+            "update:LOG_BACKUP_DONE",
+            "update:VM_STOP_DONE",
+            "vmrun-revert",
+            "update:SNAPSHOT_REVERT_DONE",
+            "vmrun-start",
+            "update:VM_START_DONE",
+            "get-status",
+            "update:WORKER_READY_DONE",
+            "update:SUCCESS"
+        },
+        recorder.Actions,
+        "Powered-off path should skip guest operations and stop, then revert and start.");
+    Assert.False(recorder.Actions.Contains("kill"), "Powered-off path must not call the guest runner kill endpoint.");
+    Assert.False(recorder.Actions.Contains("backup"), "Powered-off path must not attempt guest backup.");
+    Assert.False(recorder.Actions.Contains("vmrun-stop"), "Powered-off path must not stop an already powered-off VM.");
+}
+
 static void VmSwitchServiceFailsBeforeRevertWhenVmDoesNotStop()
 {
     var recorder = new ActionRecorder();
     var guest = ReadyGuest(recorder);
     var vmrun = new RecordingSwitchVmrunService(recorder)
     {
-        RunningResponses = [true, true]
+        RunningResponses = [true, true, true]
     };
 
     var result = NewVmSwitchService(guest, new RecordingBackupService(recorder), vmrun, new RecordingLocalStore(recorder), stopSoftTimeoutSeconds: 0)
@@ -1221,7 +1267,7 @@ static void VmSwitchServiceHardStopsWhenSoftStopTimesOutAndFallbackAllowed()
     var guest = ReadyGuest(recorder);
     var vmrun = new RecordingSwitchVmrunService(recorder)
     {
-        RunningResponses = [true, true, false]
+        RunningResponses = [true, true, true, false]
     };
 
     var result = NewVmSwitchService(
@@ -1756,7 +1802,7 @@ static void P0IntegrationSuccessClosesConfigToSwitchAndReportingLoop()
 
     Assert.True(result.SwitchStarted, "Pending profile should start the integrated switch.");
     Assert.SequenceEqual(
-        new[] { "create-tx", "get-status", "kill", "update:STOP_RUNNER_DONE", "backup", "update:LOG_BACKUP_DONE", "vmrun-is-running", "vmrun-stop", "vmrun-is-running", "update:VM_STOP_DONE", "vmrun-revert", "update:SNAPSHOT_REVERT_DONE", "vmrun-start", "update:VM_START_DONE", "get-status", "update:WORKER_READY_DONE", "update:SUCCESS" },
+        new[] { "create-tx", "vmrun-is-running", "get-status", "kill", "update:STOP_RUNNER_DONE", "backup", "update:LOG_BACKUP_DONE", "vmrun-is-running", "vmrun-stop", "vmrun-is-running", "update:VM_STOP_DONE", "vmrun-revert", "update:SNAPSHOT_REVERT_DONE", "vmrun-start", "update:VM_START_DONE", "get-status", "update:WORKER_READY_DONE", "update:SUCCESS" },
         recorder.Actions,
         "Integrated success path should stop runner, backup, vmrun stop/revert/start, wait ready, then succeed.");
 }
@@ -2667,7 +2713,7 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
 
     public bool FailOnRevert { get; set; }
     public int FailRevertTimes { get; set; }
-    public IReadOnlyList<bool> RunningResponses { get; set; } = [true, false];
+    public IReadOnlyList<bool> RunningResponses { get; set; } = [true, true, false];
     public List<VmStopMode> StopModes { get; } = [];
     private int _revertAttempts;
     private int _runningResponseIndex;
