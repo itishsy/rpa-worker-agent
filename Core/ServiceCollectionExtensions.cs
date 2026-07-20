@@ -13,6 +13,8 @@ using Seebot.WorkerAgent.Core.Storage;
 using Seebot.WorkerAgent.Core.Snapshot;
 using Seebot.WorkerAgent.Core.Switching;
 using Seebot.WorkerAgent.Core.Vmware;
+using Seebot.WorkerAgent.Core.Coordination;
+using Seebot.WorkerAgent.Core.Operations;
 
 namespace Seebot.WorkerAgent.Core;
 
@@ -100,13 +102,16 @@ public static class ServiceCollectionExtensions
         });
         services.AddHttpClient<IGuestWorkerClient, GuestWorkerClient>();
         services.AddSingleton<IGuestTokenProvisioningService, GuestTokenProvisioningService>();
-        services.AddSingleton<ILocalStore>(provider =>
+        services.AddSingleton<LocalStore>(provider =>
         {
             var agentOptions = provider.GetRequiredService<WorkerAgentOptions>().Agent;
             var dbPath = GetAgentDatabasePath(agentOptions);
             Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
             return new LocalStore(dbPath);
         });
+        services.AddSingleton<ILocalStore>(provider => provider.GetRequiredService<LocalStore>());
+        services.AddSingleton<IVmOperationStore>(provider => provider.GetRequiredService<LocalStore>());
+        services.AddSingleton<IVmOperationCoordinator, VmOperationCoordinator>();
         services.AddHostedService<LocalStoreInitializerService>();
         services.AddSingleton<ILogBackupService, LogBackupService>();
         services.AddSingleton<Startup.IStartupValidator, StartupValidator>();
@@ -114,7 +119,10 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IVmOperationLock, VmOperationLock>();
         services.AddSingleton<IVmSwitchService, VmSwitchService>();
         services.AddSingleton<IVmStateRefreshService, VmStateRefreshService>();
+        services.AddSingleton<IVmDiskCleanupService, NoOpVmDiskCleanupService>();
         services.AddSingleton<IVmHealthCheckService, VmHealthCheckService>();
+        services.AddSingleton<IVmPowerRecoveryService, VmPowerRecoveryService>();
+        services.AddSingleton<IVmPowerOnService, VmPowerOnService>();
         services.AddSingleton<IPoolSchedulerService, PoolSchedulerService>();
         services.AddSingleton<ISnapshotUpdateService, SnapshotUpdateService>();
         services.AddSingleton<IInitFileUpdateService>(provider =>

@@ -56,22 +56,22 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
         var enabledVms = EnabledVirtualMachines();
         if (enabledVms.Count == 0)
         {
-            _logger.LogInformation("Scheduler cycle skipped because no VMs are configured.");
+            _logger.LogInformation("调度周期已跳过：当前未配置可用的 VM。");
             return NoSwitch("No configured VMs.");
         }
 
-        _logger.LogInformation("Scheduler cycle started. HostId={HostId}, VmCount={VmCount}", _options.Agent.HostId, enabledVms.Count);
+        _logger.LogInformation("调度周期开始。HostId={HostId}, VmCount={VmCount}", _options.Agent.HostId, enabledVms.Count);
         var targetProfiles = await QueryPendingProfilesAsync(cancellationToken).ConfigureAwait(false);
-        _logger.LogInformation("Scheduler pending profile query completed. PendingProfileCount={PendingProfileCount}", targetProfiles.Count);
+        _logger.LogInformation("调度器待处理 Profile 查询完成。PendingProfileCount={PendingProfileCount}", targetProfiles.Count);
 
         var now = _timeProvider.GetUtcNow();
-        _logger.LogInformation("Refreshing VM state before candidate evaluation. HostId={HostId}", _options.Agent.HostId);
+        _logger.LogInformation("候选 VM 评估前开始刷新 VM 状态。HostId={HostId}", _options.Agent.HostId);
         await _vmStateRefreshService.RefreshAsync(now, cancellationToken).ConfigureAwait(false);
 
         var vmStates = await _localStore.GetVmStatesAsync(_options.Agent.HostId, cancellationToken).ConfigureAwait(false);
         var activeTxVmNames = await GetActiveSwitchVmNamesAsync(cancellationToken).ConfigureAwait(false);
         _logger.LogInformation(
-            "Loaded VM states for scheduler cycle. VmStateCount={VmStateCount}, ActiveSwitchVmCount={ActiveSwitchVmCount}",
+            "调度周期已加载 VM 状态。VmStateCount={VmStateCount}, ActiveSwitchVmCount={ActiveSwitchVmCount}",
             vmStates.Count,
             activeTxVmNames.Count);
 
@@ -80,7 +80,7 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
             var generalTargets = BuildGeneralRevertTargets(vmStates);
             if (generalTargets.Count == 0)
             {
-                _logger.LogInformation("Scheduler cycle completed without switch. Reason={Reason}", "No pending profile tasks.");
+                _logger.LogInformation("调度周期结束，本次未执行切换。Reason={Reason}", "没有待处理的 Profile 任务。");
                 return NoSwitch("No pending profile tasks.");
             }
 
@@ -100,13 +100,13 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
             var candidate = FindCandidate(target.ProfileId, pendingProfileIds, stateByVmName, now);
             if (candidate is null)
             {
-                _logger.LogInformation("No candidate VM found for target profile. TargetProfileId={TargetProfileId}", target.ProfileId);
+                _logger.LogInformation("目标 Profile 未找到可用的候选 VM。TargetProfileId={TargetProfileId}", target.ProfileId);
                 continue;
             }
 
             var (vm, state, profile) = candidate.Value;
             _logger.LogInformation(
-                "Candidate VM selected. VmName={VmName}, WorkerId={WorkerId}, CurrentProfileId={CurrentProfileId}, CurrentSnapshotName={CurrentSnapshotName}, TargetProfileId={TargetProfileId}",
+                "已选择候选 VM。VmName={VmName}, WorkerId={WorkerId}, CurrentProfileId={CurrentProfileId}, CurrentSnapshotName={CurrentSnapshotName}, TargetProfileId={TargetProfileId}",
                 vm.Name,
                 vm.WorkerId,
                 state.CurrentProfileId,
@@ -116,12 +116,12 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
             IReadOnlyList<string> snapshots;
             try
             {
-                _logger.LogInformation("Listing snapshots before switch candidate validation. VmName={VmName}, VmxPath={VmxPath}", vm.Name, vm.VmxPath);
+                _logger.LogInformation("切换候选项校验前开始读取快照列表。VmName={VmName}, VmxPath={VmxPath}", vm.Name, vm.VmxPath);
                 snapshots = await _vmrunService.ListSnapshotsAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
-                _logger.LogWarning(exception, "Failed to list snapshots for candidate VM. VmName={VmName}, TargetProfileId={TargetProfileId}", vm.Name, target.ProfileId);
+                _logger.LogWarning(exception, "读取候选 VM 的快照列表失败。VmName={VmName}, TargetProfileId={TargetProfileId}", vm.Name, target.ProfileId);
                 continue;
             }
 
@@ -129,7 +129,7 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
             if (!resolution.IsReady)
             {
                 _logger.LogWarning(
-                    "Target profile snapshot is not ready. VmName={VmName}, TargetProfileId={TargetProfileId}, Status={Status}, Message={Message}",
+                    "目标 Profile 快照尚未就绪。VmName={VmName}, TargetProfileId={TargetProfileId}, Status={Status}, Message={Message}",
                     vm.Name,
                     target.ProfileId,
                     resolution.Status,
@@ -141,7 +141,7 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
                 && string.Equals(state.CurrentSnapshotName, resolution.SnapshotName, StringComparison.OrdinalIgnoreCase))
             {
                 _logger.LogInformation(
-                    "Candidate VM already on target profile snapshot. VmName={VmName}, TargetProfileId={TargetProfileId}, SnapshotName={SnapshotName}",
+                    "候选 VM 已处于目标 Profile 快照，无需切换。VmName={VmName}, TargetProfileId={TargetProfileId}, SnapshotName={SnapshotName}",
                     vm.Name,
                     target.ProfileId,
                     resolution.SnapshotName);
@@ -149,7 +149,7 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
             }
 
             _logger.LogInformation(
-                "Starting VM switch from scheduler. VmName={VmName}, FromProfileId={FromProfileId}, TargetProfileId={TargetProfileId}, TargetSnapshotName={TargetSnapshotName}, FirstTaskId={FirstTaskId}",
+                "调度器开始执行 VM 切换。VmName={VmName}, FromProfileId={FromProfileId}, TargetProfileId={TargetProfileId}, TargetSnapshotName={TargetSnapshotName}, FirstTaskId={FirstTaskId}",
                 vm.Name,
                 state.CurrentProfileId,
                 target.ProfileId,
@@ -168,7 +168,7 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
             }, cancellationToken).ConfigureAwait(false);
 
             _logger.LogInformation(
-                "Scheduler switch request completed. VmName={VmName}, TargetProfileId={TargetProfileId}, Success={Success}, ErrorCode={ErrorCode}, ErrorMessage={ErrorMessage}",
+                "调度器 VM 切换请求执行完成。VmName={VmName}, TargetProfileId={TargetProfileId}, Success={Success}, ErrorCode={ErrorCode}, ErrorMessage={ErrorMessage}",
                 vm.Name,
                 target.ProfileId,
                 result.Success,
@@ -176,14 +176,14 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
                 result.ErrorMessage);
             return new PoolSchedulerCycleResult
             {
-                SwitchStarted = true,
+                SwitchStarted = result.Success && !result.Skipped,
                 TargetProfileId = target.ProfileId,
                 VmName = vm.Name,
-                Reason = result.Success ? "Switch started." : result.ErrorCode ?? result.ErrorMessage
+                Reason = result.Skipped ? result.ErrorCode ?? "Switch skipped." : result.Success ? "Switch completed." : result.ErrorCode ?? result.ErrorMessage
             };
         }
 
-        _logger.LogInformation("Scheduler cycle completed without switch. Reason={Reason}", "No compatible idle VM candidate.");
+        _logger.LogInformation("调度周期结束，本次未执行切换。Reason={Reason}", "没有兼容且处于空闲状态的候选 VM。");
         return NoSwitch("No compatible idle VM candidate.");
     }
 
@@ -251,7 +251,7 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
 
             var profiles = await _schedulerClient.QueryPendingTasksAsync(vm.WorkerId, state.CurrentProfileId, cancellationToken).ConfigureAwait(false);
             _logger.LogInformation(
-                "Pending task query result. VmName={VmName}, WorkerId={WorkerId}, CurrentProfileId={CurrentProfileId}, ReturnedProfileCount={ReturnedProfileCount}",
+                "待处理任务查询完成。VmName={VmName}, WorkerId={WorkerId}, CurrentProfileId={CurrentProfileId}, ReturnedProfileCount={ReturnedProfileCount}",
                 vm.Name,
                 vm.WorkerId,
                 state.CurrentProfileId,
@@ -299,7 +299,7 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
             }
 
             _logger.LogInformation(
-                "VM rejected as switch candidate. VmName={VmName}, TargetProfileId={TargetProfileId}, RunnerStatusCode={RunnerStatusCode}, ErrorCode={ErrorCode}, Reason={Reason}",
+                "VM 未通过切换候选条件校验。VmName={VmName}, TargetProfileId={TargetProfileId}, RunnerStatusCode={RunnerStatusCode}, ErrorCode={ErrorCode}, Reason={Reason}",
                 vm.Name,
                 targetProfileId,
                 state.RunnerStatusCode,

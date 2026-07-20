@@ -11,6 +11,7 @@ using Seebot.WorkerAgent.Core.Backup;
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Domain;
 using Seebot.WorkerAgent.Core.Guest;
+using Seebot.WorkerAgent.Core.Health;
 using Seebot.WorkerAgent.Core.Logging;
 using Seebot.WorkerAgent.Core.Reporting;
 using Seebot.WorkerAgent.Core.Scheduler;
@@ -20,6 +21,9 @@ using Seebot.WorkerAgent.Core.Storage;
 using Seebot.WorkerAgent.Core.Snapshot;
 using Seebot.WorkerAgent.Core.Switching;
 using Seebot.WorkerAgent.Core.Vmware;
+using Seebot.WorkerAgent.Core.Coordination;
+using Seebot.WorkerAgent.Core.Operations;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.AspNetCore.Builder;
 using AgentProgram = Seebot.WorkerAgent.Service.Program;
 
@@ -55,6 +59,10 @@ var tests = new (string Name, Action Body)[]
     ("LocalStore creates and queries switch transactions", LocalStoreCreatesAndQueriesSwitchTransactions),
     ("LocalStore updates switch transaction status", LocalStoreUpdatesSwitchTransactionStatus),
     ("LocalStore incomplete transaction query excludes terminal states", LocalStoreIncompleteTransactionQueryExcludesTerminalStates),
+    ("VM operation lease is exclusive and supports expired takeover fencing", VmOperationLeaseIsExclusiveAndFenced),
+    ("VM recovery power-cycle budget persists across attempts", VmRecoveryPowerCycleBudgetPersists),
+    ("VM health check is observation-only and invokes cleanup hook", VmHealthCheckIsObservationOnly),
+    ("VM power-on action starts, skips, and restarts according to state", VmPowerOnActionHandlesAllStates),
     ("VirtualMachineRegistry upserts and queries VM profiles", VirtualMachineRegistryUpsertsAndQueriesVmProfiles),
     ("WorkerAgent configuration loads VirtualMachines from SQLite registry", WorkerAgentConfigurationLoadsVirtualMachinesFromSqliteRegistry),
     ("VmrunService passes listSnapshots arguments in order and parses output", VmrunServicePassesListSnapshotsArgumentsInOrderAndParsesOutput),
@@ -87,7 +95,11 @@ var tests = new (string Name, Action Body)[]
     ("VmSwitchService does not backup or vmrun when kill returns WORKER_RUNNING", VmSwitchServiceDoesNotBackupOrVmrunWhenKillReturnsWorkerRunning),
     ("VmSwitchService stops before VM stop when backup fails and force revert is false", VmSwitchServiceStopsBeforeVmStopWhenBackupFailsAndForceRevertIsFalse),
     ("VmSwitchService success path executes ordered external actions", VmSwitchServiceSuccessPathExecutesOrderedExternalActions),
-    ("VmSwitchService switches and starts a powered-off VM without guest operations", VmSwitchServiceSwitchesPoweredOffVmWithoutGuestOperations),
+    ("VmSwitchService writes token before Runner readiness check", VmSwitchServiceWritesTokenBeforeRunnerReadiness),
+    ("VmSwitchService starts powered-off VM and skips current switch", VmSwitchServiceSwitchesPoweredOffVmWithoutGuestOperations),
+    ("VmSwitchService does not restart when switched VM Runner is not ready", VmSwitchServiceColdRestartsOnceWhenInitialBootIsNotReady),
+    ("VmSwitchService does not block revert for a stale VMware lock entry", VmSwitchServiceDoesNotBlockRevertForStaleVmwareLockEntry),
+    ("VmSwitchService uses shared recovery after Runner probe failure", VmSwitchServiceHardPowerCyclesAfterThreeRunnerStatusFailures),
     ("VmSwitchService fails before revert when VM does not stop", VmSwitchServiceFailsBeforeRevertWhenVmDoesNotStop),
     ("VmSwitchService hard stops when soft stop times out and fallback is allowed", VmSwitchServiceHardStopsWhenSoftStopTimesOutAndFallbackAllowed),
     ("VmSwitchService marks mismatch after ready as WORKER_PROFILE_MISMATCH", VmSwitchServiceMarksMismatchAfterReadyAsWorkerProfileMismatch),
@@ -445,6 +457,124 @@ static void LocalStoreInitializesSqliteTables()
 
     Assert.True(SqliteTableExists(scope.DatabasePath, "local_vm_state"), "local_vm_state table should exist.");
     Assert.True(SqliteTableExists(scope.DatabasePath, "local_switch_transaction"), "local_switch_transaction table should exist.");
+    Assert.True(SqliteTableExists(scope.DatabasePath, "local_vm_operation"), "local_vm_operation table should exist.");
+    Assert.True(SqliteTableExists(scope.DatabasePath, "local_vm_recovery_state"), "local_vm_recovery_state table should exist.");
+}
+
+static void VmOperationLeaseIsExclusiveAndFenced()
+{
+    using var scope = TempDatabase();
+    var store = new LocalStore(scope.DatabasePath); store.InitializeAsync().GetAwaiter().GetResult();
+    var now = DateTimeOffset.Parse("2026-07-17T10:00:00+08:00");
+    var first = store.TryAcquireAsync("host", "vm", "op-1", VmOperationType.ProfileSwitch, "owner-1",
+        now, TimeSpan.FromMinutes(5), default).GetAwaiter().GetResult();
+    Assert.NotNull(first, "First operation should acquire the lease.");
+    var competing = store.TryAcquireAsync("host", "vm", "op-2", VmOperationType.SnapshotUpdate, "owner-2",
+        now.AddMinutes(1), TimeSpan.FromMinutes(5), default).GetAwaiter().GetResult();
+    Assert.True(competing is null, "An active lease must reject a competing operation.");
+    var takeover = store.TryAcquireAsync("host", "vm", "op-3", VmOperationType.Maintenance, "owner-3",
+        now.AddMinutes(6), TimeSpan.FromMinutes(5), default).GetAwaiter().GetResult();
+    Assert.NotNull(takeover, "An expired lease should be recoverable.");
+    Assert.True(takeover!.FencingToken > first!.FencingToken, "Takeover must increment the fencing token.");
+    var staleWrite = store.UpdateAsync(first, VmOperationStatus.StartingVm, null, null, now.AddMinutes(6),
+        TimeSpan.FromMinutes(5), default).GetAwaiter().GetResult();
+    Assert.True(!staleWrite, "The previous owner must not update after fencing takeover.");
+}
+
+static void VmRecoveryPowerCycleBudgetPersists()
+{
+    using var scope = TempDatabase();
+    var store = new LocalStore(scope.DatabasePath); store.InitializeAsync().GetAwaiter().GetResult();
+    var now = DateTimeOffset.Parse("2026-07-17T10:00:00+08:00");
+    var first = store.TryReservePowerCycleAsync("host", "vm", now, TimeSpan.FromMinutes(30), 2,
+        TimeSpan.Zero, default).GetAwaiter().GetResult();
+    var second = store.TryReservePowerCycleAsync("host", "vm", now.AddMinutes(1), TimeSpan.FromMinutes(30), 2,
+        TimeSpan.Zero, default).GetAwaiter().GetResult();
+    var third = store.TryReservePowerCycleAsync("host", "vm", now.AddMinutes(2), TimeSpan.FromMinutes(30), 2,
+        TimeSpan.Zero, default).GetAwaiter().GetResult();
+    Assert.True(first && second, "Two power cycles should be reservable in the configured window.");
+    Assert.True(!third, "A third power cycle in the same window must be suppressed persistently.");
+}
+
+static void VmHealthCheckIsObservationOnly()
+{
+    var vmrun = new FakeVmrunService(); // Start/stop throw, so a successful check proves no power mutation.
+    var cleanup = new RecordingDiskCleanupService();
+    var vm = BackupVm(Path.Combine(Path.GetTempPath(), "rpa-worker-agent-health-tests"));
+    vm.Enabled = true;
+    var service = new VmHealthCheckService(vmrun, cleanup, new WorkerAgentOptions
+    {
+        VirtualMachines = [vm]
+    });
+
+    service.CheckAsync(default).GetAwaiter().GetResult();
+
+    Assert.Equal(1, cleanup.Contexts.Count, "Disk cleanup extension point should be invoked once per enabled VM.");
+    Assert.True(!cleanup.Contexts[0].IsVmRunning, "Cleanup context should contain the observed VM power state.");
+}
+
+static void VmPowerOnActionHandlesAllStates()
+{
+    VmPowerOnResult Run(IReadOnlyList<bool> runningResponses, int statusFailures, out ActionRecorder recorder,
+        bool blockRunnerProbe = false, int failStartTimes = 0)
+    {
+        using var scope = TempDatabase();
+        var options = new WorkerAgentOptions
+        {
+            Agent = new AgentOptions
+            {
+                HostId = "host", VmPowerCycleStopTimeoutSeconds = 1, VmPostStopStabilizationSeconds = 0,
+                ManualPowerOnRunnerProbeTimeoutSeconds = 1, ManualPowerOnStartMaxAttempts = 3,
+                ManualPowerOnRunnerReadyTimeoutSeconds = 1
+            },
+            Vmrun = new VmrunOptions { DefaultStartNoGui = true }
+        };
+        var vm = BackupVm(Path.Combine(Path.GetTempPath(), "rpa-worker-agent-power-on-tests"));
+        var registry = new SqliteVirtualMachineRegistry(scope.DatabasePath);
+        registry.UpsertVmAsync(vm).GetAwaiter().GetResult();
+        var store = new LocalStore(scope.DatabasePath); store.InitializeAsync().GetAwaiter().GetResult();
+        var coordinator = new VmOperationCoordinator(store, options, NullLogger<VmOperationCoordinator>.Instance);
+        recorder = new ActionRecorder();
+        var vmrun = new RecordingSwitchVmrunService(recorder)
+        {
+            RunningResponses = runningResponses, FailStartTimes = failStartTimes, ReflectSuccessfulStart = failStartTimes > 0
+        };
+        var guest = new RecordingGuestWorkerClient(recorder)
+        {
+            StatusFailuresRemaining = statusFailures,
+            BlockStatusCallsRemaining = blockRunnerProbe ? 1 : 0,
+            StatusResponses = [RunnerStatus(vm.WorkerId, "profile", RunnerStatusCode.Runnable)]
+        };
+        var recovery = new VmPowerRecoveryService(vmrun, guest, options, NullLogger<VmPowerRecoveryService>.Instance,
+            pollInterval: TimeSpan.Zero);
+        var service = new VmPowerOnService(registry, new VmOperationLock(), coordinator, recovery, options);
+        return service.PowerOnAsync(vm.Name, default).GetAwaiter().GetResult();
+    }
+
+    var started = Run([false, true], 0, out var startActions);
+    Assert.True(started.Success && started.Action == "started", "Powered-off VM should start.");
+    Assert.SequenceEqual(new[] { "vmrun-is-running", "vmrun-start", "vmrun-is-running", "get-status" }, startActions.Actions, "Start path should confirm both VM power and Runner response.");
+
+    var skipped = Run([true], 0, out var skipActions);
+    Assert.True(skipped.Success && skipped.Action == "skipped", "Responsive running VM should be skipped.");
+    Assert.False(skipActions.Actions.Any(action => action is "vmrun-stop" or "vmrun-start"), "Responsive Runner path must not mutate VM power.");
+
+    var restarted = Run([true, false, true], 1, out var restartActions);
+    Assert.True(restarted.Success && restarted.Action == "restarted", "Unreachable Runner should trigger one VM restart.");
+    Assert.Equal(1, restartActions.Actions.Count(action => action == "vmrun-stop"), "Restart path should stop once.");
+    Assert.Equal(1, restartActions.Actions.Count(action => action == "vmrun-start"), "Restart path should start once.");
+
+    var blueScreen = Run([true, false, true], 0, out var blueScreenActions, blockRunnerProbe: true);
+    Assert.True(blueScreen.Success && blueScreen.Action == "restarted", "A hung blue-screen Runner probe should time out and restart the VM.");
+    Assert.Equal(1, blueScreenActions.Actions.Count(action => action == "vmrun-stop"), "Blue-screen recovery should hard-stop once.");
+
+    var guestStillDown = Run([true, false, true], 100, out _);
+    Assert.False(guestStillDown.Success, "VMware power-on without Runner recovery must not report success.");
+    Assert.Equal("VM_RUNNER_READY_TIMEOUT", guestStillDown.ErrorCode, "False power-level success should report Runner readiness timeout.");
+
+    var retriedStart = Run([false, false], 0, out var retryActions, failStartTimes: 1);
+    Assert.True(retriedStart.Success && retriedStart.Action == "started", "A transient vmrun start failure should be retried.");
+    Assert.Equal(2, retryActions.Actions.Count(action => action == "vmrun-start"), "Start should be attempted twice after one transient failure.");
 }
 
 static void LocalStoreUpsertsAndQueriesVmState()
@@ -1105,8 +1235,8 @@ static void VmSwitchServiceDoesNotKillBackupOrVmrunWhenRunnerIsRunning()
 
     var result = service.SwitchAsync(SwitchRequest(), CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.False(result.Success, "Running runner should cancel switch.");
-    Assert.Equal(ErrorCodes.WorkerRunning, result.ErrorCode, "Running runner should report WORKER_RUNNING.");
+    Assert.True(result.Success && result.Skipped, "Running runner should skip the current switch without failing recovery.");
+    Assert.Equal(ErrorCodes.SwitchSkippedRunnerNotIdle, result.ErrorCode, "Running runner should report a non-idle skip.");
     Assert.False(recorder.Actions.Any(action => action is "kill" or "backup" or "vmrun-stop" or "vmrun-revert" or "vmrun-start"), "Running path should not call kill, backup, or vmrun.");
 }
 
@@ -1202,6 +1332,21 @@ static void VmSwitchServiceSuccessPathExecutesOrderedExternalActions()
         "Successful switch should call external actions in strict order.");
 }
 
+static void VmSwitchServiceWritesTokenBeforeRunnerReadiness()
+{
+    var recorder = new ActionRecorder();
+    var result = NewVmSwitchService(ReadyGuest(recorder), new RecordingBackupService(recorder),
+            new RecordingSwitchVmrunService(recorder), new RecordingLocalStore(recorder),
+            tokenProvisioningService: new RecordingTokenProvisioningService(recorder))
+        .SwitchAsync(SwitchRequest(), CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.True(result.Success && !result.Skipped, "Normal switch should complete.");
+    var startIndex = recorder.Actions.IndexOf("vmrun-start");
+    var tokenIndex = recorder.Actions.IndexOf("token");
+    var readyIndex = recorder.Actions.LastIndexOf("get-status");
+    Assert.True(startIndex < tokenIndex && tokenIndex < readyIndex, "Token must be written after VM start and before Runner readiness confirmation.");
+}
+
 static void VmSwitchServiceSwitchesPoweredOffVmWithoutGuestOperations()
 {
     var recorder = new ActionRecorder();
@@ -1214,34 +1359,110 @@ static void VmSwitchServiceSwitchesPoweredOffVmWithoutGuestOperations()
     };
     var vmrun = new RecordingSwitchVmrunService(recorder)
     {
-        RunningResponses = [false]
+        RunningResponses = [false, true]
     };
 
     var result = NewVmSwitchService(guest, new RecordingBackupService(recorder), vmrun, new RecordingLocalStore(recorder))
         .SwitchAsync(SwitchRequest(), CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.True(result.Success, "A powered-off VM should switch snapshots and start successfully.");
+    Assert.True(result.Success && result.Skipped, "A powered-off VM should be started and skip the current switch.");
+    Assert.Equal(ErrorCodes.SwitchSkippedVmStarted, result.ErrorCode, "Powered-off recovery should expose an explicit skip reason.");
     Assert.SequenceEqual(
         new[]
         {
             "create-tx",
             "vmrun-is-running",
-            "update:STOP_RUNNER_DONE",
-            "update:LOG_BACKUP_DONE",
-            "update:VM_STOP_DONE",
-            "vmrun-revert",
-            "update:SNAPSHOT_REVERT_DONE",
             "vmrun-start",
-            "update:VM_START_DONE",
+            "vmrun-is-running",
             "get-status",
-            "update:WORKER_READY_DONE",
             "update:SUCCESS"
         },
         recorder.Actions,
-        "Powered-off path should skip guest operations and stop, then revert and start.");
+        "Powered-off path should start the VM, confirm Runner response, and complete as skipped.");
     Assert.False(recorder.Actions.Contains("kill"), "Powered-off path must not call the guest runner kill endpoint.");
     Assert.False(recorder.Actions.Contains("backup"), "Powered-off path must not attempt guest backup.");
     Assert.False(recorder.Actions.Contains("vmrun-stop"), "Powered-off path must not stop an already powered-off VM.");
+}
+
+static void VmSwitchServiceColdRestartsOnceWhenInitialBootIsNotReady()
+{
+    var recorder = new ActionRecorder();
+    var guest = new RecordingGuestWorkerClient(recorder)
+    {
+        StatusResponses =
+        [
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-social-portal", RunnerStatusCode.Runnable),
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.RobotError),
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Runnable)
+        ],
+        KillResponse = KillSuccess()
+    };
+    var vmrun = new RecordingSwitchVmrunService(recorder)
+    {
+        RunningResponses = [true, true, false, true, false]
+    };
+
+    var result = NewVmSwitchService(guest, new RecordingBackupService(recorder), vmrun, new RecordingLocalStore(recorder))
+        .SwitchAsync(SwitchRequest(), CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.False(result.Success, "An unhealthy Runner after snapshot start should fail without another VM restart.");
+    Assert.Equal(1, recorder.Actions.Count(action => action == "vmrun-start"), "Snapshot flow must start the VM only once.");
+    Assert.Equal(1, recorder.Actions.Count(action => action == "vmrun-stop"), "Snapshot flow must stop the VM only once.");
+}
+
+static void VmSwitchServiceDoesNotBlockRevertForStaleVmwareLockEntry()
+{
+    var root = Path.Combine(Path.GetTempPath(), "rpa-worker-agent-lock-test-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(Path.Combine(root, "stale.vmx.lck"));
+    try
+    {
+        var recorder = new ActionRecorder();
+        var request = SwitchRequest();
+        request.Vm.VmxPath = Path.Combine(root, "test.vmx");
+        var vmrun = new RecordingSwitchVmrunService(recorder) { RunningResponses = [false, true] };
+        var guest = new RecordingGuestWorkerClient(recorder)
+        {
+            StatusResponses = [RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Runnable)]
+        };
+
+        var result = NewVmSwitchService(guest, new RecordingBackupService(recorder), vmrun, new RecordingLocalStore(recorder))
+            .SwitchAsync(request, CancellationToken.None).GetAwaiter().GetResult();
+
+        Assert.True(result.Success && result.Skipped, "A powered-off VM should be started even with a stale .lck entry.");
+        Assert.False(recorder.Actions.Contains("vmrun-revert"), "A recovery-only precheck must not revert a snapshot.");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void VmSwitchServiceHardPowerCyclesAfterThreeRunnerStatusFailures()
+{
+    var recorder = new ActionRecorder();
+    var guest = new RecordingGuestWorkerClient(recorder)
+    {
+        StatusFailuresRemaining = 1,
+        StatusResponses =
+        [
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-social-portal", RunnerStatusCode.Runnable),
+            RunnerStatus("rpa-sh-tax-etax-001", "rpa-sh-tax-etax", RunnerStatusCode.Runnable)
+        ],
+        KillResponse = KillSuccess()
+    };
+    var vmrun = new RecordingSwitchVmrunService(recorder)
+    {
+        RunningResponses = [true, true, false, true, false]
+    };
+
+    var result = NewVmSwitchService(guest, new RecordingBackupService(recorder), vmrun, new RecordingLocalStore(recorder))
+        .SwitchAsync(SwitchRequest(), CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.True(result.Success && result.Skipped, "Switch should be skipped after Runner recovery power cycle succeeds.");
+    Assert.Equal(ErrorCodes.SwitchSkippedVmRestarted, result.ErrorCode, "Recovery should expose an explicit skip reason.");
+    Assert.Equal(2, recorder.Actions.Count(action => action == "get-status"), "Switch should probe once before recovery and confirm Runner once after restart.");
+    Assert.SequenceEqual(new[] { VmStopMode.Hard }, vmrun.StopModes, "Runner recovery should only hard power cycle once.");
+    Assert.Equal(1, recorder.Actions.Count(action => action == "vmrun-start"), "Recovery path should start the VM once and not switch snapshots.");
 }
 
 static void VmSwitchServiceFailsBeforeRevertWhenVmDoesNotStop()
@@ -1818,8 +2039,8 @@ static void P0IntegrationRunnerRunningDoesNotSwitch()
     var result = NewVmSwitchService(guest, new RecordingBackupService(recorder), vmrun, new RecordingLocalStore(recorder))
         .SwitchAsync(SwitchRequest(), CancellationToken.None).GetAwaiter().GetResult();
 
-    Assert.False(result.Success, "Running runner should fail the integrated switch.");
-    Assert.Equal(ErrorCodes.WorkerRunning, result.ErrorCode, "Running runner should return WORKER_RUNNING.");
+    Assert.True(result.Success && result.Skipped, "Running runner should skip the integrated switch.");
+    Assert.Equal(ErrorCodes.SwitchSkippedRunnerNotIdle, result.ErrorCode, "Running runner should return the non-idle skip reason.");
     Assert.False(recorder.Actions.Any(action => action is "kill" or "backup" or "vmrun-stop" or "vmrun-revert" or "vmrun-start"), "Running runner must not be killed, backed up, or reverted.");
 }
 
@@ -2020,14 +2241,21 @@ static VmSwitchService NewVmSwitchService(
     RecordingLocalStore store,
     bool forceRevertWhenBackupFailed = false,
     bool allowHardStopAfterSoftTimeout = false,
-    int stopSoftTimeoutSeconds = 60)
+    int stopSoftTimeoutSeconds = 60,
+    IGuestTokenProvisioningService? tokenProvisioningService = null)
 {
-    return new VmSwitchService(guest, backup, vmrun, store, new WorkerAgentOptions
+    var options = new WorkerAgentOptions
     {
         Agent = new AgentOptions
         {
             ForceRevertWhenBackupFailed = forceRevertWhenBackupFailed,
-            WaitVmReadyTimeoutSeconds = 1
+            WaitVmReadyTimeoutSeconds = 1,
+            VmPostStopStabilizationSeconds = 0,
+            VmPostRevertStabilizationSeconds = 0,
+            VmPowerCycleStopTimeoutSeconds = 1,
+            ManualPowerOnRunnerProbeTimeoutSeconds = 1,
+            ManualPowerOnStartMaxAttempts = 1,
+            ManualPowerOnRunnerReadyTimeoutSeconds = 1
         },
         Vmrun = new VmrunOptions
         {
@@ -2035,7 +2263,12 @@ static VmSwitchService NewVmSwitchService(
             AllowHardStopAfterSoftTimeout = allowHardStopAfterSoftTimeout,
             StopSoftTimeoutSeconds = stopSoftTimeoutSeconds
         }
-    }, snapshotRevertRetryDelay: TimeSpan.Zero, vmStoppedPollInterval: TimeSpan.Zero, vmStopTimeout: TimeSpan.FromSeconds(stopSoftTimeoutSeconds));
+    };
+    var recovery = new VmPowerRecoveryService(vmrun, guest, options, NullLogger<VmPowerRecoveryService>.Instance,
+        pollInterval: TimeSpan.Zero);
+    return new VmSwitchService(guest, backup, vmrun, store, options, recovery,
+        snapshotRevertRetryDelay: TimeSpan.Zero, vmStoppedPollInterval: TimeSpan.Zero,
+        vmStopTimeout: TimeSpan.FromSeconds(stopSoftTimeoutSeconds), guestTokenProvisioningService: tokenProvisioningService);
 }
 
 static VmSwitchRequest SwitchRequest()
@@ -2481,6 +2714,17 @@ internal sealed class TempDirectoryScope : IDisposable
     }
 }
 
+internal sealed class RecordingDiskCleanupService : IVmDiskCleanupService
+{
+    public List<VmDiskCleanupContext> Contexts { get; } = [];
+
+    public Task CleanupIfDueAsync(VmDiskCleanupContext context, CancellationToken cancellationToken)
+    {
+        Contexts.Add(context);
+        return Task.CompletedTask;
+    }
+}
+
 internal sealed class FakeVmrunService : IVmrunService
 {
     private readonly string? _failOnGuestPath;
@@ -2657,10 +2901,24 @@ internal sealed class RecordingGuestWorkerClient : IGuestWorkerClient
         LogFlushed = true
     };
 
-    public Task<RunnerStatusResponse> GetRunnerStatusAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
+    public int StatusFailuresRemaining { get; set; }
+    public int BlockStatusCallsRemaining { get; set; }
+
+    public async Task<RunnerStatusResponse> GetRunnerStatusAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
     {
         _recorder.Actions.Add("get-status");
-        return Task.FromResult(_statusResponses.Dequeue());
+        if (BlockStatusCallsRemaining > 0)
+        {
+            BlockStatusCallsRemaining--;
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+        if (StatusFailuresRemaining > 0)
+        {
+            StatusFailuresRemaining--;
+            throw new InvalidOperationException("runner status unavailable");
+        }
+
+        return _statusResponses.Dequeue();
     }
 
     public Task<KillRunnerResponse> KillRunnerAsync(
@@ -2672,6 +2930,17 @@ internal sealed class RecordingGuestWorkerClient : IGuestWorkerClient
     {
         _recorder.Actions.Add("kill");
         return Task.FromResult(KillResponse);
+    }
+}
+
+internal sealed class RecordingTokenProvisioningService : IGuestTokenProvisioningService
+{
+    private readonly ActionRecorder _recorder;
+    public RecordingTokenProvisioningService(ActionRecorder recorder) => _recorder = recorder;
+    public Task<GuestTokenProvisioningResult> ProvisionAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
+    {
+        _recorder.Actions.Add("token");
+        return Task.FromResult(new GuestTokenProvisioningResult { Success = true });
     }
 }
 
@@ -2713,6 +2982,9 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
 
     public bool FailOnRevert { get; set; }
     public int FailRevertTimes { get; set; }
+    public int FailStartTimes { get; set; }
+    public bool ReflectSuccessfulStart { get; set; }
+    private bool _startedSuccessfully;
     public IReadOnlyList<bool> RunningResponses { get; set; } = [true, true, false];
     public List<VmStopMode> StopModes { get; } = [];
     private int _revertAttempts;
@@ -2731,7 +3003,7 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
             return Task.FromResult(RunningResponses[_runningResponseIndex++]);
         }
 
-        return Task.FromResult(false);
+        return Task.FromResult(ReflectSuccessfulStart && _startedSuccessfully);
     }
 
     public Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken)
@@ -2771,6 +3043,12 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
     public Task<VmrunCommandResult> StartVmAsync(string vmxPath, bool noGui, CancellationToken cancellationToken)
     {
         _recorder.Actions.Add("vmrun-start");
+        if (FailStartTimes > 0)
+        {
+            FailStartTimes--;
+            throw new InvalidOperationException("start transiently failed");
+        }
+        _startedSuccessfully = true;
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "start"));
     }
 

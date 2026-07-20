@@ -4,6 +4,7 @@ public sealed class VmSwitchResult
 {
     public string TxId { get; set; } = "";
     public bool Success { get; set; }
+    public bool Skipped { get; set; }
     public string? ErrorCode { get; set; }
     public string? ErrorMessage { get; set; }
 }

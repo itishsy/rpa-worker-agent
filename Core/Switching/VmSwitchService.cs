@@ -6,6 +6,8 @@ using Seebot.WorkerAgent.Core.Storage;
 using Seebot.WorkerAgent.Core.Vmware;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Seebot.WorkerAgent.Core.Coordination;
+using Seebot.WorkerAgent.Core.Operations;
 
 namespace Seebot.WorkerAgent.Core.Switching;
 
@@ -28,6 +30,8 @@ public sealed class VmSwitchService : IVmSwitchService
     private readonly ILogger<VmSwitchService> _logger;
     private readonly TimeSpan _vmStoppedPollInterval;
     private readonly TimeSpan? _vmStopTimeoutOverride;
+    private readonly IVmOperationCoordinator? _operationCoordinator;
+    private readonly IVmPowerRecoveryService _powerRecoveryService;
 
     public VmSwitchService(
         IGuestWorkerClient guestWorkerClient,
@@ -35,13 +39,15 @@ public sealed class VmSwitchService : IVmSwitchService
         IVmrunService vmrunService,
         ILocalStore localStore,
         WorkerAgentOptions options,
+        IVmPowerRecoveryService powerRecoveryService,
         TimeProvider? timeProvider = null,
         TimeSpan? snapshotRevertRetryDelay = null,
         TimeSpan? vmStoppedPollInterval = null,
         TimeSpan? vmStopTimeout = null,
         ILogger<VmSwitchService>? logger = null,
         IVirtualMachineRegistry? virtualMachineRegistry = null,
-        IGuestTokenProvisioningService? guestTokenProvisioningService = null)
+        IGuestTokenProvisioningService? guestTokenProvisioningService = null,
+        IVmOperationCoordinator? operationCoordinator = null)
     {
         _guestWorkerClient = guestWorkerClient;
         _logBackupService = logBackupService;
@@ -55,9 +61,35 @@ public sealed class VmSwitchService : IVmSwitchService
         _vmStoppedPollInterval = vmStoppedPollInterval ?? DefaultVmStoppedPollInterval;
         _vmStopTimeoutOverride = vmStopTimeout;
         _logger = logger ?? NullLogger<VmSwitchService>.Instance;
+        _operationCoordinator = operationCoordinator;
+        _powerRecoveryService = powerRecoveryService;
     }
 
     public async Task<VmSwitchResult> SwitchAsync(VmSwitchRequest request, CancellationToken cancellationToken)
+    {
+        if (_operationCoordinator is null)
+            return await SwitchCoreAsync(request, null, cancellationToken).ConfigureAwait(false);
+
+        await using var operation = await _operationCoordinator.TryAcquireAsync(
+            _options.Agent.HostId, request.Vm.Name, VmOperationType.ProfileSwitch, cancellationToken).ConfigureAwait(false);
+        if (operation is null)
+            return new VmSwitchResult { Success = false, ErrorCode = "VM_OPERATION_BUSY", ErrorMessage = "Another VM operation is in progress." };
+
+        try
+        {
+            var result = await SwitchCoreAsync(request, operation, cancellationToken).ConfigureAwait(false);
+            if (result.Success) await operation.CompleteAsync(cancellationToken).ConfigureAwait(false);
+            else await operation.FailAsync(result.ErrorCode ?? "SWITCH_FAILED", result.ErrorMessage ?? "VM switch failed.", cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            await operation.FailAsync("SWITCH_UNHANDLED", exception.Message, CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private async Task<VmSwitchResult> SwitchCoreAsync(VmSwitchRequest request, IVmOperationLease? operation, CancellationToken cancellationToken)
     {
         var tx = CreateTransaction(request);
         _logger.LogInformation(
@@ -72,53 +104,30 @@ public sealed class VmSwitchService : IVmSwitchService
             request.FirstTaskId);
         await _localStore.CreateSwitchTransactionAsync(tx, cancellationToken);
 
-        bool wasRunning;
-        try
-        {
-            wasRunning = await _vmrunService.IsVmRunningAsync(request.Vm.VmxPath, cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception exception) when (exception is not OperationCanceledException)
-        {
-            return await FailAsync(
-                tx,
-                ErrorCodes.VmStopFailed,
-                $"Failed to determine VM power state: {exception.Message}",
-                request.Timestamp,
-                cancellationToken);
-        }
-
-        if (!wasRunning)
-        {
-            _logger.LogInformation(
-                "VM is already powered off; skipping runner stop and guest backup before snapshot switch. TxId={TxId}, VmName={VmName}",
-                tx.TransactionId,
-                request.Vm.Name);
-            await UpdateAsync(tx, SwitchTransactionStatus.STOP_RUNNER_DONE, "runner-stop-skipped-vm-off", null, null, request.Timestamp, cancellationToken);
-            await UpdateAsync(tx, SwitchTransactionStatus.LOG_BACKUP_DONE, "log-backup-skipped-vm-off", null, null, request.Timestamp, cancellationToken);
-            await UpdateAsync(tx, SwitchTransactionStatus.VM_STOP_DONE, "vm-already-stopped", null, null, request.Timestamp, cancellationToken);
-        }
-
-        if (wasRunning)
-        {
-
+        if (operation is not null) await operation.SetStatusAsync(VmOperationStatus.CheckingRunner, cancellationToken).ConfigureAwait(false);
         _logger.LogInformation("画像切换前检查 runner 状态。TxId={TxId}, VmName={VmName}", tx.TransactionId, request.Vm.Name);
-        var beforeStatus = await _guestWorkerClient.GetRunnerStatusAsync(request.Vm, cancellationToken);
+        var recovery = await _powerRecoveryService.EnsureOperationalAsync(request.Vm, operation, cancellationToken).ConfigureAwait(false);
+        if (!recovery.Success)
+            return await FailAndMarkVmErrorAsync(tx, request, recovery.ErrorCode ?? ErrorCodes.VmStartFailed, recovery.Message, cancellationToken);
+        if (recovery.Action == VmPowerRecoveryAction.Started)
+            return await SkipAsync(tx, ErrorCodes.SwitchSkippedVmStarted, recovery.Message, "precheck-vm-started", request.Timestamp, cancellationToken);
+        if (recovery.Action == VmPowerRecoveryAction.Restarted)
+            return await SkipAsync(tx, ErrorCodes.SwitchSkippedVmRestarted, recovery.Message, "precheck-vm-restarted", request.Timestamp, cancellationToken);
+        var beforeStatus = recovery.RunnerStatus ?? throw new InvalidOperationException("Power recovery returned responsive without Runner status.");
         _logger.LogInformation(
             "画像切换前 runner 状态。TxId={TxId}, VmName={VmName}, RunnerStatusCode={RunnerStatusCode}",
             tx.TransactionId,
             request.Vm.Name,
             beforeStatus.RunnerStatusCode);
-        if (beforeStatus.RunnerStatusCode == RunnerStatusCode.Running)
+        if (!beforeStatus.Success || beforeStatus.RunnerStatusCode != RunnerStatusCode.Runnable || beforeStatus.CurrentTaskId is not null)
         {
-            return await FailAsync(tx, ErrorCodes.WorkerRunning, "Runner is Running.", request.Timestamp, cancellationToken);
-        }
-
-        if (beforeStatus.RunnerStatusCode == RunnerStatusCode.Upgrading)
-        {
-            return await FailAsync(tx, ErrorCodes.WorkerUpgrading, "Runner is Upgrading.", request.Timestamp, cancellationToken);
+            return await SkipAsync(tx, ErrorCodes.SwitchSkippedRunnerNotIdle,
+                $"Runner is not normally idle (status={beforeStatus.RunnerStatusCode}, currentTaskId={beforeStatus.CurrentTaskId?.ToString() ?? "null"}); current switch was skipped.",
+                "precheck-runner-not-idle", request.Timestamp, cancellationToken);
         }
 
         _logger.LogInformation("画像切换前停止 runner。TxId={TxId}, VmName={VmName}", tx.TransactionId, request.Vm.Name);
+        if (operation is not null) await operation.SetStatusAsync(VmOperationStatus.StoppingRunner, cancellationToken).ConfigureAwait(false);
         var kill = await _guestWorkerClient.KillRunnerAsync(
             request.Vm,
             tx.TransactionId,
@@ -132,14 +141,16 @@ public sealed class VmSwitchService : IVmSwitchService
             return await FailAsync(tx, errorCode!, kill.Message, request.Timestamp, cancellationToken);
         }
 
-        if (kill.CurrentTaskId is not null)
-        {
-            return await FailAsync(tx, ErrorCodes.ExecutorStopFailed, "Runner still has currentTaskId after kill.", request.Timestamp, cancellationToken);
-        }
+        // 取消对exe进程判断
+        //if (kill.CurrentTaskId is not null)
+        //{
+        //    return await FailAsync(tx, ErrorCodes.ExecutorStopFailed, "Runner still has currentTaskId after kill.", request.Timestamp, cancellationToken);
+        //}
 
         await UpdateAsync(tx, SwitchTransactionStatus.STOP_RUNNER_DONE, "runner-stopped", null, null, request.Timestamp, cancellationToken);
 
         _logger.LogInformation("画像切换前开始备份日志。TxId={TxId}, VmName={VmName}", tx.TransactionId, request.Vm.Name);
+        if (operation is not null) await operation.SetStatusAsync(VmOperationStatus.BackingUp, cancellationToken).ConfigureAwait(false);
         var backup = await _logBackupService.BackupAsync(request.Vm, tx, request.Timestamp, cancellationToken);
         _logger.LogInformation(
             "画像切换前日志备份结果。TxId={TxId}, VmName={VmName}, Success={Success}, TargetPath={TargetPath}, ErrorCode={ErrorCode}, ErrorMessage={ErrorMessage}",
@@ -156,6 +167,7 @@ public sealed class VmSwitchService : IVmSwitchService
 
         await UpdateAsync(tx, SwitchTransactionStatus.LOG_BACKUP_DONE, "log-backup-done", backup.ErrorCode, backup.ErrorMessage, request.Timestamp, cancellationToken);
 
+        if (operation is not null) await operation.SetStatusAsync(VmOperationStatus.StoppingVm, cancellationToken).ConfigureAwait(false);
         var stopError = await StopVmSafelyAsync(request.Vm.VmxPath, request.Vm.Name, tx.TransactionId, cancellationToken);
         if (stopError is not null)
         {
@@ -163,10 +175,11 @@ public sealed class VmSwitchService : IVmSwitchService
         }
 
         await UpdateAsync(tx, SwitchTransactionStatus.VM_STOP_DONE, "vm-stop-done", null, null, request.Timestamp, cancellationToken);
-        }
+        await WaitForVmFilesReleasedAsync(request.Vm, cancellationToken).ConfigureAwait(false);
 
         try
         {
+            if (operation is not null) await operation.SetStatusAsync(VmOperationStatus.RevertingSnapshot, cancellationToken).ConfigureAwait(false);
             await RevertToSnapshotWithRetryAsync(tx, request, cancellationToken);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
@@ -176,9 +189,12 @@ public sealed class VmSwitchService : IVmSwitchService
 
         await UpdateAsync(tx, SwitchTransactionStatus.SNAPSHOT_REVERT_DONE, "snapshot-revert-done", null, null, request.Timestamp, cancellationToken);
 
+        await DelayIfPositiveAsync(_options.Agent.VmPostRevertStabilizationSeconds, cancellationToken).ConfigureAwait(false);
+
         try
         {
             _logger.LogInformation("快照回滚完成，启动 VM。TxId={TxId}, VmName={VmName}, NoGui={NoGui}", tx.TransactionId, request.Vm.Name, _options.Vmrun.DefaultStartNoGui);
+            if (operation is not null) await operation.SetStatusAsync(VmOperationStatus.StartingVm, cancellationToken).ConfigureAwait(false);
             await _vmrunService.StartVmAsync(request.Vm.VmxPath, _options.Vmrun.DefaultStartNoGui, cancellationToken);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
@@ -188,22 +204,18 @@ public sealed class VmSwitchService : IVmSwitchService
 
         await UpdateAsync(tx, SwitchTransactionStatus.VM_START_DONE, "vm-start-done", null, null, request.Timestamp, cancellationToken);
 
+        _logger.LogInformation("VM 启动后等待 runner 就绪。TxId={TxId}, VmName={VmName}", tx.TransactionId, request.Vm.Name);
         if (_guestTokenProvisioningService is not null)
         {
-            var tokenResult = await _guestTokenProvisioningService.ProvisionAsync(request.Vm, cancellationToken)
-                .ConfigureAwait(false);
+            var tokenResult = await _guestTokenProvisioningService.ProvisionAsync(request.Vm, cancellationToken).ConfigureAwait(false);
             if (!tokenResult.Success)
             {
-                return await FailAsync(
-                    tx,
-                    tokenResult.ErrorCode ?? ErrorCodes.ConfigUpdateFailed,
-                    tokenResult.ErrorMessage ?? "Failed to provision scheduler token in guest.",
-                    request.Timestamp,
-                    cancellationToken);
+                return await FailAsync(tx, tokenResult.ErrorCode ?? ErrorCodes.ConfigUpdateFailed,
+                    tokenResult.ErrorMessage ?? "Failed to provision scheduler token in guest.", request.Timestamp, cancellationToken);
             }
         }
 
-        _logger.LogInformation("VM 启动后等待 runner 就绪。TxId={TxId}, VmName={VmName}", tx.TransactionId, request.Vm.Name);
+        if (operation is not null) await operation.SetStatusAsync(VmOperationStatus.WaitingRunner, cancellationToken).ConfigureAwait(false);
         var (readyStatus, ready) = await WaitUntilRunnerReadyAsync(request.Vm, cancellationToken);
         _logger.LogInformation(
             "runner 就绪评估完成。TxId={TxId}, VmName={VmName}, Evaluation={Evaluation}, ErrorCode={ErrorCode}, RunnerStatusCode={RunnerStatusCode}",
@@ -214,9 +226,11 @@ public sealed class VmSwitchService : IVmSwitchService
             readyStatus.RunnerStatusCode);
         if (ready.Kind != WorkerReadyEvaluationKind.Ready)
         {
-            return await FailAsync(tx, ready.ErrorCode ?? ErrorCodes.VmReadyTimeout, "Runner was not ready after VM start.", request.Timestamp, cancellationToken);
+            return await FailAndMarkVmErrorAsync(tx, request, ready.ErrorCode ?? ErrorCodes.VmReadyTimeout,
+                "Runner was not ready after the switched VM started.", cancellationToken);
         }
 
+        if (operation is not null) await operation.SetStatusAsync(VmOperationStatus.VerifyingIdentity, cancellationToken).ConfigureAwait(false);
         if (!MatchesExpectedWorker(request, readyStatus))
         {
             return await FailAsync(tx, ErrorCodes.WorkerProfileMismatch, "VM workerId/profileId did not match target after ready.", request.Timestamp, cancellationToken);
@@ -264,6 +278,62 @@ public sealed class VmSwitchService : IVmSwitchService
             TxId = tx.TransactionId,
             Success = true
         };
+    }
+
+    private async Task WaitForVmFilesReleasedAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
+    {
+        var vmDirectory = Path.GetDirectoryName(vm.VmxPath);
+        if (string.IsNullOrWhiteSpace(vmDirectory) || !Directory.Exists(vmDirectory))
+        {
+            await DelayIfPositiveAsync(_options.Agent.VmPostStopStabilizationSeconds, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var waitSeconds = Math.Max(_options.Agent.VmPostStopStabilizationSeconds, 0);
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(waitSeconds);
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var hasLocks = Directory.EnumerateFileSystemEntries(vmDirectory, "*.lck", SearchOption.TopDirectoryOnly).Any();
+                if (!hasLocks)
+                {
+                    var remaining = deadline - DateTimeOffset.UtcNow;
+                    if (remaining > TimeSpan.Zero)
+                    {
+                        await Task.Delay(remaining, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    return;
+                }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                _logger.LogWarning(exception, "Unable to inspect VMware lock files; continuing with vmrun validation. VmName={VmName}, Directory={Directory}", vm.Name, vmDirectory);
+                await DelayIfPositiveAsync(waitSeconds, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            if (DateTimeOffset.UtcNow >= deadline)
+            {
+                _logger.LogWarning(
+                    "VMware lock entries remain after stabilization wait; continuing and letting vmrun validate the actual lock state. VmName={VmName}, Directory={Directory}, WaitSeconds={WaitSeconds}",
+                    vm.Name,
+                    vmDirectory,
+                    waitSeconds);
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static Task DelayIfPositiveAsync(int seconds, CancellationToken cancellationToken)
+    {
+        return seconds > 0
+            ? Task.Delay(TimeSpan.FromSeconds(seconds), cancellationToken)
+            : Task.CompletedTask;
     }
 
     private async Task RevertToSnapshotWithRetryAsync(SwitchTransaction tx, VmSwitchRequest request, CancellationToken cancellationToken)
@@ -406,13 +476,36 @@ public sealed class VmSwitchService : IVmSwitchService
 
         while (true)
         {
-            var status = await _guestWorkerClient.GetRunnerStatusAsync(vm, cancellationToken).ConfigureAwait(false);
+            RunnerStatusResponse status;
+            try
+            {
+                status = await _guestWorkerClient.GetRunnerStatusAsync(vm, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                _logger.LogDebug(exception, "Runner is not reachable while VM is booting. VmName={VmName}", vm.Name);
+                if (DateTimeOffset.UtcNow >= deadline)
+                {
+                    return (
+                        new RunnerStatusResponse { Success = false, RunnerStatusCode = RunnerStatusCode.Offline },
+                        new WorkerReadyEvaluation(WorkerReadyEvaluationKind.Error, ErrorCodes.VmReadyTimeout));
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false);
+                continue;
+            }
             var evaluation = WorkerStateEvaluator.EvaluateReadyAfterVmStart(status.RunnerStatusCode);
             _logger.LogInformation(
                 "runner 就绪轮询结果。VmName={VmName}, RunnerStatusCode={RunnerStatusCode}, Evaluation={Evaluation}",
                 vm.Name,
                 status.RunnerStatusCode,
                 evaluation.Kind);
+
+            if (status.RunnerStatusCode == RunnerStatusCode.Offline && DateTimeOffset.UtcNow < deadline)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false);
+                continue;
+            }
 
             if (evaluation.Kind != WorkerReadyEvaluationKind.Wait)
             {
@@ -432,6 +525,26 @@ public sealed class VmSwitchService : IVmSwitchService
     {
         return string.Equals(readyStatus.WorkerId, request.Vm.WorkerId, StringComparison.OrdinalIgnoreCase)
             && string.Equals(readyStatus.ProfileId, request.TargetProfileId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<VmSwitchResult> SkipAsync(
+        SwitchTransaction tx,
+        string reasonCode,
+        string message,
+        string step,
+        DateTimeOffset timestamp,
+        CancellationToken cancellationToken)
+    {
+        await UpdateAsync(tx, SwitchTransactionStatus.SUCCESS, step, reasonCode, message, timestamp, cancellationToken);
+        _logger.LogInformation("Snapshot switch skipped after precheck handling. TxId={TxId}, VmName={VmName}, ReasonCode={ReasonCode}", tx.TransactionId, tx.VmName, reasonCode);
+        return new VmSwitchResult
+        {
+            TxId = tx.TransactionId,
+            Success = true,
+            Skipped = true,
+            ErrorCode = reasonCode,
+            ErrorMessage = message
+        };
     }
 
     private async Task<VmSwitchResult> FailAsync(

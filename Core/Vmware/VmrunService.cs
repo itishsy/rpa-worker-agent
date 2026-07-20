@@ -412,7 +412,7 @@ public sealed class VmrunService : IVmrunService
     {
         var started = Stopwatch.GetTimestamp();
         _logger.LogInformation(
-            "VMware command started. Command={Command}, Arguments={Arguments}, TimeoutSeconds={TimeoutSeconds}",
+            "执行VM操作. Command={Command}, Arguments={Arguments}, TimeoutSeconds={TimeoutSeconds}",
             command.CommandName,
             SanitizeArguments(arguments),
             command.Timeout.TotalSeconds);
@@ -424,7 +424,7 @@ public sealed class VmrunService : IVmrunService
             if (result.ExitCode == 0)
             {
                 _logger.LogInformation(
-                    "VMware command completed. Command={Command}, ExitCode={ExitCode}, ElapsedMs={ElapsedMs}, Stdout={Stdout}, Stderr={Stderr}",
+                    "VM操作成功. Command={Command}, ExitCode={ExitCode}, ElapsedMs={ElapsedMs}, Stdout={Stdout}, Stderr={Stderr}",
                     command.CommandName,
                     result.ExitCode,
                     elapsedMs,
@@ -434,7 +434,7 @@ public sealed class VmrunService : IVmrunService
             else
             {
                 _logger.LogWarning(
-                    "VMware command failed. Command={Command}, ExitCode={ExitCode}, ElapsedMs={ElapsedMs}, Stdout={Stdout}, Stderr={Stderr}",
+                    "VM操作失败. Command={Command}, ExitCode={ExitCode}, ElapsedMs={ElapsedMs}, Stdout={Stdout}, Stderr={Stderr}",
                     command.CommandName,
                     result.ExitCode,
                     elapsedMs,
@@ -448,7 +448,7 @@ public sealed class VmrunService : IVmrunService
         {
             _logger.LogError(
                 exception,
-                "VMware command threw exception. Command={Command}, ElapsedMs={ElapsedMs}",
+                "VM操作错误. Command={Command}, ElapsedMs={ElapsedMs}",
                 command.CommandName,
                 Stopwatch.GetElapsedTime(started).TotalMilliseconds);
             throw;

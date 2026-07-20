@@ -1,9 +1,10 @@
 using Microsoft.Data.Sqlite;
 using Seebot.WorkerAgent.Core.Domain;
+using Seebot.WorkerAgent.Core.Coordination;
 
 namespace Seebot.WorkerAgent.Core.Storage;
 
-public sealed class LocalStore : ILocalStore
+public sealed class LocalStore : ILocalStore, IVmOperationStore
 {
     private readonly string _connectionString;
 
@@ -65,7 +66,129 @@ CREATE TABLE IF NOT EXISTS local_switch_transaction (
     UNIQUE(tx_id)
 );
 """, cancellationToken);
+
+        await ExecuteNonQueryAsync(connection, """
+CREATE TABLE IF NOT EXISTS local_vm_operation (
+    host_id TEXT NOT NULL,
+    vm_name TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    operation_type TEXT NOT NULL,
+    operation_status TEXT NOT NULL,
+    owner_instance_id TEXT NOT NULL,
+    fencing_token INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    error_code TEXT,
+    error_message TEXT,
+    PRIMARY KEY(host_id, vm_name)
+);
+CREATE INDEX IF NOT EXISTS ix_local_vm_operation_lease ON local_vm_operation(lease_expires_at);
+
+CREATE TABLE IF NOT EXISTS local_vm_recovery_state (
+    host_id TEXT NOT NULL,
+    vm_name TEXT NOT NULL,
+    window_started_at TEXT NOT NULL,
+    power_cycle_count INTEGER NOT NULL,
+    last_power_cycle_at TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    cooldown_until TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(host_id, vm_name)
+);
+""", cancellationToken);
     }
+
+    public async Task<VmOperationHandle?> TryAcquireAsync(string hostId, string vmName, string operationId,
+        VmOperationType type, string ownerInstanceId, DateTimeOffset now, TimeSpan leaseDuration,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = CreateConnection(); await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+INSERT INTO local_vm_operation(host_id, vm_name, operation_id, operation_type, operation_status,
+ owner_instance_id, fencing_token, started_at, updated_at, lease_expires_at, error_code, error_message)
+VALUES($host, $vm, $id, $type, $status, $owner, 1, $now, $now, $expires, NULL, NULL)
+ON CONFLICT(host_id, vm_name) DO UPDATE SET
+ operation_id=excluded.operation_id, operation_type=excluded.operation_type,
+ operation_status=excluded.operation_status, owner_instance_id=excluded.owner_instance_id,
+ fencing_token=local_vm_operation.fencing_token + 1, started_at=excluded.started_at,
+ updated_at=excluded.updated_at, lease_expires_at=excluded.lease_expires_at,
+ error_code=NULL, error_message=NULL
+WHERE local_vm_operation.operation_status IN ('Success','Failed') OR local_vm_operation.lease_expires_at <= $now
+RETURNING fencing_token;
+""";
+        Add(command, "$host", hostId); Add(command, "$vm", vmName); Add(command, "$id", operationId);
+        Add(command, "$type", type.ToString()); Add(command, "$status", VmOperationStatus.Acquiring.ToString());
+        Add(command, "$owner", ownerInstanceId); Add(command, "$now", Format(now)); Add(command, "$expires", Format(now + leaseDuration));
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        return result is null or DBNull ? null : new VmOperationHandle(hostId, vmName, operationId, type, Convert.ToInt64(result), now + leaseDuration);
+    }
+
+    public async Task<bool> RenewAsync(VmOperationHandle handle, string ownerInstanceId, DateTimeOffset now,
+        TimeSpan leaseDuration, CancellationToken cancellationToken)
+    {
+        await using var connection = CreateConnection(); await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE local_vm_operation SET updated_at=$now, lease_expires_at=$expires " +
+            "WHERE host_id=$host AND vm_name=$vm AND operation_id=$id AND owner_instance_id=$owner " +
+            "AND fencing_token=$token AND operation_status NOT IN ('Success','Failed');";
+        BindHandle(command, handle); Add(command, "$owner", ownerInstanceId); Add(command, "$now", Format(now)); Add(command, "$expires", Format(now + leaseDuration));
+        return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
+    }
+
+    public async Task<bool> UpdateAsync(VmOperationHandle handle, VmOperationStatus status, string? errorCode,
+        string? errorMessage, DateTimeOffset now, TimeSpan leaseDuration, CancellationToken cancellationToken)
+    {
+        await using var connection = CreateConnection(); await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE local_vm_operation SET operation_status=$status, updated_at=$now, " +
+            "lease_expires_at=$expires, error_code=$code, error_message=$message " +
+            "WHERE host_id=$host AND vm_name=$vm AND operation_id=$id AND fencing_token=$token;";
+        BindHandle(command, handle); Add(command, "$status", status.ToString()); Add(command, "$now", Format(now));
+        Add(command, "$expires", Format(now + leaseDuration)); Add(command, "$code", errorCode); Add(command, "$message", errorMessage);
+        return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
+    }
+
+    public async Task<bool> TryReservePowerCycleAsync(string hostId, string vmName, DateTimeOffset now,
+        TimeSpan window, int maximum, TimeSpan cooldown, CancellationToken cancellationToken)
+    {
+        await using var connection = CreateConnection(); await connection.OpenAsync(cancellationToken);
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        await using var read = connection.CreateCommand(); read.Transaction = transaction;
+        read.CommandText = "SELECT window_started_at,power_cycle_count,cooldown_until FROM local_vm_recovery_state WHERE host_id=$host AND vm_name=$vm;";
+        Add(read, "$host", hostId); Add(read, "$vm", vmName);
+        DateTimeOffset windowStart = now; var count = 0; DateTimeOffset? cooldownUntil = null;
+        await using (var reader = await read.ExecuteReaderAsync(cancellationToken))
+        { if (await reader.ReadAsync(cancellationToken)) { windowStart = DateTimeOffset.Parse(reader.GetString(0)); count = reader.GetInt32(1); cooldownUntil = ReadNullableDateTimeOffset(reader, 2); } }
+        if (cooldownUntil > now || (now - windowStart < window && count >= maximum)) { await transaction.RollbackAsync(cancellationToken); return false; }
+        if (now - windowStart >= window) { windowStart = now; count = 0; }
+        await using var write = connection.CreateCommand(); write.Transaction = transaction;
+        write.CommandText = "INSERT INTO local_vm_recovery_state(host_id,vm_name,window_started_at,power_cycle_count,last_power_cycle_at,consecutive_failures,cooldown_until,updated_at) " +
+            "VALUES($host,$vm,$window,1,$now,0,$cooldown,$now) " +
+            "ON CONFLICT(host_id,vm_name) DO UPDATE SET window_started_at=$window,power_cycle_count=$count,last_power_cycle_at=$now,cooldown_until=$cooldown,updated_at=$now;";
+        Add(write, "$host", hostId); Add(write, "$vm", vmName); Add(write, "$window", Format(windowStart)); Add(write, "$count", count + 1);
+        Add(write, "$now", Format(now)); Add(write, "$cooldown", cooldown > TimeSpan.Zero ? Format(now + cooldown) : null);
+        await write.ExecuteNonQueryAsync(cancellationToken); await transaction.CommitAsync(cancellationToken); return true;
+    }
+
+    public async Task RecordRecoveryResultAsync(string hostId, string vmName, bool success, DateTimeOffset now,
+        int maximumConsecutiveFailures, TimeSpan failureCooldown, CancellationToken cancellationToken)
+    {
+        await using var connection = CreateConnection(); await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = success
+            ? "UPDATE local_vm_recovery_state SET consecutive_failures=0,updated_at=$now WHERE host_id=$host AND vm_name=$vm;"
+            : "UPDATE local_vm_recovery_state SET consecutive_failures=consecutive_failures+1, " +
+              "cooldown_until=CASE WHEN consecutive_failures+1 >= $max THEN $cooldown ELSE cooldown_until END,updated_at=$now " +
+              "WHERE host_id=$host AND vm_name=$vm;";
+        Add(command, "$host", hostId); Add(command, "$vm", vmName); Add(command, "$now", Format(now));
+        Add(command, "$max", maximumConsecutiveFailures); Add(command, "$cooldown", Format(now + failureCooldown));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static void BindHandle(SqliteCommand command, VmOperationHandle handle)
+    { Add(command, "$host", handle.HostId); Add(command, "$vm", handle.VmName); Add(command, "$id", handle.OperationId); Add(command, "$token", handle.FencingToken); }
 
     public async Task SeedVmStatesAsync(string hostId, IReadOnlyList<VmCurrentState> initialStates, CancellationToken cancellationToken = default)
     {

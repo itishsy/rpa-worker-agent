@@ -32,7 +32,7 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
     {
         var url = await BuildRunnerUrlAsync(vm, RunnerStatusPath, "GetRunnerStatus", cancellationToken);
         var started = Stopwatch.GetTimestamp();
-        _logger.LogInformation("Runner status request started. VmName={VmName}, WorkerId={WorkerId}, Url={Url}", vm.Name, vm.WorkerId, url);
+        _logger.LogInformation("执行器状态检查. VmName={VmName}, WorkerId={WorkerId}, Url={Url}", vm.Name, vm.WorkerId, url);
 
         try
         {
@@ -49,7 +49,7 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
                 RunnerStatusCode = statusCode
             };
             _logger.LogInformation(
-                "Runner status request completed. VmName={VmName}, StatusCode={StatusCode}, RunnerStatusCode={RunnerStatusCode}, ElapsedMs={ElapsedMs}",
+                "执行器状态检查成功. VmName={VmName}, StatusCode={StatusCode}, RunnerStatusCode={RunnerStatusCode}, ElapsedMs={ElapsedMs}",
                 vm.Name,
                 (int)response.StatusCode,
                 runnerStatus.RunnerStatusCode,
@@ -64,9 +64,10 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
         {
             _logger.LogWarning(
                 exception,
-                "Runner status request failed. VmName={VmName}, ElapsedMs={ElapsedMs}",
+                "执行器状态检查失败. VmName={VmName}, ElapsedMs={ElapsedMs}, Reason={Reason}",
                 vm.Name,
-                Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+                Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+                exception.Message);
             throw new GuestWorkerClientException("GetRunnerStatus", url, exception.Message, exception);
         }
     }
@@ -81,7 +82,7 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
         var url = await BuildRunnerUrlAsync(vm, RunnerKillPath, "KillRunner", cancellationToken);
         var started = Stopwatch.GetTimestamp();
         _logger.LogInformation(
-            "Runner kill request started. VmName={VmName}, WorkerId={WorkerId}, TxId={TxId}, Reason={Reason}, DeadlineSeconds={DeadlineSeconds}, Url={Url}",
+            "执行器终止. VmName={VmName}, WorkerId={WorkerId}, TxId={TxId}, Reason={Reason}, DeadlineSeconds={DeadlineSeconds}, Url={Url}",
             vm.Name,
             vm.WorkerId,
             txId,
@@ -109,7 +110,7 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
                 Message = result.Data == 0 ? result.Message : $"Kill runner failed, data={result.Data}"
             };
             _logger.LogInformation(
-                "Runner kill request completed. VmName={VmName}, TxId={TxId}, Success={Success}, Data={Data}, ErrorCode={ErrorCode}, ElapsedMs={ElapsedMs}",
+                "执行器终止成功. VmName={VmName}, TxId={TxId}, Success={Success}, Data={Data}, ErrorCode={ErrorCode}, ElapsedMs={ElapsedMs}",
                 vm.Name,
                 txId,
                 killResult.Success,
@@ -117,7 +118,8 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
                 killResult.ErrorCode,
                 Stopwatch.GetElapsedTime(started).TotalMilliseconds);
 
-            await ForceKillGuestProcessesAsync(vm, cancellationToken);
+            // 暂停强杀exe进程
+            //await ForceKillGuestProcessesAsync(vm, cancellationToken);
 
             return killResult;
         }
@@ -129,7 +131,7 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
         {
             _logger.LogWarning(
                 exception,
-                "Runner kill request failed. VmName={VmName}, TxId={TxId}, ElapsedMs={ElapsedMs}",
+                "执行器终止失败. VmName={VmName}, TxId={TxId}, ElapsedMs={ElapsedMs}",
                 vm.Name,
                 txId,
                 Stopwatch.GetElapsedTime(started).TotalMilliseconds);
@@ -180,9 +182,9 @@ public sealed class GuestWorkerClient : IGuestWorkerClient
     {
         try
         {
-            _logger.LogInformation("Resolving guest IP address started. VmName={VmName}, VmxPath={VmxPath}, Operation={Operation}", vm.Name, vm.VmxPath, operationName);
+            _logger.LogDebug("Resolving guest IP address started. VmName={VmName}, VmxPath={VmxPath}, Operation={Operation}", vm.Name, vm.VmxPath, operationName);
             var ipAddress = await _vmrunService.GetGuestIPAddressAsync(vm.VmxPath, cancellationToken);
-            _logger.LogInformation("Resolving guest IP address completed. VmName={VmName}, IpAddress={IpAddress}, Operation={Operation}", vm.Name, ipAddress, operationName);
+            _logger.LogDebug("Resolving guest IP address completed. VmName={VmName}, IpAddress={IpAddress}, Operation={Operation}", vm.Name, ipAddress, operationName);
             return $"http://{ipAddress}:{RunnerControlPort}/{path}";
         }
         catch (Exception exception) when (exception is not OperationCanceledException)

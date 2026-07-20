@@ -5,6 +5,7 @@ using Seebot.WorkerAgent.Core.Storage;
 using Seebot.WorkerAgent.Core.Vmware;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Seebot.WorkerAgent.Core.Coordination;
 
 namespace Seebot.WorkerAgent.Core.Snapshot;
 
@@ -28,6 +29,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
     private readonly int _runnerStatusCheckMaxAttempts;
     private readonly ILogger<SnapshotUpdateService> _logger;
     private readonly TimeSpan _vmStoppedPollInterval;
+    private readonly IVmOperationCoordinator? _operationCoordinator;
 
     public SnapshotUpdateService(
         IVmrunService vmrunService,
@@ -42,7 +44,8 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         TimeSpan? runnerStatusCheckInterval = null,
         int? runnerStatusCheckMaxAttempts = null,
         TimeSpan? vmStoppedPollInterval = null,
-        IGuestTokenProvisioningService? guestTokenProvisioningService = null)
+        IGuestTokenProvisioningService? guestTokenProvisioningService = null,
+        IVmOperationCoordinator? operationCoordinator = null)
     {
         _vmrunService = vmrunService;
         _guestWorkerClient = guestWorkerClient;
@@ -57,9 +60,35 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         _runnerStatusCheckMaxAttempts = runnerStatusCheckMaxAttempts.GetValueOrDefault(DefaultRunnerStatusCheckMaxAttempts);
         _logger = logger ?? NullLogger<SnapshotUpdateService>.Instance;
         _vmStoppedPollInterval = vmStoppedPollInterval ?? DefaultVmStoppedPollInterval;
+        _operationCoordinator = operationCoordinator;
     }
 
     public async Task<SnapshotUpdateResult> UpdateSnapshotAsync(
+        string vmName,
+        string profileId,
+        CancellationToken cancellationToken)
+    {
+        if (_operationCoordinator is null)
+            return await UpdateSnapshotCoreAsync(vmName, profileId, cancellationToken).ConfigureAwait(false);
+        await using var operation = await _operationCoordinator.TryAcquireAsync(
+            _options.Agent.HostId, vmName, VmOperationType.SnapshotUpdate, cancellationToken).ConfigureAwait(false);
+        if (operation is null)
+            return Fail("VM_OPERATION_BUSY", "Another VM operation is in progress.", "acquire-operation-lease");
+        try
+        {
+            var result = await UpdateSnapshotCoreAsync(vmName, profileId, cancellationToken).ConfigureAwait(false);
+            if (result.Success) await operation.CompleteAsync(cancellationToken).ConfigureAwait(false);
+            else await operation.FailAsync(result.ErrorCode ?? "SNAPSHOT_UPDATE_FAILED", result.ErrorMessage ?? "Snapshot update failed.", cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            await operation.FailAsync("SNAPSHOT_UPDATE_UNHANDLED", exception.Message, CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private async Task<SnapshotUpdateResult> UpdateSnapshotCoreAsync(
         string vmName,
         string profileId,
         CancellationToken cancellationToken)

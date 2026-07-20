@@ -165,6 +165,16 @@ if ([string]::IsNullOrWhiteSpace($ServiceUser)) {
     $ServiceUser = "LocalSystem"
 }
 
+if ($ServiceUser.StartsWith(".\", [StringComparison]::Ordinal)) {
+    $localUserName = $ServiceUser.Substring(2)
+    if ([string]::IsNullOrWhiteSpace($localUserName)) {
+        Write-Host "ERROR: Local Windows account name cannot be empty." -ForegroundColor Red
+        exit 1
+    }
+
+    $ServiceUser = "$env:COMPUTERNAME\$localUserName"
+}
+
 $useLocalSystem = $ServiceUser -eq "LocalSystem" -or $ServiceUser -eq "NT AUTHORITY\SYSTEM"
 if ($useLocalSystem) {
     $ServiceUser = "LocalSystem"

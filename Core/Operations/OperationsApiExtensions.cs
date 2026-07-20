@@ -223,6 +223,15 @@ public static class OperationsApiExtensions
                 : Results.UnprocessableEntity(result);
         });
 
+        group.MapPost("/vms/{vmName}/power-on", async (
+            string vmName,
+            IVmPowerOnService powerOnService,
+            CancellationToken cancellationToken) =>
+        {
+            var result = await powerOnService.PowerOnAsync(vmName, cancellationToken).ConfigureAwait(false);
+            return result.Success ? Results.Ok(result) : Results.UnprocessableEntity(result);
+        });
+
         group.MapPost("/snapshots/{vmName}/{profileId}/switch", async (
             string vmName,
             string profileId,
@@ -249,6 +258,7 @@ public static class OperationsApiExtensions
                 return Results.NotFound(new { success = false, errorCode = ErrorCodes.ProfileNotFound, errorMessage = $"Profile '{profileId}' not found in VM '{vmName}'." });
             }
 
+            await using var vmLock = await vmOperationLock.AcquireAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
             IReadOnlyList<string> snapshots;
             try
             {
@@ -270,7 +280,6 @@ public static class OperationsApiExtensions
 
             var states = await localStore.GetVmStatesAsync(options.Agent.HostId, cancellationToken).ConfigureAwait(false);
             var state = states.FirstOrDefault(s => string.Equals(s.VmName, vm.Name, StringComparison.OrdinalIgnoreCase));
-            await using var vmLock = await vmOperationLock.AcquireAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
             var result = await switchService.SwitchAsync(new VmSwitchRequest
             {
                 HostId = options.Agent.HostId,
@@ -434,8 +443,9 @@ public static class OperationsApiExtensions
           <label><input name="enabled" type="checkbox" checked style="width:auto"> Enabled</label>
           <div class="row">
             <button class="primary" type="submit">Save VM</button>
-            <button type="button" id="updateVmSnapshotsBtn" onclick="updateVmSnapshots()">Upgrade Snapshots</button>
-            <button type="button" id="updateInitBtn" onclick="updateInitWorkerId()">Rename WorkerId</button>
+            <button type="button" id="powerOnVmBtn" onclick="powerOnVm()">开启</button>
+            <button type="button" id="updateVmSnapshotsBtn" onclick="updateVmSnapshots()">升级快照</button>
+            <button type="button" id="updateInitBtn" onclick="updateInitWorkerId()">更新机器码</button>
             <button type="button" onclick="clearVmForm()">Clear</button>
           </div>
         </form>
@@ -451,8 +461,8 @@ public static class OperationsApiExtensions
           <label>Snapshot Name</label><input name="snapshotName">
           <div class="row">
             <button class="primary" type="submit">Save Profile</button>
-            <button type="button" onclick="switchSelectedSnapshot()">Switch Snapshot</button>
-            <button type="button" onclick="updateSelectedSnapshot()">Upgrade Snapshot</button>
+            <button type="button" onclick="switchSelectedSnapshot()">切换</button>
+            <button type="button" onclick="updateSelectedSnapshot()">升级</button>
             <button type="button" onclick="clearProfileForm()">Clear</button>
           </div>
         </form>
@@ -622,7 +632,27 @@ public static class OperationsApiExtensions
       } catch (err) {
         status(`Update failed: ${err.message}`);
       } finally {
-        if (btn) { btn.disabled = false; btn.textContent = 'Rename WorkerId'; }
+        if (btn) { btn.disabled = false; btn.textContent = '更新机器码'; }
+      }
+    }
+
+    async function powerOnVm() {
+      const form = document.getElementById('vmForm');
+      const vmName = form.elements.name?.value || selectedVmName || '';
+      if (!vmName) { status('Please save or select a VM first.'); return; }
+      if (!confirm(`Power on or recover VM "${vmName}"?`)) return;
+
+      const btn = document.getElementById('powerOnVmBtn');
+      if (btn) { btn.disabled = true; btn.textContent = 'Processing...'; }
+      status(`Checking VM "${vmName}"...`);
+      try {
+        const result = await request(`/vms/${encodeURIComponent(vmName)}/power-on`, { method: 'POST' });
+        status(result.message || `VM action completed: ${result.action}`);
+        await load();
+      } catch (err) {
+        status(`Power-on failed: ${err.message}`);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '开启'; }
       }
     }
 
@@ -663,7 +693,7 @@ public static class OperationsApiExtensions
         status(`Snapshot updates completed for "${vmName}". Success: ${successCount}/${profiles.length}.` + (lines.length ? '\n' + lines.join('\n') : ''));
         await load();
       } finally {
-        if (btn) { btn.disabled = false; btn.textContent = 'Upgrade Snapshots'; }
+        if (btn) { btn.disabled = false; btn.textContent = '升级快照'; }
       }
     }
 

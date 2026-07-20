@@ -1,178 +1,189 @@
-# Profile 切换完整流程
+# Profile 快照切换流程
 
-## 概述
+## 1. 目标
 
-Profile 切换是 RPA Worker Agent 的核心调度行为。当云端后台存在待执行任务时，Agent 会选择合适的空闲 VM，将其从当前 profile 的快照切换到目标 profile 的快照，使 VM 内的 Runner 可以承接对应 profile 的任务。
+将指定 VM 切换到目标 Profile 快照，同时保证：
 
----
+- 只有 Runner 正常且空闲时才执行快照切换；
+- VM 或 Runner 异常时，本次只执行恢复，不继续切换；
+- VM 必须确认关机后才能恢复快照；
+- VM 开机后先写入调度 Token，再确认 Runner 状态；
+- 手动切换、自动切换和快照升级不能并发操作同一 VM。
 
-## 一、触发：调度轮询循环
+核心实现：
 
-`WorkerAgent`（`BackgroundService`）每隔 `Agent.PollIntervalSeconds`（默认 30s）调用一次 `PoolSchedulerService.RunOneCycleAsync`。
-
-```
-WorkerAgent.ExecuteAsync
-  └─ 每 PollIntervalSeconds 调用
-       └─ PoolSchedulerService.RunOneCycleAsync
-```
-
----
-
-## 二、调度周期（RunOneCycleAsync）
-
-### 2.1 获取待切换 Profile 列表
-
-对配置的每个 VM，取其 `WorkerId` 调用云端接口：
-
-```
-GET /robot/client/task/findTaskByWorkerId/{workerId}
-→ IReadOnlyList<ProfilePendingTaskResponse>
+```text
+Core/Switching/VmSwitchService.cs
+Core/Scheduling/PoolSchedulerService.cs
+Core/Operations/OperationsApiExtensions.cs
+Core/Operations/VmPowerOnService.cs
+Core/Snapshot/SnapshotUpdateService.cs
+Core/Coordination/VmOperationCoordinator.cs
+Core/Storage/LocalStore.cs
 ```
 
-返回值已由云端按优先级排序，字段含义：
+`VmPowerOnService.cs` 内分为两层：
 
-| 字段 | 说明 |
-|------|------|
-| `ProfileId` | 目标 profile |
-| `HasTask` | 是否有待执行任务 |
-| `Priority` | 优先级（越大越优先） |
-| `OldestQueuedAt` | 最早入队时间 |
-| `FirstTaskId` | 队列中第一个任务 ID |
+- `IVmPowerRecoveryService`：无锁的统一开机/蓝屏恢复核心，由页面 API 和快照切换共同调用；
+- `IVmPowerOnService`：页面 API 编排层，负责查找 VM、获取 `IVmOperationLock` 和 `ManualPowerOn` 租约。
 
-多个 VM 的结果合并为一个列表，即为本轮 `targetProfiles`。
+快照切换已经持有 `ProfileSwitch` 租约，因此直接调用恢复核心，不会嵌套申请 `ManualPowerOn` 租约。
 
-### 2.2 加载 VM 状态 & 上报
+## 2. 完整流程
 
-从 SQLite（`local_vm_state`）读取所有 VM 的当前状态，同时向云端上报每台 VM 的最新状态（`ReportVmStatusAsync`）。
-
-### 2.3 候选 VM 筛选（FindCandidate）
-
-对 `targetProfiles` 中的每个目标 profile，遍历配置中的所有 VM，按以下条件过滤：
-
-| 检查项 | 不满足时的处理 |
-|--------|--------------|
-| VM 配置中包含该 `profileId` 对应的快照 | 跳过此 VM |
-| VM 当前 profile 不等于目标 profile | 跳过（已是目标，无需切换）|
-| VM 未被隔离（`IsQuarantined = false`）| 拒绝：`WORKER_QUARANTINED` |
-| 无进行中的切换事务（`HasActiveSwitchTransaction = false`）| 拒绝：`VM_NOT_IDLE` |
-| Runner 状态为 `Runnable` | 拒绝：`VM_NOT_IDLE` |
-| VM 当前 profile 不在本轮 targetProfiles 中（无待执行任务）| 拒绝：`VM_NOT_IDLE` |
-| 空闲时长 ≥ `Agent.IdleStableSeconds` | 拒绝：`VM_NOT_IDLE` |
-
-找到第一个通过全部条件的 VM 即为切换候选，**每个 cycle 只触发一次切换**。
-
----
-
-## 三、切换执行（VmSwitchService.SwitchAsync）
-
-切换是一个有状态的事务，每步完成后均写入 SQLite（`local_switch_transaction`），状态流转如下：
-
-```
-CREATED
-  │
-  ├─ 查询 Runner 状态（GET :9090/status）
-  │     Running   → FAILED / WORKER_RUNNING
-  │     Upgrading → FAILED / WORKER_UPGRADING
-  │
-  ├─ Kill Runner（POST :9090/kill，deadline=30s）
-  │     失败              → FAILED / EXECUTOR_STOP_FAILED
-  │     Kill 后仍有任务   → FAILED / EXECUTOR_STOP_FAILED
-  │
-STOP_RUNNER_DONE
-  │
-  ├─ 备份 VM 日志目录（cache / db / file / logs）
-  │     → {HostWorkPath}/{VmName}/{timestamp}/
-  │     失败且 ForceRevertWhenBackupFailed=false → FAILED / LOG_BACKUP_FAILED
-  │
-LOG_BACKUP_DONE
-  │
-  ├─ vmrun stop（soft 停机）
-  │     异常 → VmState 置 ERROR + FAILED / VM_STOP_FAILED
-  │
-VM_STOP_DONE
-  │
-  ├─ vmrun revertToSnapshot {TargetSnapshotName}
-  │     异常 → VmState 置 ERROR + FAILED / SNAPSHOT_REVERT_FAILED
-  │
-SNAPSHOT_REVERT_DONE
-  │
-  ├─ vmrun start nogui
-  │     异常 → VmState 置 ERROR + FAILED / VM_START_FAILED
-  │
-VM_START_DONE
-  │
-  ├─ 轮询等待 Runner 就绪（每 3s 查询一次）
-  │     超时（WaitVmReadyTimeoutSeconds，默认 120s）→ FAILED / VM_READY_TIMEOUT
-  │     状态为 Error 类（Closed / RobotError 等）   → FAILED / 对应 ErrorCode
-  │     状态为 Runnable 或 Running                  → 继续
-  │
-  ├─ 校验 workerId / profileId 与预期一致
-  │     不匹配 → FAILED / WORKER_PROFILE_MISMATCH
-  │
-WORKER_READY_DONE
-  │
-SUCCESS
+```text
+取得 VM 进程锁
+  -> 取得持久化 ProfileSwitch 租约
+  -> 创建切换事务
+  -> 检查 VM 电源和 Runner
+       ├─ VM 已关机：启动 VM + Runner 恢复响应 -> 跳过本次切换
+       ├─ Runner 短探测失败：硬关机 + 启动 VM + Runner 恢复响应 -> 跳过本次切换
+       ├─ Runner 非正常闲时：直接跳过本次切换
+       └─ Runner Runnable 且 currentTaskId 为空：继续
+  -> 停止 Runner
+  -> 备份 Guest 数据
+  -> VM 软关机并确认停止
+       └─ 配置允许时，软关机超时后执行硬关机并再次确认
+  -> 等待 VMware 文件锁释放
+  -> 恢复目标快照（瞬时失败最多重试 3 次）
+  -> 启动 VM
+  -> 等待 VMware Tools 可执行 Guest 操作并写入 Token
+  -> 等待 Runner 正常
+  -> 校验 workerId 和 profileId
+  -> 更新本地状态及快照注册信息
+  -> 完成切换事务
 ```
 
-### 关键说明
+## 3. 前置检查与跳过语义
 
-**VM 级错误与普通失败的区别**
+### 3.1 VM 处于关机状态
 
-`VM_STOP_FAILED`、`SNAPSHOT_REVERT_FAILED`、`VM_START_FAILED` 这三种错误发生时，除写入事务状态外，还会将 `local_vm_state` 中该 VM 的 `VmStatus` 置为 `ERROR`。这会导致后续所有调度周期的候选筛选均拒绝该 VM（`Runner 状态非 Runnable`），直到人工干预恢复。
+统一恢复服务调用 `vmrun start`，先通过 `vmrun list` 确认 VM 已进入运行状态，再等待 Runner 在 `ManualPowerOnRunnerReadyTimeoutSeconds` 内恢复响应。两项都成功后结束本次切换，不停止 Runner、不备份、不恢复快照。
 
-**备份失败的强制继续**
+如果 VMware 电源状态已运行但 Runner 未恢复，返回 `VM_RUNNER_READY_TIMEOUT`，本次切换失败，不会错误地返回“开机成功”。
 
-当 `Agent.ForceRevertWhenBackupFailed = true` 时，备份失败不会中止切换，会以 `LOG_BACKUP_FAILED_BUT_FORCE_REVERT` 记录警告并继续执行后续步骤。
+返回结果：
 
-**Runner 状态的轮询语义**
-
-VM 启动后 Runner 可能处于初始化中（`New`）或升级中（`Upgrading`），这两种状态触发等待而非失败。其余状态的处理：
-
-| RunnerStatusCode | EvaluateReadyAfterVmStart 结果 |
-|------------------|-------------------------------|
-| `Runnable` / `Running` | Ready → 成功 |
-| `New` / `Upgrading` | Wait → 继续轮询 |
-| `Closed` | Error / RUNNER_CLOSED |
-| `RobotError` | Error / ROBOT_ERROR |
-| `ClientError` | Error / CLIENT_ERROR |
-| `UpgradeFailed` | Error / UPGRADE_FAILED |
-| `Offline` | Error / WORKER_OFFLINE |
-
----
-
-## 四、完整数据流
-
-```
-云端后台
-  │  GET /robot/client/task/findTaskByWorkerId/{workerId}
-  │  → [ProfilePendingTaskResponse]（已按优先级排序）
-  ↓
-PoolSchedulerService
-  │  FindCandidate → (VirtualMachineOptions, VmCurrentState, ProfileOptions)
-  │  构造 VmSwitchRequest:
-  │    HostId, Vm, FromProfileId, FromSnapshotName,
-  │    TargetProfileId, TargetSnapshotName, FirstTaskId
-  ↓
-VmSwitchService
-  ├─ GuestWorkerClient  → HTTP :9090  （status / kill）
-  ├─ LogBackupService   → 主机文件系统备份
-  ├─ VmrunService       → vmrun.exe stop / revertToSnapshot / start
-  └─ GuestWorkerClient  → HTTP :9090  （轮询 status 直到 Runnable/Running）
-  ↓
-LocalStore（SQLite）
-  ├─ local_switch_transaction  记录每步状态流转
-  └─ local_vm_state            VM 级错误时置 ERROR
+```json
+{
+  "success": true,
+  "skipped": true,
+  "errorCode": "SWITCH_SKIPPED_VM_STARTED"
+}
 ```
 
----
+### 3.2 Runner 无法请求
 
-## 五、配置项速查
+切换前置步骤与页面“开机”按钮统一调用 `IVmPowerRecoveryService.EnsureOperationalAsync`。Runner/Guest-IP 探测使用 `ManualPowerOnRunnerProbeTimeoutSeconds` 短超时；请求失败或超时后执行硬关机加开机。重启受持久化重启预算和冷却时间保护。
 
-| 配置路径 | 说明 | 默认值 |
-|---------|------|--------|
-| `Agent.PollIntervalSeconds` | 调度轮询间隔 | 30s |
-| `Agent.IdleStableSeconds` | VM 进入可切换状态所需最小空闲时长 | 需配置 |
-| `Agent.WaitVmReadyTimeoutSeconds` | VM 启动后等待 Runner 就绪的最大时长 | 120s |
-| `Agent.ForceRevertWhenBackupFailed` | 备份失败时是否强制继续切换 | `false` |
-| `Agent.MaxSwitchesPerCycle` | 每个调度周期最多触发的切换次数 | 1 |
-| `VirtualMachines[].Profiles[].SnapshotName` | 该 profile 对应的快照名称 | 需配置 |
+硬关机最多执行两次，每次都通过 `vmrun list` 确认停止；启动最多执行 `ManualPowerOnStartMaxAttempts` 次。启动后还必须等待 Runner 恢复响应，才返回 `Restarted`。随后结束本次切换，不继续恢复快照。
+
+返回 `SWITCH_SKIPPED_VM_RESTARTED`。
+
+### 3.3 Runner 非正常闲时
+
+只有同时满足以下条件才可继续：
+
+```text
+status 请求成功
+RunnerStatusCode == Runnable
+currentTaskId == null
+```
+
+Running、Upgrading、Closed、Offline、错误状态或仍有任务时均直接跳过，返回 `SWITCH_SKIPPED_RUNNER_NOT_IDLE`，且不会调用停止 Runner、备份或任何 VM 电源操作。
+
+`Skipped` 是已正确处理的非切换结果，因此 `Success=true`；自动调度会将其视为 `SwitchStarted=false`，不会误报切换完成。
+
+## 4. 正常切换
+
+### 4.1 停止 Runner 和备份
+
+调用 Runner kill 接口。kill 失败或返回 `currentTaskId` 时终止流程。随后备份配置的 Guest 目录；备份失败时，除非明确启用 `ForceRevertWhenBackupFailed`，否则不关机、不恢复快照。
+
+### 4.2 确认 VM 关机
+
+调用软关机后持续通过 `vmrun list` 判断 VM 是否仍运行。只有确认停止后才允许恢复快照。若启用 `Vmrun.AllowHardStopAfterSoftTimeout`，软关机超时后可执行一次硬关机，并再次等待确认；仍未停止则返回 `VM_STOP_FAILED`。
+
+### 4.3 恢复快照并启动
+
+VM 停止后等待短暂稳定时间和 `.lck` 释放，然后调用 `revertToSnapshot`。恢复完成后等待 `VmPostRevertStabilizationSeconds`，再启动 VM。
+
+### 4.4 Token 写入
+
+VM 启动命令成功后立即调用 `IGuestTokenProvisioningService`。该服务会等待 VMware Tools Guest Operations 可用，然后把 `rpa.token` 写入 Guest 的 `application.properties` 并回读验证。
+
+Token 写入失败时切换失败，不进入 Runner 状态确认。
+
+### 4.5 Runner 确认
+
+Token 成功后轮询 Runner。Runner 必须进入正常可用状态，并且返回的 `workerId`、`profileId` 必须与目标配置一致。未就绪或身份不一致时切换失败，不再自动执行第二次冷重启。
+
+## 5. 并发与事务保护
+
+同一 VM 使用两层保护：
+
+1. `IVmOperationLock`：按规范化后的 `VmxPath` 提供进程内互斥；
+2. `local_vm_operation`：按 `hostId + vmName` 提供持久化租约、心跳和 fencing token。
+
+入口规则：
+
+- 自动切换在读取快照列表前取得 VM 锁；
+- 手动切换同样在读取快照列表前取得 VM 锁；
+- `VmSwitchService` 取得 `ProfileSwitch` 持久化租约；
+- `SnapshotUpdateService` 取得 `SnapshotUpdate` 持久化租约并使用同一 VM 锁；
+- 租约冲突返回 `VM_OPERATION_BUSY`。
+
+因此：
+
+- 手动切换不能与自动切换同时操作同一 VM；
+- 切换期间不能升级同一 VM 的快照；
+- 不同 VM 仍可独立执行；
+- 服务异常退出后，只有租约过期才能接管；旧操作的 fencing token 无法更新新事务。
+
+## 6. 关键配置
+
+| 配置 | 作用 |
+| --- | --- |
+| `ManualPowerOnRunnerProbeTimeoutSeconds` | 页面开机与切换前置步骤共用的 Runner/Guest-IP 探测超时 |
+| `ManualPowerOnStartMaxAttempts` | 页面开机与切换前置步骤共用的 VM 启动最大尝试次数 |
+| `ManualPowerOnRunnerReadyTimeoutSeconds` | VM 启动后等待 Runner 恢复响应的总超时 |
+| `VmPowerCycleStopTimeoutSeconds` | 前置恢复关机及重新运行确认超时 |
+| `VmPostStopStabilizationSeconds` | VM 停止后的稳定等待 |
+| `VmPostRevertStabilizationSeconds` | 恢复快照后的稳定等待 |
+| `WaitVmReadyTimeoutSeconds` | Token 写入后等待 Runner 的超时 |
+| `VmOperationLeaseSeconds` | VM 操作租约有效期 |
+| `VmOperationHeartbeatSeconds` | 租约心跳间隔 |
+| `VmRecoveryWindowMinutes` | 重启预算统计窗口 |
+| `VmMaxPowerCyclesPerWindow` | 窗口内最大恢复重启次数 |
+| `VmRecoveryCooldownMinutes` | 两次恢复重启之间的冷却 |
+
+## 7. 事务结果
+
+- 真正完成快照切换：`Success=true, Skipped=false`；
+- 前置恢复或非闲时跳过：`Success=true, Skipped=true`；
+- 外部操作失败或校验失败：`Success=false, Skipped=false`。
+
+跳过事务以 `SUCCESS` 终止，但保留明确的 reason code 和 step，避免被当作未完成事务重复恢复。
+
+## 8. VM 编辑页“开机”操作
+
+`/vms` 的 VM 编辑框提供“开机”按钮，请求 `POST /operations/vms/{vmName}/power-on`：
+
+- VM 已关机：启动、确认进入运行状态并确认 Runner 恢复，返回 `action=started`；
+- VM 已运行且 Runner 请求正常：不改变电源状态，返回 `action=skipped`；
+- VM 已运行但 Runner 请求异常：硬关机并确认停止，再启动并确认运行及 Runner 恢复，返回 `action=restarted`。
+
+该操作使用同一 `IVmOperationLock` 和 `ManualPowerOn` 持久化租约，因此不能与切换、快照升级或其他 VM 维护操作并发。
+
+针对蓝屏或 VMware Tools 卡死场景，“开机”操作使用独立的 Runner 探测超时，不会长期阻塞在 `getGuestIPAddress`：
+
+- `ManualPowerOnRunnerProbeTimeoutSeconds`：Runner/Guest-IP 探测超时，默认5秒；
+- 硬关机命令最多尝试2次，每次通过 `vmrun list` 确认 VM 已停止；
+- 停止成功后等待 `VmPostStopStabilizationSeconds`，降低残留 VMX/VMDK 锁导致的启动失败；
+- `ManualPowerOnStartMaxAttempts`：启动最大尝试次数，默认3次；
+- 每次启动后都通过 `vmrun list` 确认 VM 真正进入运行状态。
+- `ManualPowerOnRunnerReadyTimeoutSeconds`：电源启动后等待 Runner 恢复响应的总超时，默认180秒。
+
+`vmrun list` 出现 VMX 只表示 VMware 虚拟机进程已运行，不代表 Windows Guest 和 Runner 已恢复。因此 `started` 和 `restarted` 必须同时满足：VM 位于运行列表，并且 Runner 在总超时内重新响应。若只有电源状态成功但 Runner 未恢复，返回 `VM_RUNNER_READY_TIMEOUT`，不会显示启动或重启成功。
+
+若最终失败，接口会在错误消息中保留最后一次 `vmrun` 异常，便于排查服务账号权限、VM 文件锁或 `vmware-vmx.exe` 卡死。

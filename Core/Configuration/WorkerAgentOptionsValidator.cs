@@ -9,6 +9,16 @@ public static class WorkerAgentOptionsValidator
         Require(options.Agent.HostId, "Agent.HostId", errors);
         Require(options.Agent.HostWorkPath, "Agent.HostWorkPath", errors);
         Require(options.Vmrun.VmrunPath, "Vmrun.VmrunPath", errors);
+        Positive(options.Agent.VmOperationLeaseSeconds, "Agent.VmOperationLeaseSeconds", errors);
+        Positive(options.Agent.VmOperationHeartbeatSeconds, "Agent.VmOperationHeartbeatSeconds", errors);
+        if (options.Agent.VmOperationHeartbeatSeconds >= options.Agent.VmOperationLeaseSeconds)
+            errors.Add("Agent.VmOperationHeartbeatSeconds must be less than Agent.VmOperationLeaseSeconds.");
+        Positive(options.Agent.VmRecoveryWindowMinutes, "Agent.VmRecoveryWindowMinutes", errors);
+        Positive(options.Agent.VmMaxPowerCyclesPerWindow, "Agent.VmMaxPowerCyclesPerWindow", errors);
+        Positive(options.Agent.VmMaxConsecutiveRecoveryFailures, "Agent.VmMaxConsecutiveRecoveryFailures", errors);
+        Positive(options.Agent.ManualPowerOnRunnerProbeTimeoutSeconds, "Agent.ManualPowerOnRunnerProbeTimeoutSeconds", errors);
+        Positive(options.Agent.ManualPowerOnStartMaxAttempts, "Agent.ManualPowerOnStartMaxAttempts", errors);
+        Positive(options.Agent.ManualPowerOnRunnerReadyTimeoutSeconds, "Agent.ManualPowerOnRunnerReadyTimeoutSeconds", errors);
 
         var workerIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -78,5 +88,10 @@ public static class WorkerAgentOptionsValidator
         {
             errors.Add($"{name} is required.");
         }
+    }
+
+    private static void Positive(int value, string name, List<string> errors)
+    {
+        if (value <= 0) errors.Add($"{name} must be greater than zero.");
     }
 }

@@ -31,4 +31,7 @@ public static class ErrorCodes
     public const string SnapshotDeleteFailed = "SNAPSHOT_DELETE_FAILED";
     public const string RunnerStatusCheckFailed = "RUNNER_STATUS_CHECK_FAILED";
     public const string ConfigUpdateFailed = "CONFIG_UPDATE_FAILED";
+    public const string SwitchSkippedVmStarted = "SWITCH_SKIPPED_VM_STARTED";
+    public const string SwitchSkippedVmRestarted = "SWITCH_SKIPPED_VM_RESTARTED";
+    public const string SwitchSkippedRunnerNotIdle = "SWITCH_SKIPPED_RUNNER_NOT_IDLE";
 }
