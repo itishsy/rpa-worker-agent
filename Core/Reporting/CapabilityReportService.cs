@@ -1,4 +1,3 @@
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Seebot.WorkerAgent.Core.Configuration;
 using Seebot.WorkerAgent.Core.Scheduler;
@@ -7,7 +6,7 @@ using Seebot.WorkerAgent.Core.Vmware;
 
 namespace Seebot.WorkerAgent.Core.Reporting;
 
-public sealed class CapabilityReportService : BackgroundService
+public sealed class CapabilityReportService
 {
     private readonly ISchedulerClient _schedulerClient;
     private readonly IVmrunService _vmrunService;
@@ -47,30 +46,6 @@ public sealed class CapabilityReportService : BackgroundService
         {
             _logger.LogWarning(exception, "Failed to report VM profile capabilities.");
         }
-    }
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            await ReportOnceAsync(stoppingToken).ConfigureAwait(false);
-            try
-            {
-                await Task.Delay(GetInterval(), stoppingToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-        }
-    }
-
-    private TimeSpan GetInterval()
-    {
-        var seconds = _options.Agent.CapabilityReportIntervalSeconds > 0
-            ? _options.Agent.CapabilityReportIntervalSeconds
-            : 300;
-        return TimeSpan.FromSeconds(seconds);
     }
 
     private async Task<IReadOnlyList<HostProfileCapabilityRequest>> BuildProfileCapabilitiesAsync(CancellationToken cancellationToken)

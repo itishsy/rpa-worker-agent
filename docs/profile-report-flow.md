@@ -4,7 +4,7 @@
 
 核心实现：
 
-- 后台服务：`Core/Reporting/CapabilityReportService.cs`
+- 启动上报服务：`Core/Reporting/CapabilityReportService.cs`
 - 上报客户端：`Core/Scheduler/SchedulerClient.cs`
 - 请求模型：`Core/Scheduler/HostProfileCapabilityRequest.cs`
 - 快照匹配：`Core/Snapshot/ProfileSnapshotResolver.cs`
@@ -13,45 +13,24 @@
 
 ## 1. 上报频率
 
-画像上报由 `CapabilityReportService` 执行，它是一个 `BackgroundService`。
+画像上报由 `WorkerAgent` 在服务启动时调用 `CapabilityReportService.ReportOnceAsync` 执行一次。
 
 启动后执行节奏：
 
 ```text
 服务启动
--> 立即执行 ReportOnceAsync 一次
--> 等待 Agent.CapabilityReportIntervalSeconds
--> 再执行下一次
--> 循环直到服务停止
+-> 执行 ReportOnceAsync 一次
+-> 后续不再自动上报
 ```
-
-配置项：
-
-```json
-{
-  "Agent": {
-    "CapabilityReportIntervalSeconds": 300
-  }
-}
-```
-
-默认值：
-
-```text
-300 秒，即 5 分钟
-```
-
-如果配置值 `<= 0`，代码会使用兜底值 `300` 秒。
 
 ## 2. 触发方式
 
-当前没有单独的手动 API 触发画像上报。服务启动后，只要 `CapabilityReportService` 被注册为 HostedService，就会自动周期执行。
+当前没有单独的手动 API 触发画像上报。服务启动后由 `WorkerAgent.ExecuteAsync` 调用一次，后续调度周期不会再次上报。
 
 注册位置：
 
 ```csharp
 services.AddSingleton<CapabilityReportService>();
-services.AddHostedService(sp => sp.GetRequiredService<CapabilityReportService>());
 ```
 
 ## 3. 数据来源
@@ -75,15 +54,15 @@ _options.VirtualMachines.Where(vm => vm.Enabled)
 ## 4. 总体流程
 
 ```text
-1. CapabilityReportService.ExecuteAsync 启动循环
-2. 调用 ReportOnceAsync
+1. WorkerAgent.ExecuteAsync 启动
+2. 调用 CapabilityReportService.ReportOnceAsync
 3. 读取启用 VM 列表
 4. 对每台 VM 执行 vmrun listSnapshots
 5. 对该 VM 下每个 Profile 解析匹配快照
 6. 组装 HostProfileCapabilityRequest 列表
 7. 调用 SchedulerClient.ReportCapabilitiesAsync
 8. POST 到云后台 robot/vmProfile/reportSave
-9. 成功后等待下一轮
+9. 上报结束，服务运行期间不再重复上报
 ```
 
 ## 5. VM 快照读取
@@ -268,4 +247,4 @@ Host + VM + Profile + SnapshotName
 3. 单个 VM 快照读取失败不会阻断其它 VM 上报。
 4. Profile 快照必须遵循 `{ProfileId}.v{yyMMdd}.{sequence}` 命名规则，否则 `snapshotName` 会为空。
 5. 同一 VM/Profile 如果存在多个匹配快照，会被视为不唯一，`snapshotName` 为空，需要人工清理或通过更新快照流程收敛。
-6. 上报周期由 `Agent.CapabilityReportIntervalSeconds` 控制，默认 300 秒。
+6. 画像仅在 Worker Agent 启动时上报一次，不执行周期上报。

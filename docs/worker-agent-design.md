@@ -454,7 +454,6 @@ Agent 只读取状态并上报，不参与任务执行
     "HostId": "SB-VM-001",
     "AgentName": "SR20宿主机Agent",
     "PollIntervalSeconds": 10,
-    "CapabilityReportIntervalSeconds": 300,
     "SwitchTimeoutSeconds": 300,
     "WaitVmReadyTimeoutSeconds": 180,
     "WaitUpgradeTimeoutSeconds": 600,
@@ -1016,8 +1015,7 @@ POST robot/vmProfile/reportSave
 触发时机：
 
 - Agent 启动完成配置校验后上报一次。
-- 配置变化或人工刷新时上报一次。
-- 按 `CapabilityReportIntervalSeconds` 低频周期上报。
+- 服务运行期间不再重复上报。
 
 ### 14.4 上报 VM 当前运行状态
 

@@ -98,7 +98,6 @@ dotnet publish rpa-worker-agent.csproj -c Release -o D:\seebot\rpa-worker-agent
     "HostId": "RPA Workstation 001",
     "AgentName": "RPA Worker Agent 001",
     "PollIntervalSeconds": 10,
-    "CapabilityReportIntervalSeconds": 300,
     "SwitchTimeoutSeconds": 300,
     "WaitVmReadyTimeoutSeconds": 180,
     "WaitUpgradeTimeoutSeconds": 300,
@@ -157,7 +156,7 @@ dotnet publish rpa-worker-agent.csproj -c Release -o D:\seebot\rpa-worker-agent
 - `HostId`：宿主机唯一标识。
 - `AgentName`：展示名称。
 - WorkerAgent 不上报 heartbeat 或周期 VM 状态心跳，worker 心跳由 VM 内 runner 上报。
-- `CapabilityReportIntervalSeconds`：能力上报间隔。
+- VM/Profile 能力画像仅在 Worker Agent 启动时上报一次，不进行周期上报。
 - `IdleStableSeconds`：VM 空闲稳定时间阈值。
 - `ForceRevertWhenBackupFailed`：目录备份失败后是否仍允许回滚快照。生产建议保持 `false`。
 - `MaxSwitchesPerCycle`：单轮调度最大切换数量。当前调度实现每轮最多启动一次切换。

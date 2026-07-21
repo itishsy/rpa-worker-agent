@@ -29,6 +29,8 @@ public interface IVmPowerRecoveryService
 
 public sealed class VmPowerRecoveryService : IVmPowerRecoveryService
 {
+    private const int RunningVmRunnerProbeAttempts = 3;
+
     private readonly IVmrunService _vmrun; private readonly IGuestWorkerClient _guest;
     private readonly WorkerAgentOptions _options; private readonly TimeProvider _time;
     private readonly TimeSpan _poll; private readonly ILogger<VmPowerRecoveryService> _logger;
@@ -52,21 +54,9 @@ public sealed class VmPowerRecoveryService : IVmPowerRecoveryService
                 : Ok(VmPowerRecoveryAction.Started, $"VM '{vm.Name}' started and Runner responded successfully.", runner);
         }
 
-        try
-        {
-            using var probe = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            probe.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, _options.Agent.ManualPowerOnRunnerProbeTimeoutSeconds)));
-            var status = await _guest.GetRunnerStatusAsync(vm, probe.Token).ConfigureAwait(false);
-            return new VmPowerRecoveryResult { Action = VmPowerRecoveryAction.AlreadyResponsive, RunnerStatus = status, Message = $"VM '{vm.Name}' is running and Runner responded." };
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            _logger.LogWarning("Runner probe timed out; recovering VM. VmName={VmName}, TimeoutSeconds={TimeoutSeconds}", vm.Name, _options.Agent.ManualPowerOnRunnerProbeTimeoutSeconds);
-        }
-        catch (Exception exception) when (exception is not OperationCanceledException)
-        {
-            _logger.LogWarning(exception, "Runner probe failed; recovering VM. VmName={VmName}", vm.Name);
-        }
+        var currentRunner = await ProbeRunningVmRunnerAsync(vm, cancellationToken).ConfigureAwait(false);
+        if (currentRunner is not null)
+            return new VmPowerRecoveryResult { Action = VmPowerRecoveryAction.AlreadyResponsive, RunnerStatus = currentRunner, Message = $"VM '{vm.Name}' is running and Runner responded." };
 
         if (operation is not null && !await operation.TryReservePowerCycleAsync(cancellationToken).ConfigureAwait(false))
             return Fail("RECOVERY_BUDGET_EXHAUSTED", "VM restart was suppressed by the persistent recovery budget or cooldown.");
@@ -99,6 +89,48 @@ public sealed class VmPowerRecoveryService : IVmPowerRecoveryService
 
         if (operation is not null) await operation.RecordRecoveryResultAsync(true, cancellationToken).ConfigureAwait(false);
         return Ok(VmPowerRecoveryAction.Restarted, $"VM '{vm.Name}' restarted and Runner recovered successfully.", recoveredRunner);
+    }
+
+    private async Task<RunnerStatusResponse?> ProbeRunningVmRunnerAsync(
+        VirtualMachineOptions vm,
+        CancellationToken cancellationToken)
+    {
+        var timeoutSeconds = Math.Max(1, _options.Agent.ManualPowerOnRunnerProbeTimeoutSeconds);
+        for (var attempt = 1; attempt <= RunningVmRunnerProbeAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                using var probe = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                probe.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+                var status = await _guest.GetRunnerStatusAsync(vm, probe.Token).ConfigureAwait(false);
+                _logger.LogInformation(
+                    "运行中的 VM Runner 响应正常。VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}",
+                    vm.Name, attempt, RunningVmRunnerProbeAttempts);
+                return status;
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(
+                    "运行中的 VM Runner 请求超时。VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}, TimeoutSeconds={TimeoutSeconds}",
+                    vm.Name, attempt, RunningVmRunnerProbeAttempts, timeoutSeconds);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                _logger.LogWarning(
+                    exception,
+                    "运行中的 VM Runner 请求失败。VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}",
+                    vm.Name, attempt, RunningVmRunnerProbeAttempts);
+            }
+
+            if (attempt < RunningVmRunnerProbeAttempts && _poll > TimeSpan.Zero)
+                await Task.Delay(_poll, _time, cancellationToken).ConfigureAwait(false);
+        }
+
+        _logger.LogWarning(
+            "运行中的 VM Runner 连续三次无响应，准备执行 hard 关机并重新启动。VmName={VmName}",
+            vm.Name);
+        return null;
     }
 
     private async Task<RunnerStatusResponse?> WaitForRunnerResponseAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
@@ -172,31 +204,30 @@ public sealed class VmPowerRecoveryService : IVmPowerRecoveryService
 public sealed class VmPowerOnResult { public bool Success { get; set; } public string Action { get; set; } = ""; public string Message { get; set; } = ""; public string? ErrorCode { get; set; } }
 public interface IVmPowerOnService { Task<VmPowerOnResult> PowerOnAsync(string vmName, CancellationToken cancellationToken); }
 
-/// <summary>API orchestration layer: resolves VM and owns the lock and ManualPowerOn lease.</summary>
+/// <summary>Manual API orchestration layer. Concurrency is controlled by the operator.</summary>
 public sealed class VmPowerOnService : IVmPowerOnService
 {
-    private readonly IVirtualMachineRegistry _registry; private readonly IVmOperationLock _vmLock;
-    private readonly IVmOperationCoordinator _coordinator; private readonly IVmPowerRecoveryService _recovery;
-    private readonly WorkerAgentOptions _options;
-    public VmPowerOnService(IVirtualMachineRegistry registry, IVmOperationLock vmLock, IVmOperationCoordinator coordinator,
-        IVmPowerRecoveryService recovery, WorkerAgentOptions options)
-    { _registry = registry; _vmLock = vmLock; _coordinator = coordinator; _recovery = recovery; _options = options; }
+    private readonly IVirtualMachineRegistry _registry;
+    private readonly IVmPowerRecoveryService _recovery;
+
+    public VmPowerOnService(IVirtualMachineRegistry registry, IVmPowerRecoveryService recovery)
+    {
+        _registry = registry;
+        _recovery = recovery;
+    }
 
     public async Task<VmPowerOnResult> PowerOnAsync(string vmName, CancellationToken ct)
     {
         var vm = await _registry.GetByNameAsync(vmName, ct).ConfigureAwait(false);
         if (vm is null) return Map(new VmPowerRecoveryResult { Action = VmPowerRecoveryAction.Failed, ErrorCode = "VM_NOT_FOUND", Message = $"VM '{vmName}' was not found." });
-        await using var vmLock = await _vmLock.AcquireAsync(vm.VmxPath, ct).ConfigureAwait(false);
-        await using var operation = await _coordinator.TryAcquireAsync(_options.Agent.HostId, vm.Name, VmOperationType.ManualPowerOn, ct).ConfigureAwait(false);
-        if (operation is null) return Map(new VmPowerRecoveryResult { Action = VmPowerRecoveryAction.Failed, ErrorCode = "VM_OPERATION_BUSY", Message = "Another VM operation is in progress." });
         try
         {
-            var result = await _recovery.EnsureOperationalAsync(vm, operation, ct).ConfigureAwait(false);
-            if (result.Success) await operation.CompleteAsync(ct).ConfigureAwait(false); else await operation.FailAsync(result.ErrorCode ?? "VM_POWER_ON_FAILED", result.Message, ct).ConfigureAwait(false);
-            return Map(result);
+            return Map(await _recovery.EnsureOperationalAsync(vm, null, ct).ConfigureAwait(false));
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
-        { await operation.FailAsync("VM_POWER_ON_FAILED", ex.Message, CancellationToken.None).ConfigureAwait(false); return Map(new VmPowerRecoveryResult { Action = VmPowerRecoveryAction.Failed, ErrorCode = "VM_POWER_ON_FAILED", Message = ex.Message }); }
+        {
+            return Map(new VmPowerRecoveryResult { Action = VmPowerRecoveryAction.Failed, ErrorCode = "VM_POWER_ON_FAILED", Message = ex.Message });
+        }
     }
 
     private static VmPowerOnResult Map(VmPowerRecoveryResult result) => new()

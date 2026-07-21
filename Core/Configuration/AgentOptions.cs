@@ -7,7 +7,6 @@ public sealed class AgentOptions
     public string GeneralProfileId { get; set; } = "General";
     public string HostWorkPath { get; set; } = "";
     public int PollIntervalSeconds { get; set; }
-    public int CapabilityReportIntervalSeconds { get; set; }
     public int SwitchTimeoutSeconds { get; set; }
     public int WaitVmReadyTimeoutSeconds { get; set; }
     public int WaitUpgradeTimeoutSeconds { get; set; }

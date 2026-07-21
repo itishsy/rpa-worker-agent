@@ -135,7 +135,6 @@ public static class ServiceCollectionExtensions
                 logger: provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<InitFileUpdateService>>(),
                 guestTokenProvisioningService: provider.GetRequiredService<IGuestTokenProvisioningService>()));
         services.AddSingleton<CapabilityReportService>();
-        services.AddHostedService(sp => sp.GetRequiredService<CapabilityReportService>());
 
         return services;
     }

@@ -34,7 +34,7 @@ services.AddSingleton<ILocalStore>(...);
 services.AddSingleton<IVmSwitchService, VmSwitchService>();
 services.AddSingleton<IPoolSchedulerService, PoolSchedulerService>();
 services.AddSingleton<ISnapshotUpdateService, SnapshotUpdateService>();
-services.AddHostedService<CapabilityReportService>();
+services.AddSingleton<CapabilityReportService>();
 ```
 
 说明：
@@ -410,7 +410,7 @@ TargetSnapshotName = profile.SnapshotName,
 
 已实现内容：
 
-- `CapabilityReportService` 周期执行启动校验并上报 VM profile 能力。
+- `WorkerAgent` 启动时调用 `CapabilityReportService` 上报一次 VM profile 能力，运行期间不再周期上报。
 - WorkerAgent 不处理心跳上报；worker 心跳由 VM 内 runner 上报。
 - 能力上报异常会记录 warning，不直接终止进程。
 
@@ -530,4 +530,4 @@ var tests = new (string Name, Action Body)[]
 4. `SnapshotName` 必填，语义是版本化格式 `ProfileId.vYYMMDD.No`，并由 Snapshot 更新流程自动生成下一版本。
 5. 本机运维 API 当前只实现了快照更新接口，暂停调度、隔离 VM、解除隔离、查询事务等接口尚未看到实现。
 6. `VmSwitchService` 使用 soft stop，当前没有看到 soft 超时后 hard stop 的完整降级逻辑。
-7. `CapabilityReportService` 会周期性执行真实文件和 vmrun 快照校验，生产运行前需要确保路径和权限配置正确。
+7. `CapabilityReportService` 仅在服务启动时执行真实文件和 vmrun 快照校验及能力上报。

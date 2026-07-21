@@ -6,6 +6,8 @@ namespace Seebot.WorkerAgent.Core.Vmware;
 
 public sealed class VmrunService : IVmrunService
 {
+    private static readonly SemaphoreSlim CommandSemaphore = new(1, 1);
+
     private readonly string _vmrunPath;
     private readonly string _hostType;
     private readonly IProcessRunner _processRunner;
@@ -410,15 +412,16 @@ public sealed class VmrunService : IVmrunService
         IReadOnlyList<string> arguments,
         CancellationToken cancellationToken)
     {
+        await CommandSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
         var started = Stopwatch.GetTimestamp();
-        _logger.LogInformation(
-            "执行VM操作. Command={Command}, Arguments={Arguments}, TimeoutSeconds={TimeoutSeconds}",
-            command.CommandName,
-            SanitizeArguments(arguments),
-            command.Timeout.TotalSeconds);
-
         try
         {
+            _logger.LogInformation(
+                "执行VM操作. Command={Command}, Arguments={Arguments}, TimeoutSeconds={TimeoutSeconds}",
+                command.CommandName,
+                SanitizeArguments(arguments),
+                command.Timeout.TotalSeconds);
+
             var result = await _processRunner.RunAsync(command, cancellationToken);
             var elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             if (result.ExitCode == 0)
@@ -452,6 +455,10 @@ public sealed class VmrunService : IVmrunService
                 command.CommandName,
                 Stopwatch.GetElapsedTime(started).TotalMilliseconds);
             throw;
+        }
+        finally
+        {
+            CommandSemaphore.Release();
         }
     }
 
