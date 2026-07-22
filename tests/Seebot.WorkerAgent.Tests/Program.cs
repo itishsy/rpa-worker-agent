@@ -114,6 +114,7 @@ var tests = new (string Name, Action Body)[]
     ("PoolSchedulerService reverts to General when no pending tasks and VM is not on General", PoolSchedulerServiceRevertsToGeneralWhenNoPendingTasksAndVmIsNotGeneral),
     ("PoolSchedulerService does not revert when VM already on General and no pending tasks", PoolSchedulerServiceDoesNotRevertWhenVmAlreadyOnGeneral),
     ("CapabilityReportService reports all VM profile capabilities", CapabilityReportServiceReportsAllVmProfileCapabilities),
+    ("InitFileUpdateService writes token server URL and worker ID before rebuilding snapshot", InitFileUpdateServiceWritesRequiredGuestConfiguration),
     ("SnapshotNameGenerator generates first sequence number when no existing snapshot for today", SnapshotNameGeneratorGeneratesFirstSequenceNumber),
     ("SnapshotNameGenerator increments sequence when today snapshot already exists", SnapshotNameGeneratorIncrementsSequence),
     ("SnapshotNameGenerator does not conflict with different profile on same date", SnapshotNameGeneratorIgnoresDifferentProfile),
@@ -2333,6 +2334,73 @@ static VmSwitchService NewVmSwitchService(
         vmStopTimeout: TimeSpan.FromSeconds(stopSoftTimeoutSeconds), guestTokenProvisioningService: tokenProvisioningService);
 }
 
+static void InitFileUpdateServiceWritesRequiredGuestConfiguration()
+{
+    using var scope = TempDirectory();
+    var vm = BackupVm(scope.DirectoryPath);
+    vm.VmxPath = Path.Combine(scope.DirectoryPath, "test.vmx");
+    File.WriteAllText(vm.VmxPath, ".encoding = \"UTF-8\"\r\nethernet0.connectionType = \"bridged\"\r\n");
+    vm.Profiles =
+    [
+        new ProfileOptions
+        {
+            ProfileId = "rpa-sh-tax-etax",
+            ProfileName = "Shanghai Tax",
+            SnapshotName = "rpa-sh-tax-etax.v260721.1"
+        }
+    ];
+    var options = new WorkerAgentOptions
+    {
+        Scheduler = new SchedulerOptions { BaseUrl = "https://rpa.example.com/api" },
+        Vmrun = new VmrunOptions { NetType = "nat" },
+        VirtualMachines = [vm]
+    };
+    var vmrun = new InitUpdateVmrunService(["rpa-sh-tax-etax.v260721.1"]);
+    vmrun.BeforeStart = () => Assert.Contains(
+        new[] { File.ReadAllText(vm.VmxPath) },
+        "ethernet0.connectionType = \"nat\"");
+    var tokenProvisioning = new GuestTokenProvisioningService(
+        vmrun,
+        new StaticSchedulerTokenProvider("scheduler-token"),
+        new FixedTimeProvider(DateTimeOffset.Parse("2026-07-22T09:00:00Z")),
+        guestOperationsTimeout: TimeSpan.FromSeconds(1),
+        guestOperationsPollInterval: TimeSpan.Zero);
+    var service = new InitFileUpdateService(
+        vmrun,
+        new VmOperationLock(),
+        new ProfileSnapshotResolver(),
+        options,
+        timeProvider: new FixedTimeProvider(DateTimeOffset.Parse("2026-07-22T09:00:00Z")),
+        processWaitTimeout: TimeSpan.FromSeconds(1),
+        processPollInterval: TimeSpan.Zero,
+        guestTokenProvisioningService: tokenProvisioning,
+        vmxNetworkConfigurationService: new VmxNetworkConfigurationService(
+            NullLogger<VmxNetworkConfigurationService>.Instance));
+
+    var result = service.UpdateWorkerIdInSnapshotsAsync(vm.Name, default).GetAwaiter().GetResult();
+
+    Assert.True(result.Success, "Worker ID update should succeed for a ready profile snapshot.");
+    Assert.Equal(3, vmrun.GuestPowerShellCommands.Count, "Token, server.init and rpa.init should each be written once.");
+    Assert.True(vmrun.GuestPowerShellCommands.Any(command =>
+            command.Contains(@"D:\seebon\rpa\application.properties", StringComparison.Ordinal)
+            && command.Contains("rpa.token", StringComparison.Ordinal)
+            && command.Contains("scheduler-token", StringComparison.Ordinal)),
+        "Token should be written to the fixed application.properties path.");
+    Assert.True(vmrun.GuestPowerShellCommands.Any(command =>
+            command.Contains(@"C:\Program Files\rpa\server.init", StringComparison.Ordinal)
+            && command.Contains("https://rpa.example.com/api", StringComparison.Ordinal)),
+        "Scheduler BaseUrl should be written to server.init.");
+    Assert.True(vmrun.GuestPowerShellCommands.Any(command =>
+            command.Contains(@"C:\Program Files\rpa\rpa.init", StringComparison.Ordinal)
+            && command.Contains(vm.WorkerId, StringComparison.Ordinal)),
+        "WorkerId should be written to rpa.init.");
+    Assert.Contains(
+        new[] { File.ReadAllText(vm.VmxPath) },
+        "ethernet0.connectionType = \"nat\"");
+    Assert.Equal("rpa-sh-tax-etax.v260722.1", result.Profiles[0].NewSnapshotName, "A new dated snapshot should be created.");
+    Assert.False(vmrun.Snapshots.Contains("rpa-sh-tax-etax.v260721.1", StringComparer.OrdinalIgnoreCase), "Old snapshot should be deleted.");
+}
+
 static VmSwitchRequest SwitchRequest()
 {
     return new VmSwitchRequest
@@ -3193,6 +3261,116 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
     {
         return Task.FromResult<IReadOnlyList<GuestProcess>>([]);
     }
+}
+
+internal sealed class InitUpdateVmrunService : IVmrunService
+{
+    public InitUpdateVmrunService(IEnumerable<string> snapshots)
+    {
+        Snapshots.AddRange(snapshots);
+    }
+
+    public List<string> Snapshots { get; } = [];
+    public List<string> GuestPowerShellCommands { get; } = [];
+    public Action? BeforeStart { get; set; }
+
+    public Task<IReadOnlyList<string>> ListSnapshotsAsync(string vmxPath, CancellationToken cancellationToken) =>
+        Task.FromResult<IReadOnlyList<string>>([.. Snapshots]);
+
+    public Task<bool> IsVmRunningAsync(string vmxPath, CancellationToken cancellationToken) =>
+        Task.FromResult(false);
+
+    public Task<string?> GetCurrentSnapshotAsync(string vmxPath, CancellationToken cancellationToken) =>
+        Task.FromResult<string?>(null);
+
+    public Task<string> GetGuestIPAddressAsync(string vmxPath, CancellationToken cancellationToken) =>
+        Task.FromResult("127.0.0.1");
+
+    public Task<VmrunCommandResult> StopVmAsync(string vmxPath, VmStopMode mode, CancellationToken cancellationToken) =>
+        Task.FromResult(Ok("stop"));
+
+    public Task<VmrunCommandResult> RevertToSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken) =>
+        Task.FromResult(Ok("revertToSnapshot"));
+
+    public Task<VmrunCommandResult> StartVmAsync(string vmxPath, CancellationToken cancellationToken)
+    {
+        BeforeStart?.Invoke();
+        return Task.FromResult(Ok("start"));
+    }
+
+    public Task<VmrunCommandResult> EnableSharedFoldersAsync(string vmxPath, CancellationToken cancellationToken) =>
+        Task.FromResult(Ok("enableSharedFolders"));
+
+    public Task<VmrunCommandResult> AddSharedFolderAsync(string vmxPath, string shareName, string hostPath, CancellationToken cancellationToken) =>
+        Task.FromResult(Ok("addSharedFolder"));
+
+    public Task<VmrunCommandResult> RemoveSharedFolderAsync(string vmxPath, string shareName, CancellationToken cancellationToken) =>
+        Task.FromResult(Ok("removeSharedFolder"));
+
+    public Task<VmrunCommandResult> RunProgramInGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        string programPath,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken)
+    {
+        var encodedIndex = -1;
+        for (var index = 0; index < arguments.Count; index++)
+        {
+            if (string.Equals(arguments[index], "-EncodedCommand", StringComparison.OrdinalIgnoreCase))
+            {
+                encodedIndex = index;
+                break;
+            }
+        }
+        if (encodedIndex >= 0 && encodedIndex + 1 < arguments.Count)
+        {
+            GuestPowerShellCommands.Add(Encoding.Unicode.GetString(Convert.FromBase64String(arguments[encodedIndex + 1])));
+        }
+
+        return Task.FromResult(Ok("runProgramInGuest"));
+    }
+
+    public Task<VmrunCommandResult> CopyFileFromHostToGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        string hostPath,
+        string guestPath,
+        CancellationToken cancellationToken) =>
+        Task.FromResult(Ok("copyFileFromHostToGuest"));
+
+    public Task<VmrunCommandResult> CopyFileFromGuestToHostAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        string guestPath,
+        string hostPath,
+        CancellationToken cancellationToken) =>
+        Task.FromResult(Ok("copyFileFromGuestToHost"));
+
+    public Task<VmrunCommandResult> CreateSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
+    {
+        Snapshots.Add(snapshotName);
+        return Task.FromResult(Ok("snapshot"));
+    }
+
+    public Task<VmrunCommandResult> DeleteSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken)
+    {
+        Snapshots.RemoveAll(item => string.Equals(item, snapshotName, StringComparison.OrdinalIgnoreCase));
+        return Task.FromResult(Ok("deleteSnapshot"));
+    }
+
+    public Task<IReadOnlyList<GuestProcess>> ListProcessesInGuestAsync(
+        string vmxPath,
+        string guestUser,
+        string guestPassword,
+        CancellationToken cancellationToken) =>
+        Task.FromResult<IReadOnlyList<GuestProcess>>([]);
+
+    private static VmrunCommandResult Ok(string commandName) =>
+        new(0, "", "", TimeSpan.Zero, commandName);
 }
 
 internal sealed class RecordingLocalStore : ILocalStore

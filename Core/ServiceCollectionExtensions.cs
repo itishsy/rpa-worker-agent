@@ -118,6 +118,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<Startup.IStartupValidator, StartupValidator>();
         services.AddSingleton<IProfileSnapshotResolver, ProfileSnapshotResolver>();
         services.AddSingleton<IVmOperationLock, VmOperationLock>();
+        services.AddSingleton<IVmxNetworkConfigurationService, VmxNetworkConfigurationService>();
         services.AddSingleton<IVmSwitchService, VmSwitchService>();
         services.AddSingleton<IVmStateRefreshService, VmStateRefreshService>();
         services.AddSingleton<IVmDiskCleanupService, NoOpVmDiskCleanupService>();
@@ -135,7 +136,8 @@ public static class ServiceCollectionExtensions
                 provider.GetRequiredService<IVirtualMachineRegistry>(),
                 logger: provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<InitFileUpdateService>>(),
                 guestTokenProvisioningService: provider.GetRequiredService<IGuestTokenProvisioningService>(),
-                automaticCycleGate: provider.GetRequiredService<IAutomaticCycleGate>()));
+                automaticCycleGate: provider.GetRequiredService<IAutomaticCycleGate>(),
+                vmxNetworkConfigurationService: provider.GetRequiredService<IVmxNetworkConfigurationService>()));
         services.AddSingleton<CapabilityReportService>();
 
         return services;

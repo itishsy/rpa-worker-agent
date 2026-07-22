@@ -13,6 +13,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
 {
     // Guest path for the worker id consumed by the legacy client.
     private const string GuestInitFilePath = @"C:\Program Files\rpa\rpa.init";
+    private const string GuestServerInitFilePath = @"C:\Program Files\rpa\server.init";
 
     private static readonly TimeSpan DefaultProcessWaitTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan DefaultProcessPollInterval = TimeSpan.FromSeconds(10);
@@ -30,6 +31,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
     private readonly TimeSpan _processPollInterval;
     private readonly ILogger<InitFileUpdateService> _logger;
     private readonly IAutomaticCycleGate? _automaticCycleGate;
+    private readonly IVmxNetworkConfigurationService? _vmxNetworkConfigurationService;
 
     public InitFileUpdateService(
         IVmrunService vmrunService,
@@ -42,7 +44,8 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         TimeSpan? processPollInterval = null,
         ILogger<InitFileUpdateService>? logger = null,
         IGuestTokenProvisioningService? guestTokenProvisioningService = null,
-        IAutomaticCycleGate? automaticCycleGate = null)
+        IAutomaticCycleGate? automaticCycleGate = null,
+        IVmxNetworkConfigurationService? vmxNetworkConfigurationService = null)
     {
         _vmrunService = vmrunService;
         _vmOperationLock = vmOperationLock;
@@ -55,6 +58,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         _processPollInterval = processPollInterval ?? DefaultProcessPollInterval;
         _logger = logger ?? NullLogger<InitFileUpdateService>.Instance;
         _automaticCycleGate = automaticCycleGate;
+        _vmxNetworkConfigurationService = vmxNetworkConfigurationService;
     }
 
     public async Task<InitFileUpdateResult> UpdateWorkerIdInSnapshotsAsync(string vmName, CancellationToken cancellationToken)
@@ -86,6 +90,11 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         if (vm.Profiles.Count == 0)
         {
             return Fail("NO_PROFILES", $"VM '{vmName}' has no profiles.");
+        }
+
+        if (string.IsNullOrWhiteSpace(_options.Scheduler.BaseUrl))
+        {
+            return Fail("SCHEDULER_BASE_URL_MISSING", "Scheduler.BaseUrl is required to update server.init.");
         }
 
         await using var vmLock = await _vmOperationLock.AcquireAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
@@ -176,7 +185,21 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             return FailProfile(profile.ProfileId, "SNAPSHOT_REVERT_FAILED", ex.Message);
         }
 
-        // 3. Start the VM.
+        // 3. A snapshot restore can restore its old virtual hardware settings. Apply the configured
+        // network type after revert and before start so the rebuilt snapshot persists that setting.
+        if (_vmxNetworkConfigurationService is not null)
+        {
+            var networkUpdate = await _vmxNetworkConfigurationService
+                .ApplyAsync(vm.VmxPath, _options.Vmrun, cancellationToken)
+                .ConfigureAwait(false);
+            if (!networkUpdate.Success)
+            {
+                return FailProfile(profile.ProfileId, "WRITE_VMX_NETWORK_FAILED",
+                    networkUpdate.ErrorMessage ?? "Failed to update ethernet0.connectionType.");
+            }
+        }
+
+        // 4. Start the VM.
         try
         {
             await _vmrunService.StartVmAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
@@ -202,10 +225,28 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
                 $"Timed out waiting for VMware Tools guest operations to become available (timeout={_processWaitTimeout.TotalMinutes:F0}min).");
         }
 
-        // 5. Write and verify rpa.init; stop robot.exe only when direct update fails.
+        // 5. Write and verify server.init and rpa.init; stop robot.exe only when a direct update fails.
+        var serverInitUpdate = await UpdateGuestTextFileWithFallbackAsync(
+            vm,
+            GuestServerInitFilePath,
+            _options.Scheduler.BaseUrl.Trim(),
+            "server.init",
+            cancellationToken).ConfigureAwait(false);
+        if (!serverInitUpdate.Success)
+        {
+            await SafeStopAsync(vm, cancellationToken).ConfigureAwait(false);
+            return FailProfile(profile.ProfileId, "WRITE_SERVER_INIT_FAILED",
+                serverInitUpdate.ErrorMessage ?? "Failed to update server.init.");
+        }
+
         try
         {
-            var initUpdate = await UpdateInitFileWithFallbackAsync(vm, cancellationToken).ConfigureAwait(false);
+            var initUpdate = await UpdateGuestTextFileWithFallbackAsync(
+                vm,
+                GuestInitFilePath,
+                vm.WorkerId,
+                "rpa.init",
+                cancellationToken).ConfigureAwait(false);
             if (!initUpdate.Success)
             {
                 await SafeStopAsync(vm, cancellationToken).ConfigureAwait(false);
@@ -334,11 +375,15 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         }
     }
 
-    private async Task<InitFileWriteAttempt> UpdateInitFileWithFallbackAsync(
+    private async Task<InitFileWriteAttempt> UpdateGuestTextFileWithFallbackAsync(
         VirtualMachineOptions vm,
+        string guestPath,
+        string expectedValue,
+        string fileLabel,
         CancellationToken cancellationToken)
     {
-        var directAttempt = await TryWriteAndVerifyInitFileAsync(vm, useTemporaryFile: false, cancellationToken)
+        var directAttempt = await TryWriteAndVerifyGuestTextFileAsync(
+                vm, guestPath, expectedValue, fileLabel, useTemporaryFile: false, cancellationToken)
             .ConfigureAwait(false);
         if (directAttempt.Success)
         {
@@ -346,17 +391,21 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         }
 
         _logger.LogWarning(
-            "Direct rpa.init update failed; stopping robot.exe before retry. VmName={VmName}, Error={Error}",
+            "Direct Guest file update failed; stopping robot.exe before retry. VmName={VmName}, File={File}, Error={Error}",
             vm.Name,
+            fileLabel,
             directAttempt.ErrorMessage);
 
         await ForceKillProcessesAsync(vm, cancellationToken).ConfigureAwait(false);
         if (!await WaitForProcessExitAsync(vm, "robot.exe", cancellationToken).ConfigureAwait(false))
         {
-            return new InitFileWriteAttempt(false, "Timed out waiting for robot.exe to exit before writing rpa.init.");
+            return new InitFileWriteAttempt(
+                false,
+                $"Timed out waiting for robot.exe to exit before writing {fileLabel}.");
         }
 
-        var retryAttempt = await TryWriteAndVerifyInitFileAsync(vm, useTemporaryFile: true, cancellationToken)
+        var retryAttempt = await TryWriteAndVerifyGuestTextFileAsync(
+                vm, guestPath, expectedValue, fileLabel, useTemporaryFile: true, cancellationToken)
             .ConfigureAwait(false);
         if (retryAttempt.Success)
         {
@@ -368,18 +417,21 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             $"Direct write failed: {directAttempt.ErrorMessage}; retry after stopping robot.exe failed: {retryAttempt.ErrorMessage}");
     }
 
-    private async Task<InitFileWriteAttempt> TryWriteAndVerifyInitFileAsync(
+    private async Task<InitFileWriteAttempt> TryWriteAndVerifyGuestTextFileAsync(
         VirtualMachineOptions vm,
+        string guestPath,
+        string expectedValue,
+        string fileLabel,
         bool useTemporaryFile,
         CancellationToken cancellationToken)
     {
-        var psCommand = BuildWriteAndVerifyInitFileCommand(vm.WorkerId, useTemporaryFile);
+        var psCommand = BuildWriteAndVerifyGuestTextFileCommand(guestPath, expectedValue, fileLabel, useTemporaryFile);
         var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(psCommand));
 
         _logger.LogInformation(
-            "Writing and verifying rpa.init. VmName={VmName}, WorkerId={WorkerId}, UseTemporaryFile={UseTemporaryFile}",
+            "Writing and verifying Guest file. VmName={VmName}, File={File}, UseTemporaryFile={UseTemporaryFile}",
             vm.Name,
-            vm.WorkerId,
+            fileLabel,
             useTemporaryFile);
 
         try
@@ -399,10 +451,15 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         }
     }
 
-    private static string BuildWriteAndVerifyInitFileCommand(string workerId, bool useTemporaryFile)
+    private static string BuildWriteAndVerifyGuestTextFileCommand(
+        string guestPath,
+        string expectedValue,
+        string fileLabel,
+        bool useTemporaryFile)
     {
-        var escapedPath = EscapePowerShellSingleQuotedString(GuestInitFilePath);
-        var escapedWorkerId = EscapePowerShellSingleQuotedString(workerId);
+        var escapedPath = EscapePowerShellSingleQuotedString(guestPath);
+        var escapedValue = EscapePowerShellSingleQuotedString(expectedValue);
+        var escapedLabel = EscapePowerShellSingleQuotedString(fileLabel);
         var writeCommand = useTemporaryFile
             ? """
 $tmp = "$target.tmp"
@@ -416,11 +473,11 @@ Move-Item -LiteralPath $tmp -Destination $target -Force
         return $$"""
 $ErrorActionPreference = 'Stop'
 $target = '{{escapedPath}}'
-$expected = '{{escapedWorkerId}}'
+$expected = '{{escapedValue}}'
 {{writeCommand}}
 $actual = [System.IO.File]::ReadAllText($target, [System.Text.Encoding]::UTF8).TrimEnd("`r", "`n")
 if ($actual -ne $expected) {
-    Write-Error "rpa.init verification failed. Expected '$expected' but read '$actual'."
+    Write-Error "{{escapedLabel}} verification failed. Expected '$expected' but read '$actual'."
     exit 10
 }
 """;

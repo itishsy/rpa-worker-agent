@@ -9,6 +9,7 @@ public static class WorkerAgentOptionsValidator
         Require(options.Agent.HostId, "Agent.HostId", errors);
         Require(options.Agent.HostWorkPath, "Agent.HostWorkPath", errors);
         Require(options.Vmrun.VmrunPath, "Vmrun.VmrunPath", errors);
+        ValidateNetType(options.Vmrun.NetType, errors);
         Positive(options.Agent.VmOperationLeaseSeconds, "Agent.VmOperationLeaseSeconds", errors);
         Positive(options.Agent.VmOperationHeartbeatSeconds, "Agent.VmOperationHeartbeatSeconds", errors);
         if (options.Agent.VmOperationHeartbeatSeconds >= options.Agent.VmOperationLeaseSeconds)
@@ -93,5 +94,19 @@ public static class WorkerAgentOptionsValidator
     private static void Positive(int value, string name, List<string> errors)
     {
         if (value <= 0) errors.Add($"{name} must be greater than zero.");
+    }
+
+    private static void ValidateNetType(string netType, List<string> errors)
+    {
+        if (string.IsNullOrWhiteSpace(netType))
+        {
+            errors.Add("Vmrun.NetType is required.");
+            return;
+        }
+
+        if (netType.Trim().ToLowerInvariant() is not ("nat" or "bridged" or "hostonly" or "custom"))
+        {
+            errors.Add("Vmrun.NetType must be one of: nat, bridged, hostonly, custom.");
+        }
     }
 }

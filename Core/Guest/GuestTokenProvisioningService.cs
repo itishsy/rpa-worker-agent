@@ -11,7 +11,7 @@ namespace Seebot.WorkerAgent.Core.Guest;
 public sealed class GuestTokenProvisioningService : IGuestTokenProvisioningService
 {
     private const string TokenKey = "rpa.token";
-    private const string ApplicationPropertiesFileName = "application.properties";
+    private const string ApplicationPropertiesPath = @"D:\seebon\rpa\application.properties";
     private static readonly TimeSpan DefaultGuestOperationsTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan DefaultGuestOperationsPollInterval = TimeSpan.FromSeconds(5);
 
@@ -64,7 +64,7 @@ public sealed class GuestTokenProvisioningService : IGuestTokenProvisioningServi
             return Fail(ErrorCodes.SchedulerUnavailable, $"Failed to get scheduler access token: {ex.Message}");
         }
 
-        var propertiesPath = GetApplicationPropertiesPath(vm);
+        var propertiesPath = ApplicationPropertiesPath;
         var command = BuildUpdateTokenCommand(propertiesPath, token);
         var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(command));
 
@@ -120,14 +120,6 @@ public sealed class GuestTokenProvisioningService : IGuestTokenProvisioningServi
         }
 
         return false;
-    }
-
-    private static string GetApplicationPropertiesPath(VirtualMachineOptions vm)
-    {
-        var guestWorkPath = string.IsNullOrWhiteSpace(vm.GuestWorkPath)
-            ? @"D:\seebon\rpa"
-            : vm.GuestWorkPath.TrimEnd('\\', '/');
-        return guestWorkPath + @"\" + ApplicationPropertiesFileName;
     }
 
     private static string BuildUpdateTokenCommand(string propertiesPath, string token)
