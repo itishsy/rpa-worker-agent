@@ -19,13 +19,14 @@ Core/Operations/OperationsApiExtensions.cs
 Core/Operations/VmPowerOnService.cs
 Core/Snapshot/SnapshotUpdateService.cs
 Core/Coordination/VmOperationCoordinator.cs
+Core/Coordination/AutomaticCycleGate.cs
 Core/Storage/LocalStore.cs
 ```
 
 `VmPowerOnService.cs` 内分为两层：
 
 - `IVmPowerRecoveryService`：无锁的统一开机/蓝屏恢复核心，由页面 API 和快照切换共同调用；
-- `IVmPowerOnService`：页面 API 编排层，负责查找 VM、获取 `IVmOperationLock` 和 `ManualPowerOn` 租约。
+- `IVmPowerOnService`：页面 API 编排层，负责查找 VM 并调用统一恢复核心；页面开机由人工控制，不申请 VM 锁和事务租约。
 
 快照切换已经持有 `ProfileSwitch` 租约，因此直接调用恢复核心，不会嵌套申请 `ManualPowerOn` 租约。
 
@@ -133,6 +134,14 @@ Token 成功后轮询 Runner。Runner 必须进入正常可用状态，并且返
 - `SnapshotUpdateService` 取得 `SnapshotUpdate` 持久化租约并使用同一 VM 锁；
 - 租约冲突返回 `VM_OPERATION_BUSY`。
 
+人工“升级快照”和“更新机器码”还使用宿主机级 `IAutomaticCycleGate`：
+
+- 自动后台循环在执行健康检查前取得自动周期租约，并持有到本轮调度结束；
+- 人工维护先等待正在执行的自动周期完成，再取得独占维护租约；
+- 维护租约持有期间，新的健康检查和自动快照调度不会开始；
+- 快照升级、机器码更新成功、失败、取消或抛出异常时，租约都会通过 `await using` 自动释放；
+- 两个人工维护请求也会串行执行，避免互相干扰。
+
 因此：
 
 - 手动切换不能与自动切换同时操作同一 VM；
@@ -173,7 +182,7 @@ Token 成功后轮询 Runner。Runner 必须进入正常可用状态，并且返
 - VM 已运行且 Runner 请求正常：不改变电源状态，返回 `action=skipped`；
 - VM 已运行但 Runner 请求异常：硬关机并确认停止，再启动并确认运行及 Runner 恢复，返回 `action=restarted`。
 
-该操作使用同一 `IVmOperationLock` 和 `ManualPowerOn` 持久化租约，因此不能与切换、快照升级或其他 VM 维护操作并发。
+该页面开机操作不申请 `IVmOperationLock` 或持久化事务租约，由人工负责避免与切换、快照升级或其他维护操作并发。
 
 针对蓝屏或 VMware Tools 卡死场景，“开机”操作使用独立的 Runner 探测超时，不会长期阻塞在 `getGuestIPAddress`：
 

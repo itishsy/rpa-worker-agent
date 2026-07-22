@@ -657,7 +657,7 @@ public interface IVmrunService
 
     Task RevertToSnapshotAsync(string vmxPath, string snapshotName, CancellationToken ct);
 
-    Task StartVmAsync(string vmxPath, bool noGui, CancellationToken ct);
+    Task StartVmAsync(string vmxPath, CancellationToken ct);
 
     Task CopyFileFromGuestToHostAsync(
         string vmxPath,

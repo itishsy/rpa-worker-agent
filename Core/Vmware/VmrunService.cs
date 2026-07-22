@@ -173,9 +173,9 @@ public sealed class VmrunService : IVmrunService
         return RunVmrunAsync("revertToSnapshot", [vmxPath, snapshotName], cancellationToken);
     }
 
-    public Task<VmrunCommandResult> StartVmAsync(string vmxPath, bool noGui, CancellationToken cancellationToken)
+    public Task<VmrunCommandResult> StartVmAsync(string vmxPath, CancellationToken cancellationToken)
     {
-        return RunVmrunAsync("start", noGui ? [vmxPath, "nogui"] : [vmxPath], cancellationToken);
+        return RunVmrunAsync("start", [vmxPath, "nogui"], cancellationToken);
     }
 
     private async Task<VmrunCommandResult> RunVmrunAsync(

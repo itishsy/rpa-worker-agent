@@ -369,7 +369,7 @@ if (beforeStatus.RunnerStatusCode == RunnerStatusCode.Running)
 // Core/Switching/VmSwitchService.cs
 await _vmrunService.StopVmAsync(request.Vm.VmxPath, VmStopMode.Soft, cancellationToken);
 await _vmrunService.RevertToSnapshotAsync(request.Vm.VmxPath, request.TargetSnapshotName, cancellationToken);
-await _vmrunService.StartVmAsync(request.Vm.VmxPath, _options.Vmrun.DefaultStartNoGui, cancellationToken);
+await _vmrunService.StartVmAsync(request.Vm.VmxPath, cancellationToken);
 ```
 
 ## 11. Profile 调度轮询

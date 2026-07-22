@@ -16,7 +16,7 @@ public interface IVmrunService
 
     Task<VmrunCommandResult> RevertToSnapshotAsync(string vmxPath, string snapshotName, CancellationToken cancellationToken);
 
-    Task<VmrunCommandResult> StartVmAsync(string vmxPath, bool noGui, CancellationToken cancellationToken);
+    Task<VmrunCommandResult> StartVmAsync(string vmxPath, CancellationToken cancellationToken);
 
     Task<VmrunCommandResult> EnableSharedFoldersAsync(string vmxPath, CancellationToken cancellationToken);
 

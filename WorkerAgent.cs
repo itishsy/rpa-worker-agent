@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Seebot.WorkerAgent.Core.Configuration;
+using Seebot.WorkerAgent.Core.Coordination;
 using Seebot.WorkerAgent.Core.Health;
 using Seebot.WorkerAgent.Core.Reporting;
 using Seebot.WorkerAgent.Core.Scheduling;
@@ -12,6 +13,7 @@ public sealed class WorkerAgent : BackgroundService
     private readonly IPoolSchedulerService _poolSchedulerService;
     private readonly CapabilityReportService _capabilityReportService;
     private readonly IVmHealthCheckService _vmHealthCheckService;
+    private readonly IAutomaticCycleGate _automaticCycleGate;
     private readonly WorkerAgentOptions _options;
     private readonly ILogger<WorkerAgent> _logger;
 
@@ -19,12 +21,14 @@ public sealed class WorkerAgent : BackgroundService
         IPoolSchedulerService poolSchedulerService,
         CapabilityReportService capabilityReportService,
         IVmHealthCheckService vmHealthCheckService,
+        IAutomaticCycleGate automaticCycleGate,
         WorkerAgentOptions options,
         ILogger<WorkerAgent> logger)
     {
         _poolSchedulerService = poolSchedulerService;
         _capabilityReportService = capabilityReportService;
         _vmHealthCheckService = vmHealthCheckService;
+        _automaticCycleGate = automaticCycleGate;
         _options = options;
         _logger = logger;
     }
@@ -39,6 +43,9 @@ public sealed class WorkerAgent : BackgroundService
         {
             try
             {
+                await using var cycleLease = await _automaticCycleGate
+                    .EnterAutomaticCycleAsync(stoppingToken)
+                    .ConfigureAwait(false);
                 await _vmHealthCheckService.CheckAsync(stoppingToken).ConfigureAwait(false);
                 var result = await _poolSchedulerService.RunOneCycleAsync(stoppingToken).ConfigureAwait(false);
                 if (result.SwitchStarted)

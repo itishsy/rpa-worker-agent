@@ -116,7 +116,6 @@ dotnet publish rpa-worker-agent.csproj -c Release -o D:\seebot\rpa-worker-agent
   },
   "Vmrun": {
     "VmrunPath": "D:\\VMware\\VMware Workstation\\vmrun.exe",
-    "DefaultStartNoGui": true,
     "StopSoftTimeoutSeconds": 60,
     "AllowHardStopAfterSoftTimeout": false
   },
@@ -169,7 +168,7 @@ dotnet publish rpa-worker-agent.csproj -c Release -o D:\seebot\rpa-worker-agent
 `Vmrun`：
 
 - `VmrunPath`：`vmrun.exe` 完整路径。
-- `DefaultStartNoGui`：启动 VM 时是否使用 `nogui`。
+- Agent 后台启动 VM 时固定使用 `vmrun start <vmx> nogui`，无需配置启动模式。
 - `StopSoftTimeoutSeconds`：vmrun 命令超时时间。
 
 `VirtualMachines`：

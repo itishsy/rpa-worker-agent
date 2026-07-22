@@ -178,7 +178,7 @@ public sealed class VmPowerRecoveryService : IVmPowerRecoveryService
         var max = Math.Max(1, _options.Agent.ManualPowerOnStartMaxAttempts); Exception? last = null;
         for (var attempt = 1; attempt <= max; attempt++)
         {
-            try { await _vmrun.StartVmAsync(vm.VmxPath, _options.Vmrun.DefaultStartNoGui, ct).ConfigureAwait(false); }
+            try { await _vmrun.StartVmAsync(vm.VmxPath, ct).ConfigureAwait(false); }
             catch (Exception ex) when (ex is not OperationCanceledException) { last = ex; _logger.LogWarning(ex, "VM start failed. VmName={VmName}, Attempt={Attempt}, MaxAttempts={MaxAttempts}", vm.Name, attempt, max); }
             if (await WaitForPowerStateAsync(vm.VmxPath, true, ct).ConfigureAwait(false)) return null;
             if (attempt < max) await Task.Delay(_poll, _time, ct).ConfigureAwait(false);

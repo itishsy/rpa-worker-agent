@@ -193,9 +193,9 @@ public sealed class VmSwitchService : IVmSwitchService
 
         try
         {
-            _logger.LogInformation("快照回滚完成，启动 VM。TxId={TxId}, VmName={VmName}, NoGui={NoGui}", tx.TransactionId, request.Vm.Name, _options.Vmrun.DefaultStartNoGui);
+            _logger.LogInformation("快照回滚完成，以 nogui 模式启动 VM。TxId={TxId}, VmName={VmName}", tx.TransactionId, request.Vm.Name);
             if (operation is not null) await operation.SetStatusAsync(VmOperationStatus.StartingVm, cancellationToken).ConfigureAwait(false);
-            await _vmrunService.StartVmAsync(request.Vm.VmxPath, _options.Vmrun.DefaultStartNoGui, cancellationToken);
+            await _vmrunService.StartVmAsync(request.Vm.VmxPath, cancellationToken);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {

@@ -472,7 +472,6 @@ Agent 只读取状态并上报，不参与任务执行
   },
   "Vmrun": {
     "VmrunPath": "C:\\Program Files (x86)\\VMware\\VMware Workstation\\vmrun.exe",
-    "DefaultStartNoGui": true,
     "StopSoftTimeoutSeconds": 60,
     "AllowHardStopAfterSoftTimeout": true
   },
@@ -845,7 +844,7 @@ public interface IVmrunService
 
     Task RevertToSnapshotAsync(string vmxPath, string snapshotName, CancellationToken ct);
 
-    Task StartVmAsync(string vmxPath, bool noGui, CancellationToken ct);
+    Task StartVmAsync(string vmxPath, CancellationToken ct);
 
     Task CopyFileFromGuestToHostAsync(
         string vmxPath,

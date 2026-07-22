@@ -5,7 +5,8 @@
     [string]$ExePath = "C:\Program Files\Seebot Worker Agent\service\Seebot.WorkerAgent.Service.exe",
     [string[]]$AdditionalGrantPaths = @(),
     [string]$ServiceUser,
-    [Security.SecureString]$ServicePassword
+    [Security.SecureString]$ServicePassword,
+    [bool]$StartAfterInstall = $true
 )
 
 Write-Host "Installing Windows service: $ServiceName"
@@ -154,7 +155,9 @@ else {
 }
 
 foreach ($path in $AdditionalGrantPaths) {
-    Add-GrantPath $grantPaths $path
+    foreach ($pathItem in ($path -split '[,;]')) {
+        Add-GrantPath $grantPaths $pathItem
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($ServiceUser)) {
@@ -240,6 +243,25 @@ if ($LASTEXITCODE -ne 0) {
 sc.exe description $ServiceName $Description
 sc.exe failure $ServiceName reset= 86400 actions= restart/60000/restart/60000/none/60000
 
+if ($StartAfterInstall) {
+    Write-Host "Starting service: $ServiceName"
+    try {
+        Start-Service -Name $ServiceName -ErrorAction Stop
+        $installedService = Get-Service -Name $ServiceName -ErrorAction Stop
+        $installedService.WaitForStatus(
+            [System.ServiceProcess.ServiceControllerStatus]::Running,
+            [TimeSpan]::FromSeconds(30)
+        )
+        $installedService.Refresh()
+        Write-Host "Service is running: $ServiceName" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "ERROR: Service was installed but failed to start: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Check the service logs and Windows Event Viewer for startup errors." -ForegroundColor Yellow
+        exit 1
+    }
+}
+
 Write-Host "Service configuration:"
 sc.exe qc $ServiceName
 sc.exe query $ServiceName
@@ -247,6 +269,9 @@ sc.exe query $ServiceName
 Write-Host ""
 Write-Host "Install completed."
 Write-Host "Service account: $ServiceUser"
-Write-Host "Start service: Start-Service $ServiceName"
+Write-Host "Startup mode: Automatic"
+if (-not $StartAfterInstall) {
+    Write-Host "Start service manually: Start-Service $ServiceName"
+}
 Write-Host "If VM configs are stored in SQLite, pass VM roots explicitly, for example:"
-Write-Host "  .\install-service.ps1 -ExePath D:\seebot\rpa-worker-agent\Seebot.WorkerAgent.Service.exe -AdditionalGrantPaths E:\vms,D:\VMware"
+Write-Host '  .\install-service.ps1 -ExePath "C:\Program Files\Seebot Worker Agent\service\Seebot.WorkerAgent.Service.exe" -AdditionalGrantPaths @("E:\VMS", "D:\VMS")'

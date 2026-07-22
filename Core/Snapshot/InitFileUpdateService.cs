@@ -2,6 +2,7 @@ using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Seebot.WorkerAgent.Core.Configuration;
+using Seebot.WorkerAgent.Core.Coordination;
 using Seebot.WorkerAgent.Core.Guest;
 using Seebot.WorkerAgent.Core.Storage;
 using Seebot.WorkerAgent.Core.Vmware;
@@ -28,6 +29,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
     private readonly TimeSpan _processWaitTimeout;
     private readonly TimeSpan _processPollInterval;
     private readonly ILogger<InitFileUpdateService> _logger;
+    private readonly IAutomaticCycleGate? _automaticCycleGate;
 
     public InitFileUpdateService(
         IVmrunService vmrunService,
@@ -39,7 +41,8 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         TimeSpan? processWaitTimeout = null,
         TimeSpan? processPollInterval = null,
         ILogger<InitFileUpdateService>? logger = null,
-        IGuestTokenProvisioningService? guestTokenProvisioningService = null)
+        IGuestTokenProvisioningService? guestTokenProvisioningService = null,
+        IAutomaticCycleGate? automaticCycleGate = null)
     {
         _vmrunService = vmrunService;
         _vmOperationLock = vmOperationLock;
@@ -51,9 +54,21 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         _processWaitTimeout = processWaitTimeout ?? DefaultProcessWaitTimeout;
         _processPollInterval = processPollInterval ?? DefaultProcessPollInterval;
         _logger = logger ?? NullLogger<InitFileUpdateService>.Instance;
+        _automaticCycleGate = automaticCycleGate;
     }
 
     public async Task<InitFileUpdateResult> UpdateWorkerIdInSnapshotsAsync(string vmName, CancellationToken cancellationToken)
+    {
+        if (_automaticCycleGate is null)
+            return await UpdateWorkerIdInSnapshotsCoreAsync(vmName, cancellationToken).ConfigureAwait(false);
+
+        await using var pauseLease = await _automaticCycleGate
+            .PauseForMaintenanceAsync("UpdateWorkerId", vmName, cancellationToken)
+            .ConfigureAwait(false);
+        return await UpdateWorkerIdInSnapshotsCoreAsync(vmName, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<InitFileUpdateResult> UpdateWorkerIdInSnapshotsCoreAsync(string vmName, CancellationToken cancellationToken)
     {
         var vm = _options.VirtualMachines
             .FirstOrDefault(v => string.Equals(v.Name, vmName, StringComparison.OrdinalIgnoreCase));
@@ -164,7 +179,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         // 3. Start the VM.
         try
         {
-            await _vmrunService.StartVmAsync(vm.VmxPath, noGui: true, cancellationToken).ConfigureAwait(false);
+            await _vmrunService.StartVmAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

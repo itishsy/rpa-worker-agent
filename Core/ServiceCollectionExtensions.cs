@@ -112,6 +112,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ILocalStore>(provider => provider.GetRequiredService<LocalStore>());
         services.AddSingleton<IVmOperationStore>(provider => provider.GetRequiredService<LocalStore>());
         services.AddSingleton<IVmOperationCoordinator, VmOperationCoordinator>();
+        services.AddSingleton<IAutomaticCycleGate, AutomaticCycleGate>();
         services.AddHostedService<LocalStoreInitializerService>();
         services.AddSingleton<ILogBackupService, LogBackupService>();
         services.AddSingleton<Startup.IStartupValidator, StartupValidator>();
@@ -133,7 +134,8 @@ public static class ServiceCollectionExtensions
                 provider.GetRequiredService<WorkerAgentOptions>(),
                 provider.GetRequiredService<IVirtualMachineRegistry>(),
                 logger: provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<InitFileUpdateService>>(),
-                guestTokenProvisioningService: provider.GetRequiredService<IGuestTokenProvisioningService>()));
+                guestTokenProvisioningService: provider.GetRequiredService<IGuestTokenProvisioningService>(),
+                automaticCycleGate: provider.GetRequiredService<IAutomaticCycleGate>()));
         services.AddSingleton<CapabilityReportService>();
 
         return services;

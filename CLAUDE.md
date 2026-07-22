@@ -133,7 +133,7 @@ Configuration comes from `appsettings.json`. Key sections:
     "ForceRevertWhenBackupFailed": false
   },
   "Scheduler": { "BaseUrl": "", "AccessToken": "" },
-  "Vmrun": { "VmrunPath": "", "DefaultStartNoGui": true },
+  "Vmrun": { "VmrunPath": "" },
   "VirtualMachines": [{
     "Name": "", "VmxPath": "", "WorkerId": "",
     "RunnerStatusUrl": "http://...:9090/...",

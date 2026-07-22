@@ -253,7 +253,7 @@ SCHEDULED
 
 无论离线检查或收缩成功与否，只要 VM 文件仍可用，都应进入恢复启动：
 
-1. 执行 `vmrun start`，沿用 `Vmrun.DefaultStartNoGui`；
+1. 执行 `vmrun start <vmx> nogui`；
 2. 等待 `IsVmRunningAsync == true`；
 3. 等待 VMware Tools/Guest IP 可用；
 4. 等待 Runner 状态进入 `Runnable` 或 `Running`；

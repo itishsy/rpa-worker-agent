@@ -60,6 +60,7 @@ var tests = new (string Name, Action Body)[]
     ("LocalStore updates switch transaction status", LocalStoreUpdatesSwitchTransactionStatus),
     ("LocalStore incomplete transaction query excludes terminal states", LocalStoreIncompleteTransactionQueryExcludesTerminalStates),
     ("VM operation lease is exclusive and supports expired takeover fencing", VmOperationLeaseIsExclusiveAndFenced),
+    ("Automatic cycle gate serializes maintenance and automatic cycles", AutomaticCycleGateSerializesMaintenanceAndAutomaticCycles),
     ("VM recovery power-cycle budget persists across attempts", VmRecoveryPowerCycleBudgetPersists),
     ("VM health check ensures enabled VMs are operational and invokes cleanup hook", VmHealthCheckEnsuresEnabledVmsAreOperational),
     ("VM power-on action starts, skips, and restarts according to state", VmPowerOnActionHandlesAllStates),
@@ -146,6 +147,7 @@ static void HostRegistersCoreServicesAndHostedServices()
     var hostedServices = app.Services.GetServices<IHostedService>().ToList();
 
     Assert.NotNull(app.Services.GetRequiredService<IAgentCoreMarker>(), "Core marker service should be registered.");
+    Assert.NotNull(app.Services.GetRequiredService<IAutomaticCycleGate>(), "Automatic cycle gate should be registered.");
     Assert.NotEmpty(hostedServices, "At least one hosted service should be registered.");
     Assert.True(
         hostedServices.Any(service => service.GetType().Name == "LocalStoreInitializerService"),
@@ -482,6 +484,37 @@ static void VmOperationLeaseIsExclusiveAndFenced()
     Assert.True(!staleWrite, "The previous owner must not update after fencing takeover.");
 }
 
+static void AutomaticCycleGateSerializesMaintenanceAndAutomaticCycles()
+{
+    var gate = new AutomaticCycleGate();
+    var automaticLease = gate.EnterAutomaticCycleAsync(default).GetAwaiter().GetResult();
+    var maintenanceWait = gate.PauseForMaintenanceAsync("SnapshotUpdate", "vm-1", default);
+
+    Thread.Sleep(50);
+    Assert.True(!maintenanceWait.IsCompleted, "Manual maintenance must wait for the active automatic cycle to finish.");
+
+    automaticLease.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    var maintenanceLease = maintenanceWait.GetAwaiter().GetResult();
+    var nextAutomaticWait = gate.EnterAutomaticCycleAsync(default);
+
+    Thread.Sleep(50);
+    Assert.True(!nextAutomaticWait.IsCompleted, "A new automatic cycle must not start while manual maintenance is active.");
+
+    maintenanceLease.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    var nextAutomaticLease = nextAutomaticWait.GetAwaiter().GetResult();
+    nextAutomaticLease.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+    var heldLease = gate.EnterAutomaticCycleAsync(default).GetAwaiter().GetResult();
+    using var cancellation = new CancellationTokenSource();
+    var canceledWait = gate.PauseForMaintenanceAsync("UpdateWorkerId", "vm-1", cancellation.Token);
+    cancellation.Cancel();
+    Assert.Throws<OperationCanceledException>(() => canceledWait.GetAwaiter().GetResult());
+    heldLease.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+    var finalLease = gate.PauseForMaintenanceAsync("SnapshotUpdate", "vm-1", default).GetAwaiter().GetResult();
+    finalLease.DisposeAsync().AsTask().GetAwaiter().GetResult();
+}
+
 static void VmRecoveryPowerCycleBudgetPersists()
 {
     using var scope = TempDatabase();
@@ -533,7 +566,7 @@ static void VmPowerOnActionHandlesAllStates()
                 ManualPowerOnRunnerProbeTimeoutSeconds = 1, ManualPowerOnStartMaxAttempts = 3,
                 ManualPowerOnRunnerReadyTimeoutSeconds = 1
             },
-            Vmrun = new VmrunOptions { DefaultStartNoGui = true }
+            Vmrun = new VmrunOptions()
         };
         var vm = BackupVm(Path.Combine(Path.GetTempPath(), "rpa-worker-agent-power-on-tests"));
         var registry = new SqliteVirtualMachineRegistry(scope.DatabasePath);
@@ -848,7 +881,7 @@ static void VmrunServicePassesStartNoguiArguments()
     var runner = new FakeProcessRunner(SuccessResult("start"));
     var service = NewVmrunService(runner);
 
-    service.StartVmAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", noGui: true, CancellationToken.None).GetAwaiter().GetResult();
+    service.StartVmAsync(@"D:\VMs With Spaces\SR20\SR20.vmx", CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.SequenceEqual(new[] { "-T", "ws", "start", @"D:\VMs With Spaces\SR20\SR20.vmx", "nogui" }, runner.LastCommand!.Arguments, "start nogui arguments should match vmrun contract.");
 }
@@ -1355,7 +1388,7 @@ static void VmrunServiceSerializesConcurrentCommands()
     Task.WhenAll(
         service.IsVmRunningAsync(@"D:\VMs\VM-A\VM-A.vmx", CancellationToken.None),
         service.ListSnapshotsAsync(@"D:\VMs\VM-B\VM-B.vmx", CancellationToken.None),
-        service.StartVmAsync(@"D:\VMs\VM-C\VM-C.vmx", noGui: true, CancellationToken.None))
+        service.StartVmAsync(@"D:\VMs\VM-C\VM-C.vmx", CancellationToken.None))
         .GetAwaiter().GetResult();
 
     Assert.Equal(1, runner.MaximumConcurrency, "Concurrent VmrunService calls must execute one vmrun command at a time.");
@@ -1994,7 +2027,7 @@ static WorkerAgentOptions SnapshotUpdateOptions()
     return new WorkerAgentOptions
     {
         Agent = new AgentOptions { HostId = "HOST-SR20-001" },
-        Vmrun = new VmrunOptions { DefaultStartNoGui = true },
+        Vmrun = new VmrunOptions(),
         VirtualMachines =
         [
             new VirtualMachineOptions
@@ -2289,7 +2322,6 @@ static VmSwitchService NewVmSwitchService(
         },
         Vmrun = new VmrunOptions
         {
-            DefaultStartNoGui = true,
             AllowHardStopAfterSoftTimeout = allowHardStopAfterSoftTimeout,
             StopSoftTimeoutSeconds = stopSoftTimeoutSeconds
         }
@@ -2584,7 +2616,6 @@ static WorkerAgentOptions ValidOptions()
         Vmrun = new VmrunOptions
         {
             VmrunPath = @"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe",
-            DefaultStartNoGui = true,
             StopSoftTimeoutSeconds = 60,
             AllowHardStopAfterSoftTimeout = true
         },
@@ -2813,7 +2844,7 @@ internal sealed class FakeVmrunService : IVmrunService
         throw new NotSupportedException();
     }
 
-    public Task<VmrunCommandResult> StartVmAsync(string vmxPath, bool noGui, CancellationToken cancellationToken)
+    public Task<VmrunCommandResult> StartVmAsync(string vmxPath, CancellationToken cancellationToken)
     {
         throw new NotSupportedException();
     }
@@ -3085,7 +3116,7 @@ internal sealed class RecordingSwitchVmrunService : IVmrunService
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "revertToSnapshot"));
     }
 
-    public Task<VmrunCommandResult> StartVmAsync(string vmxPath, bool noGui, CancellationToken cancellationToken)
+    public Task<VmrunCommandResult> StartVmAsync(string vmxPath, CancellationToken cancellationToken)
     {
         _recorder.Actions.Add("vmrun-start");
         if (FailStartTimes > 0)
@@ -3452,7 +3483,7 @@ internal sealed class RecordingSnapshotUpdateVmrunService : IVmrunService
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "revertToSnapshot"));
     }
 
-    public Task<VmrunCommandResult> StartVmAsync(string vmxPath, bool noGui, CancellationToken cancellationToken)
+    public Task<VmrunCommandResult> StartVmAsync(string vmxPath, CancellationToken cancellationToken)
     {
         _recorder.Actions.Add("vmrun-start");
         return Task.FromResult(new VmrunCommandResult(0, "", "", TimeSpan.Zero, "start"));

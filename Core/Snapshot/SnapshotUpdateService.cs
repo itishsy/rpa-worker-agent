@@ -30,6 +30,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
     private readonly ILogger<SnapshotUpdateService> _logger;
     private readonly TimeSpan _vmStoppedPollInterval;
     private readonly IVmOperationCoordinator? _operationCoordinator;
+    private readonly IAutomaticCycleGate? _automaticCycleGate;
 
     public SnapshotUpdateService(
         IVmrunService vmrunService,
@@ -45,7 +46,8 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         int? runnerStatusCheckMaxAttempts = null,
         TimeSpan? vmStoppedPollInterval = null,
         IGuestTokenProvisioningService? guestTokenProvisioningService = null,
-        IVmOperationCoordinator? operationCoordinator = null)
+        IVmOperationCoordinator? operationCoordinator = null,
+        IAutomaticCycleGate? automaticCycleGate = null)
     {
         _vmrunService = vmrunService;
         _guestWorkerClient = guestWorkerClient;
@@ -61,9 +63,24 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         _logger = logger ?? NullLogger<SnapshotUpdateService>.Instance;
         _vmStoppedPollInterval = vmStoppedPollInterval ?? DefaultVmStoppedPollInterval;
         _operationCoordinator = operationCoordinator;
+        _automaticCycleGate = automaticCycleGate;
     }
 
     public async Task<SnapshotUpdateResult> UpdateSnapshotAsync(
+        string vmName,
+        string profileId,
+        CancellationToken cancellationToken)
+    {
+        if (_automaticCycleGate is null)
+            return await UpdateSnapshotWithOperationLeaseAsync(vmName, profileId, cancellationToken).ConfigureAwait(false);
+
+        await using var pauseLease = await _automaticCycleGate
+            .PauseForMaintenanceAsync("SnapshotUpdate", vmName, cancellationToken)
+            .ConfigureAwait(false);
+        return await UpdateSnapshotWithOperationLeaseAsync(vmName, profileId, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<SnapshotUpdateResult> UpdateSnapshotWithOperationLeaseAsync(
         string vmName,
         string profileId,
         CancellationToken cancellationToken)
@@ -161,7 +178,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
             try
             {
                 _logger.LogInformation("快照画像升级校验前启动 VM。VmName={VmName}", vm.Name);
-                await _vmrunService.StartVmAsync(vm.VmxPath, noGui: false, cancellationToken);
+                await _vmrunService.StartVmAsync(vm.VmxPath, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -248,7 +265,7 @@ public sealed class SnapshotUpdateService : ISnapshotUpdateService
         try
         {
             _logger.LogInformation("快照画像升级完成后启动 VM。VmName={VmName}", vm.Name);
-            await _vmrunService.StartVmAsync(vm.VmxPath, noGui: false, cancellationToken);
+            await _vmrunService.StartVmAsync(vm.VmxPath, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
