@@ -111,10 +111,10 @@ var tests = new (string Name, Action Body)[]
     ("PoolSchedulerService skips Running VM candidates", PoolSchedulerServiceSkipsRunningVmCandidates),
     ("PoolSchedulerService does not preempt current profile with pending tasks", PoolSchedulerServiceDoesNotPreemptCurrentProfileWithPendingTasks),
     ("PoolSchedulerService handles higher priority profile first", PoolSchedulerServiceHandlesHigherPriorityProfileFirst),
-    ("PoolSchedulerService reverts to General when no pending tasks and VM is not on General", PoolSchedulerServiceRevertsToGeneralWhenNoPendingTasksAndVmIsNotGeneral),
-    ("PoolSchedulerService does not revert when VM already on General and no pending tasks", PoolSchedulerServiceDoesNotRevertWhenVmAlreadyOnGeneral),
     ("CapabilityReportService reports all VM profile capabilities", CapabilityReportServiceReportsAllVmProfileCapabilities),
+    ("CapabilityReportService reports Enabled Disabled and Quarantined status", CapabilityReportServiceReportsVmEnvironmentStatus),
     ("InitFileUpdateService writes token server URL and worker ID before rebuilding snapshot", InitFileUpdateServiceWritesRequiredGuestConfiguration),
+    ("InitFileUpdateService updates only the selected profile snapshot", InitFileUpdateServiceUpdatesOnlySelectedProfileSnapshot),
     ("SnapshotNameGenerator generates first sequence number when no existing snapshot for today", SnapshotNameGeneratorGeneratesFirstSequenceNumber),
     ("SnapshotNameGenerator increments sequence when today snapshot already exists", SnapshotNameGeneratorIncrementsSequence),
     ("SnapshotNameGenerator does not conflict with different profile on same date", SnapshotNameGeneratorIgnoresDifferentProfile),
@@ -541,15 +541,25 @@ static void VmHealthCheckEnsuresEnabledVmsAreOperational()
     var disabledVm = BackupVm(Path.Combine(Path.GetTempPath(), "rpa-worker-agent-disabled-health-tests"));
     disabledVm.Name = "disabled-vm";
     disabledVm.Enabled = false;
-    var service = new VmHealthCheckService(powerOn, vmrun, cleanup, new WorkerAgentOptions
+    var quarantinedVm = BackupVm(Path.Combine(Path.GetTempPath(), "rpa-worker-agent-quarantined-health-tests"));
+    quarantinedVm.Name = "quarantined-vm";
+    quarantinedVm.Enabled = true;
+    var store = new RecordingLocalStore(new ActionRecorder())
     {
-        VirtualMachines = [vm, disabledVm]
+        VmStates = [new VmCurrentState { VmName = quarantinedVm.Name, IsQuarantined = true }]
+    };
+    var service = new VmHealthCheckService(powerOn, vmrun, cleanup, store, new WorkerAgentOptions
+    {
+        Agent = new AgentOptions { HostId = "health-test-host" },
+        VirtualMachines = [vm, disabledVm, quarantinedVm]
     });
 
     service.CheckAsync(default).GetAwaiter().GetResult();
 
-    Assert.SequenceEqual(new[] { vm.Name }, powerOn.VmNames, "Health check should power-on every enabled VM and skip disabled VMs.");
-    Assert.Equal(1, cleanup.Contexts.Count, "Disk cleanup extension point should be invoked once per enabled VM.");
+    Assert.SequenceEqual(new[] { vm.Name }, powerOn.VmNames,
+        "Health check should skip disabled and quarantined VMs.");
+    Assert.Equal(1, cleanup.Contexts.Count,
+        "Disk cleanup must not run for disabled or quarantined VMs.");
     Assert.True(!cleanup.Contexts[0].IsVmRunning, "Cleanup context should contain the observed VM power state.");
 }
 
@@ -974,7 +984,8 @@ static void SchedulerClientCapabilitiesPostsProfileCapabilityList()
             MachineCode = "rpa-sh-tax-etax-001",
             ProfileCode = "rpa-sh-tax-etax",
             ProfileName = "上海税务电子税局",
-            SnapshotName = "rpa-sh-tax-etax.v260624.1"
+            SnapshotName = "rpa-sh-tax-etax.v260624.1",
+            Status = "Enabled"
         }
     ], CancellationToken.None).GetAwaiter().GetResult();
 
@@ -989,6 +1000,7 @@ static void SchedulerClientCapabilitiesPostsProfileCapabilityList()
     Assert.Equal("rpa-sh-tax-etax", item.GetProperty("profileCode").GetString(), "Capability profileCode should be serialized.");
     Assert.Equal("上海税务电子税局", item.GetProperty("profileName").GetString(), "Capability profileName should be serialized.");
     Assert.Equal("rpa-sh-tax-etax.v260624.1", item.GetProperty("snapshotName").GetString(), "Capability snapshotName should be serialized.");
+    Assert.Equal("Enabled", item.GetProperty("status").GetString(), "Capability status should be serialized.");
 }
 
 static void SchedulerClientLogsReportPayload()
@@ -1599,11 +1611,20 @@ static void PoolSchedulerServiceDoesNotSwitchWhenNoPendingTasks()
         VmStates = [SchedulerVmState("SR20-2026-6HQ8", "rpa-sh-social-portal", RunnerStatusCode.Runnable, now.AddSeconds(-60))]
     };
 
-    var result = NewPoolScheduler(scheduler, switchService, store, SchedulerWorkerOptions(), now)
+    var options = SchedulerWorkerOptions();
+    options.VirtualMachines[0].Profiles.Add(new ProfileOptions
+    {
+        ProfileId = "rpa-sh-general",
+        ProfileName = "General",
+        SnapshotName = "rpa-sh-general.v260624.1"
+    });
+
+    var result = NewPoolScheduler(scheduler, switchService, store, options, now)
         .RunOneCycleAsync(CancellationToken.None).GetAwaiter().GetResult();
 
     Assert.False(result.SwitchStarted, "No pending profile tasks should not start a switch.");
     Assert.Equal(0, switchService.Requests.Count, "Switch service should not be called when no profiles have pending work.");
+    Assert.Equal("No pending profile tasks returned by scheduler.", result.Reason, "The cycle should explain why no switch was performed.");
 }
 
 static void PoolSchedulerServiceSwitchesCompatibleIdleVmWhenPending()
@@ -1731,58 +1752,6 @@ static void PoolSchedulerServiceHandlesHigherPriorityProfileFirst()
     Assert.Equal("rpa-sh-social-portal", switchService.Requests[0].TargetProfileId, "Switch request should use the selected higher priority profile.");
 }
 
-static void PoolSchedulerServiceRevertsToGeneralWhenNoPendingTasksAndVmIsNotGeneral()
-{
-    var now = DateTimeOffset.Parse("2026-06-20T10:00:00+08:00");
-    var scheduler = new RecordingSchedulerClient();
-    var switchService = new RecordingVmSwitchService();
-    var store = new RecordingLocalStore(new ActionRecorder())
-    {
-        VmStates = [SchedulerVmState("SR20-2026-6HQ8", "rpa-sh-social-portal", RunnerStatusCode.Runnable, now.AddSeconds(-60))]
-    };
-    var options = SchedulerWorkerOptions();
-    options.Agent.GeneralProfileId = "rpa-sh-general";
-    options.VirtualMachines[0].Profiles.Add(new ProfileOptions
-    {
-        ProfileId = "rpa-sh-general",
-        ProfileName = "General",
-        SnapshotName = "rpa-sh-general.v260624.1"
-    });
-
-    var result = NewPoolScheduler(scheduler, switchService, store, options, now)
-        .RunOneCycleAsync(CancellationToken.None).GetAwaiter().GetResult();
-
-    Assert.True(result.SwitchStarted, "No pending tasks with non-General VM should trigger revert to General.");
-    Assert.Equal("rpa-sh-general", result.TargetProfileId, "Revert target should be GeneralProfileId.");
-    Assert.Equal(1, switchService.Requests.Count, "Exactly one switch to General should be started.");
-    Assert.Equal("rpa-sh-general.v260624.1", switchService.Requests[0].TargetSnapshotName, "Snapshot should match the General profile.");
-}
-
-static void PoolSchedulerServiceDoesNotRevertWhenVmAlreadyOnGeneral()
-{
-    var now = DateTimeOffset.Parse("2026-06-20T10:00:00+08:00");
-    var scheduler = new RecordingSchedulerClient();
-    var switchService = new RecordingVmSwitchService();
-    var store = new RecordingLocalStore(new ActionRecorder())
-    {
-        VmStates = [SchedulerVmState("SR20-2026-6HQ8", "rpa-sh-general", RunnerStatusCode.Runnable, now.AddSeconds(-60))]
-    };
-    var options = SchedulerWorkerOptions();
-    options.Agent.GeneralProfileId = "rpa-sh-general";
-    options.VirtualMachines[0].Profiles.Add(new ProfileOptions
-    {
-        ProfileId = "rpa-sh-general",
-        ProfileName = "General",
-        SnapshotName = "rpa-sh-general.v260624.1"
-    });
-
-    var result = NewPoolScheduler(scheduler, switchService, store, options, now)
-        .RunOneCycleAsync(CancellationToken.None).GetAwaiter().GetResult();
-
-    Assert.False(result.SwitchStarted, "VM already on General should not trigger another revert.");
-    Assert.Equal(0, switchService.Requests.Count, "No switch should be started when all VMs are already on General.");
-}
-
 static void CapabilityReportServiceReportsAllVmProfileCapabilities()
 {
     var scheduler = new RecordingSchedulerClient();
@@ -1803,6 +1772,52 @@ static void CapabilityReportServiceReportsAllVmProfileCapabilities()
     Assert.Equal("rpa-sh-tax-etax", scheduler.ReportedCapabilities[0][0].ProfileCode, "Capability should include profileCode.");
     Assert.Equal("Shanghai Tax", scheduler.ReportedCapabilities[0][0].ProfileName, "Capability should include profileName.");
     Assert.Equal("rpa-sh-tax-etax.v260624.1", scheduler.ReportedCapabilities[0][0].SnapshotName, "Capability should include snapshotName.");
+    Assert.Equal("Enabled", scheduler.ReportedCapabilities[0][0].Status, "Enabled VM profiles should report Enabled status.");
+}
+
+static void CapabilityReportServiceReportsVmEnvironmentStatus()
+{
+    var scheduler = new RecordingSchedulerClient();
+    var options = new WorkerAgentOptions
+    {
+        Agent = new AgentOptions { HostId = "host", AgentName = "agent" },
+        VirtualMachines =
+        [
+            CapabilityVm("enabled-vm", "enabled-worker", enabled: true),
+            CapabilityVm("disabled-vm", "disabled-worker", enabled: false),
+            CapabilityVm("quarantined-vm", "quarantined-worker", enabled: true)
+        ]
+    };
+    var store = new RecordingLocalStore(new ActionRecorder())
+    {
+        VmStates = [new VmCurrentState { VmName = "quarantined-vm", IsQuarantined = true }]
+    };
+    var service = new CapabilityReportService(
+        scheduler,
+        new FakeVmrunService(snapshots: ["profile.v260722.1"]),
+        new ProfileSnapshotResolver(),
+        options,
+        new ListLogger<CapabilityReportService>(),
+        store);
+
+    service.ReportOnceAsync(CancellationToken.None).GetAwaiter().GetResult();
+
+    var reported = scheduler.ReportedCapabilities.Single();
+    Assert.Equal("Enabled", reported.Single(item => item.MachineCode == "enabled-worker").Status, "Enabled VM should report Enabled.");
+    Assert.Equal("Disabled", reported.Single(item => item.MachineCode == "disabled-worker").Status, "Disabled VM should report Disabled.");
+    Assert.Equal("Quarantined", reported.Single(item => item.MachineCode == "quarantined-worker").Status, "Quarantined VM should report Quarantined.");
+}
+
+static VirtualMachineOptions CapabilityVm(string name, string workerId, bool enabled)
+{
+    return new VirtualMachineOptions
+    {
+        Name = name,
+        WorkerId = workerId,
+        VmxPath = name + ".vmx",
+        Enabled = enabled,
+        Profiles = [new ProfileOptions { ProfileId = "profile", ProfileName = "Profile" }]
+    };
 }
 
 static void SnapshotNameGeneratorGeneratesFirstSequenceNumber()
@@ -2356,6 +2371,7 @@ static void InitFileUpdateServiceWritesRequiredGuestConfiguration()
         VirtualMachines = [vm]
     };
     var vmrun = new InitUpdateVmrunService(["rpa-sh-tax-etax.v260721.1"]);
+    vmrun.FailGuestPowerShellPathOnce = @"C:\Program Files\rpa\server.init";
     vmrun.BeforeStart = () => Assert.Contains(
         new[] { File.ReadAllText(vm.VmxPath) },
         "ethernet0.connectionType = \"nat\"");
@@ -2380,12 +2396,19 @@ static void InitFileUpdateServiceWritesRequiredGuestConfiguration()
     var result = service.UpdateWorkerIdInSnapshotsAsync(vm.Name, default).GetAwaiter().GetResult();
 
     Assert.True(result.Success, "Worker ID update should succeed for a ready profile snapshot.");
-    Assert.Equal(3, vmrun.GuestPowerShellCommands.Count, "Token, server.init and rpa.init should each be written once.");
+    Assert.Equal(4, vmrun.GuestPowerShellCommands.Count, "Token and rpa.init should run once, while server.init should retry once.");
     Assert.True(vmrun.GuestPowerShellCommands.Any(command =>
             command.Contains(@"D:\seebon\rpa\application.properties", StringComparison.Ordinal)
             && command.Contains("rpa.token", StringComparison.Ordinal)
             && command.Contains("scheduler-token", StringComparison.Ordinal)),
         "Token should be written to the fixed application.properties path.");
+    Assert.False(
+        vmrun.GuestPowerShellCommands.Any(command => command.Contains("Remove-Item -Recurse -Force", StringComparison.Ordinal)),
+        "Worker ID update must not clear Guest backup directories.");
+    Assert.Equal(0, vmrun.KilledProcessNames.Count,
+        "Worker ID update must not stop robot.exe or java.exe.");
+    Assert.Equal(2, vmrun.ListProcessesInGuestCallCount,
+        "Worker ID update should check Guest Operations once directly and once during Token provisioning.");
     Assert.True(vmrun.GuestPowerShellCommands.Any(command =>
             command.Contains(@"C:\Program Files\rpa\server.init", StringComparison.Ordinal)
             && command.Contains("https://rpa.example.com/api", StringComparison.Ordinal)),
@@ -2394,11 +2417,79 @@ static void InitFileUpdateServiceWritesRequiredGuestConfiguration()
             command.Contains(@"C:\Program Files\rpa\rpa.init", StringComparison.Ordinal)
             && command.Contains(vm.WorkerId, StringComparison.Ordinal)),
         "WorkerId should be written to rpa.init.");
+    var lastServerInitWrite = vmrun.GuestPowerShellCommands.FindLastIndex(command =>
+        command.Contains(@"C:\Program Files\rpa\server.init", StringComparison.Ordinal));
+    var workerIdWrite = vmrun.GuestPowerShellCommands.FindIndex(command =>
+        command.Contains(@"C:\Program Files\rpa\rpa.init", StringComparison.Ordinal));
+    var tokenWrite = vmrun.GuestPowerShellCommands.FindIndex(command =>
+        command.Contains(@"D:\seebon\rpa\application.properties", StringComparison.Ordinal));
+    Assert.True(
+        lastServerInitWrite >= 0 && workerIdWrite > lastServerInitWrite && tokenWrite > workerIdWrite,
+        "BaseUrl and WorkerId must be written before Token so token-gated robot startup sees complete configuration.");
     Assert.Contains(
         new[] { File.ReadAllText(vm.VmxPath) },
         "ethernet0.connectionType = \"nat\"");
     Assert.Equal("rpa-sh-tax-etax.v260722.1", result.Profiles[0].NewSnapshotName, "A new dated snapshot should be created.");
     Assert.False(vmrun.Snapshots.Contains("rpa-sh-tax-etax.v260721.1", StringComparer.OrdinalIgnoreCase), "Old snapshot should be deleted.");
+}
+
+static void InitFileUpdateServiceUpdatesOnlySelectedProfileSnapshot()
+{
+    using var scope = TempDirectory();
+    var vm = BackupVm(scope.DirectoryPath);
+    vm.VmxPath = Path.Combine(scope.DirectoryPath, "test.vmx");
+    File.WriteAllText(vm.VmxPath, ".encoding = \"UTF-8\"\r\nethernet0.connectionType = \"bridged\"\r\n");
+    vm.Profiles =
+    [
+        new ProfileOptions
+        {
+            ProfileId = "profile-a",
+            ProfileName = "Profile A",
+            SnapshotName = "profile-a.v260721.1"
+        },
+        new ProfileOptions
+        {
+            ProfileId = "profile-b",
+            ProfileName = "Profile B",
+            SnapshotName = "profile-b.v260721.1"
+        }
+    ];
+    var options = new WorkerAgentOptions
+    {
+        Scheduler = new SchedulerOptions { BaseUrl = "https://rpa.example.com/api" },
+        Vmrun = new VmrunOptions { NetType = "nat" },
+        VirtualMachines = [vm]
+    };
+    var vmrun = new InitUpdateVmrunService(["profile-a.v260721.1", "profile-b.v260721.1"]);
+    var tokenProvisioning = new GuestTokenProvisioningService(
+        vmrun,
+        new StaticSchedulerTokenProvider("scheduler-token"),
+        new FixedTimeProvider(DateTimeOffset.Parse("2026-07-22T09:00:00Z")),
+        guestOperationsTimeout: TimeSpan.FromSeconds(1),
+        guestOperationsPollInterval: TimeSpan.Zero);
+    var service = new InitFileUpdateService(
+        vmrun,
+        new VmOperationLock(),
+        new ProfileSnapshotResolver(),
+        options,
+        timeProvider: new FixedTimeProvider(DateTimeOffset.Parse("2026-07-22T09:00:00Z")),
+        processWaitTimeout: TimeSpan.FromSeconds(1),
+        processPollInterval: TimeSpan.Zero,
+        guestTokenProvisioningService: tokenProvisioning,
+        vmxNetworkConfigurationService: new VmxNetworkConfigurationService(
+            NullLogger<VmxNetworkConfigurationService>.Instance));
+
+    var result = service.UpdateWorkerIdInSnapshotAsync(vm.Name, "profile-b", default).GetAwaiter().GetResult();
+
+    Assert.True(result.Success, "Selected profile update should succeed.");
+    Assert.Equal(1, result.Profiles.Count, "A single-profile request must return exactly one profile result.");
+    Assert.Equal("profile-b", result.Profiles[0].ProfileId, "Only the requested profile should be processed.");
+    Assert.True(vmrun.Snapshots.Contains("profile-a.v260721.1", StringComparer.OrdinalIgnoreCase),
+        "The unselected profile snapshot must remain unchanged.");
+    Assert.False(vmrun.Snapshots.Contains("profile-b.v260721.1", StringComparer.OrdinalIgnoreCase),
+        "The selected profile old snapshot should be replaced.");
+    Assert.True(vmrun.Snapshots.Contains("profile-b.v260722.1", StringComparer.OrdinalIgnoreCase),
+        "The selected profile new snapshot should be created.");
 }
 
 static VmSwitchRequest SwitchRequest()
@@ -3272,7 +3363,10 @@ internal sealed class InitUpdateVmrunService : IVmrunService
 
     public List<string> Snapshots { get; } = [];
     public List<string> GuestPowerShellCommands { get; } = [];
+    public List<string> KilledProcessNames { get; } = [];
     public Action? BeforeStart { get; set; }
+    public string? FailGuestPowerShellPathOnce { get; set; }
+    public int ListProcessesInGuestCallCount { get; private set; }
 
     public Task<IReadOnlyList<string>> ListSnapshotsAsync(string vmxPath, CancellationToken cancellationToken) =>
         Task.FromResult<IReadOnlyList<string>>([.. Snapshots]);
@@ -3315,6 +3409,23 @@ internal sealed class InitUpdateVmrunService : IVmrunService
         IReadOnlyList<string> arguments,
         CancellationToken cancellationToken)
     {
+        if (programPath.EndsWith("taskkill.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            var imageIndex = -1;
+            for (var index = 0; index < arguments.Count; index++)
+            {
+                if (string.Equals(arguments[index], "/IM", StringComparison.OrdinalIgnoreCase))
+                {
+                    imageIndex = index;
+                    break;
+                }
+            }
+            if (imageIndex >= 0 && imageIndex + 1 < arguments.Count)
+            {
+                KilledProcessNames.Add(arguments[imageIndex + 1]);
+            }
+        }
+
         var encodedIndex = -1;
         for (var index = 0; index < arguments.Count; index++)
         {
@@ -3326,7 +3437,14 @@ internal sealed class InitUpdateVmrunService : IVmrunService
         }
         if (encodedIndex >= 0 && encodedIndex + 1 < arguments.Count)
         {
-            GuestPowerShellCommands.Add(Encoding.Unicode.GetString(Convert.FromBase64String(arguments[encodedIndex + 1])));
+            var command = Encoding.Unicode.GetString(Convert.FromBase64String(arguments[encodedIndex + 1]));
+            GuestPowerShellCommands.Add(command);
+            if (!string.IsNullOrWhiteSpace(FailGuestPowerShellPathOnce)
+                && command.Contains(FailGuestPowerShellPathOnce, StringComparison.OrdinalIgnoreCase))
+            {
+                FailGuestPowerShellPathOnce = null;
+                throw new InvalidOperationException("Simulated direct Guest file write failure.");
+            }
         }
 
         return Task.FromResult(Ok("runProgramInGuest"));
@@ -3366,8 +3484,11 @@ internal sealed class InitUpdateVmrunService : IVmrunService
         string vmxPath,
         string guestUser,
         string guestPassword,
-        CancellationToken cancellationToken) =>
-        Task.FromResult<IReadOnlyList<GuestProcess>>([]);
+        CancellationToken cancellationToken)
+    {
+        ListProcessesInGuestCallCount++;
+        return Task.FromResult<IReadOnlyList<GuestProcess>>([]);
+    }
 
     private static VmrunCommandResult Ok(string commandName) =>
         new(0, "", "", TimeSpan.Zero, commandName);

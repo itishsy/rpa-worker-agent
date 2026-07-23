@@ -1,7 +1,9 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Seebot.WorkerAgent.Core.Configuration;
+using Seebot.WorkerAgent.Core.Domain;
 using Seebot.WorkerAgent.Core.Operations;
+using Seebot.WorkerAgent.Core.Storage;
 using Seebot.WorkerAgent.Core.Vmware;
 
 namespace Seebot.WorkerAgent.Core.Health;
@@ -14,6 +16,7 @@ public sealed class VmHealthCheckService : IVmHealthCheckService
     private readonly IVmPowerOnService _powerOnService;
     private readonly IVmrunService _vmrunService;
     private readonly IVmDiskCleanupService _diskCleanupService;
+    private readonly ILocalStore _localStore;
     private readonly WorkerAgentOptions _options;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<VmHealthCheckService> _logger;
@@ -22,6 +25,7 @@ public sealed class VmHealthCheckService : IVmHealthCheckService
         IVmPowerOnService powerOnService,
         IVmrunService vmrunService,
         IVmDiskCleanupService diskCleanupService,
+        ILocalStore localStore,
         WorkerAgentOptions options,
         TimeProvider? timeProvider = null,
         ILogger<VmHealthCheckService>? logger = null)
@@ -29,6 +33,7 @@ public sealed class VmHealthCheckService : IVmHealthCheckService
         _powerOnService = powerOnService;
         _vmrunService = vmrunService;
         _diskCleanupService = diskCleanupService;
+        _localStore = localStore;
         _options = options;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _logger = logger ?? NullLogger<VmHealthCheckService>.Instance;
@@ -36,8 +41,32 @@ public sealed class VmHealthCheckService : IVmHealthCheckService
 
     public async Task CheckAsync(CancellationToken cancellationToken)
     {
+        IReadOnlyDictionary<string, VmCurrentState> stateByVmName;
+        try
+        {
+            var states = await _localStore
+                .GetVmStatesAsync(_options.Agent.HostId, cancellationToken)
+                .ConfigureAwait(false);
+            stateByVmName = states.ToDictionary(state => state.VmName, StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            // Quarantine is a safety boundary. If its state cannot be read, do not risk
+            // powering on, restarting or cleaning a quarantined VM.
+            _logger.LogError(exception, "无法读取 VM 隔离状态，本次健康检查已取消。");
+            return;
+        }
+
         foreach (var vm in _options.VirtualMachines.Where(vm => vm.Enabled))
         {
+            if (stateByVmName.TryGetValue(vm.Name, out var state) && state.IsQuarantined)
+            {
+                _logger.LogInformation(
+                    "VM 处于隔离状态，跳过全部健康检查操作。VmName={VmName}",
+                    vm.Name);
+                continue;
+            }
+
             try
             {
                 var result = await _powerOnService.PowerOnAsync(vm.Name, cancellationToken).ConfigureAwait(false);

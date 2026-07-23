@@ -63,16 +63,43 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
 
     public async Task<InitFileUpdateResult> UpdateWorkerIdInSnapshotsAsync(string vmName, CancellationToken cancellationToken)
     {
-        if (_automaticCycleGate is null)
-            return await UpdateWorkerIdInSnapshotsCoreAsync(vmName, cancellationToken).ConfigureAwait(false);
-
-        await using var pauseLease = await _automaticCycleGate
-            .PauseForMaintenanceAsync("UpdateWorkerId", vmName, cancellationToken)
-            .ConfigureAwait(false);
-        return await UpdateWorkerIdInSnapshotsCoreAsync(vmName, cancellationToken).ConfigureAwait(false);
+        return await UpdateWithMaintenancePauseAsync(vmName, profileId: null, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task<InitFileUpdateResult> UpdateWorkerIdInSnapshotsCoreAsync(string vmName, CancellationToken cancellationToken)
+    public async Task<InitFileUpdateResult> UpdateWorkerIdInSnapshotAsync(
+        string vmName,
+        string profileId,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(profileId))
+        {
+            return Fail("PROFILE_ID_MISSING", "ProfileId is required.");
+        }
+
+        return await UpdateWithMaintenancePauseAsync(vmName, profileId.Trim(), cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<InitFileUpdateResult> UpdateWithMaintenancePauseAsync(
+        string vmName,
+        string? profileId,
+        CancellationToken cancellationToken)
+    {
+        if (_automaticCycleGate is null)
+            return await UpdateWorkerIdInSnapshotsCoreAsync(vmName, profileId, cancellationToken).ConfigureAwait(false);
+
+        await using var pauseLease = await _automaticCycleGate
+            .PauseForMaintenanceAsync(
+                "UpdateWorkerId",
+                profileId is null ? vmName : $"{vmName}/{profileId}",
+                cancellationToken)
+            .ConfigureAwait(false);
+        return await UpdateWorkerIdInSnapshotsCoreAsync(vmName, profileId, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<InitFileUpdateResult> UpdateWorkerIdInSnapshotsCoreAsync(
+        string vmName,
+        string? profileId,
+        CancellationToken cancellationToken)
     {
         var vm = _options.VirtualMachines
             .FirstOrDefault(v => string.Equals(v.Name, vmName, StringComparison.OrdinalIgnoreCase));
@@ -87,9 +114,31 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             return Fail("GUEST_CREDENTIALS_MISSING", $"VM '{vmName}' has no GuestUser configured.");
         }
 
+        if (string.IsNullOrWhiteSpace(vm.WorkerId))
+        {
+            return Fail("WORKER_ID_MISSING", $"VM '{vmName}' has no WorkerId configured.");
+        }
+
         if (vm.Profiles.Count == 0)
         {
             return Fail("NO_PROFILES", $"VM '{vmName}' has no profiles.");
+        }
+
+        IReadOnlyList<ProfileOptions> profilesToUpdate;
+        if (profileId is null)
+        {
+            profilesToUpdate = vm.Profiles;
+        }
+        else
+        {
+            var selectedProfile = vm.Profiles.FirstOrDefault(profile =>
+                string.Equals(profile.ProfileId, profileId, StringComparison.OrdinalIgnoreCase));
+            if (selectedProfile is null)
+            {
+                return Fail("PROFILE_NOT_FOUND", $"Profile '{profileId}' was not found in VM '{vmName}'.");
+            }
+
+            profilesToUpdate = [selectedProfile];
         }
 
         if (string.IsNullOrWhiteSpace(_options.Scheduler.BaseUrl))
@@ -97,15 +146,27 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             return Fail("SCHEDULER_BASE_URL_MISSING", "Scheduler.BaseUrl is required to update server.init.");
         }
 
+        if (_vmxNetworkConfigurationService is null)
+        {
+            return Fail("VMX_NETWORK_SERVICE_UNAVAILABLE",
+                "VMX network configuration service is required to update ethernet0.connectionType.");
+        }
+
+        if (_guestTokenProvisioningService is null)
+        {
+            return Fail("TOKEN_PROVISIONING_SERVICE_UNAVAILABLE",
+                "Guest token provisioning service is required to update application.properties.");
+        }
+
         await using var vmLock = await _vmOperationLock.AcquireAsync(vm.VmxPath, cancellationToken).ConfigureAwait(false);
 
         _logger.LogInformation(
             "Init file update started. VmName={VmName}, WorkerId={WorkerId}, ProfileCount={ProfileCount}",
-            vm.Name, vm.WorkerId, vm.Profiles.Count);
+            vm.Name, vm.WorkerId, profilesToUpdate.Count);
 
         var profileResults = new List<ProfileInitUpdateResult>();
 
-        foreach (var profile in vm.Profiles)
+        foreach (var profile in profilesToUpdate)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -187,16 +248,13 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
 
         // 3. A snapshot restore can restore its old virtual hardware settings. Apply the configured
         // network type after revert and before start so the rebuilt snapshot persists that setting.
-        if (_vmxNetworkConfigurationService is not null)
+        var networkUpdate = await _vmxNetworkConfigurationService!
+            .ApplyAsync(vm.VmxPath, _options.Vmrun, cancellationToken)
+            .ConfigureAwait(false);
+        if (!networkUpdate.Success)
         {
-            var networkUpdate = await _vmxNetworkConfigurationService
-                .ApplyAsync(vm.VmxPath, _options.Vmrun, cancellationToken)
-                .ConfigureAwait(false);
-            if (!networkUpdate.Success)
-            {
-                return FailProfile(profile.ProfileId, "WRITE_VMX_NETWORK_FAILED",
-                    networkUpdate.ErrorMessage ?? "Failed to update ethernet0.connectionType.");
-            }
+            return FailProfile(profile.ProfileId, "WRITE_VMX_NETWORK_FAILED",
+                networkUpdate.ErrorMessage ?? "Failed to update ethernet0.connectionType.");
         }
 
         // 4. Start the VM.
@@ -209,14 +267,9 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             return FailProfile(profile.ProfileId, "VM_START_FAILED", ex.Message);
         }
 
-        var tokenFailure = await ProvisionGuestTokenAsync(vm, profile.ProfileId, cancellationToken).ConfigureAwait(false);
-        if (tokenFailure is not null)
-        {
-            await SafeStopAsync(vm, cancellationToken).ConfigureAwait(false);
-            return tokenFailure;
-        }
-
-        // 4. Wait until VMware Tools guest operations are available.
+        // 5. Wait until VMware Tools guest operations are available. Starting the VM in this
+        // maintenance flow exists only to make Guest configuration writable; Runner readiness
+        // is deliberately not part of this step.
         var guestOperationsReady = await WaitForGuestOperationsReadyAsync(vm, cancellationToken).ConfigureAwait(false);
         if (!guestOperationsReady)
         {
@@ -225,7 +278,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
                 $"Timed out waiting for VMware Tools guest operations to become available (timeout={_processWaitTimeout.TotalMinutes:F0}min).");
         }
 
-        // 5. Write and verify server.init and rpa.init; stop robot.exe only when a direct update fails.
+        // 6. Write and verify BaseUrl and WorkerId before making the Token available to robot.exe.
         var serverInitUpdate = await UpdateGuestTextFileWithFallbackAsync(
             vm,
             GuestServerInitFilePath,
@@ -259,10 +312,19 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
             return FailProfile(profile.ProfileId, "WRITE_INIT_FAILED", ex.Message);
         }
 
-        // 7. Stop VM before creating the updated snapshot.
+        // 7. Write Token last. robot.exe may be token-gated, so it must not observe the Token
+        // until NetType, BaseUrl and WorkerId have all been updated successfully.
+        var tokenFailure = await ProvisionGuestTokenAsync(vm, profile.ProfileId, cancellationToken).ConfigureAwait(false);
+        if (tokenFailure is not null)
+        {
+            await SafeStopAsync(vm, cancellationToken).ConfigureAwait(false);
+            return tokenFailure;
+        }
+
+        // 8. Stop VM before creating the updated snapshot.
         await SafeStopAsync(vm, cancellationToken).ConfigureAwait(false);
 
-        // 8. Generate a new snapshot name and create the updated snapshot.
+        // 9. Generate a new snapshot name and create the updated snapshot.
         string newSnapshotName;
         try
         {
@@ -347,34 +409,6 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         return false;
     }
 
-    // Stop guest processes best-effort; failures are logged and ignored.
-    private async Task ForceKillProcessesAsync(VirtualMachineOptions vm, CancellationToken cancellationToken)
-    {
-        foreach (var processName in new[] { "robot.exe" })
-        {
-            try
-            {
-                await _vmrunService.RunProgramInGuestAsync(
-                    vm.VmxPath,
-                    vm.GuestUser,
-                    vm.GuestPasswordSecret,
-                    @"C:\Windows\System32\taskkill.exe",
-                    ["/F", "/IM", processName],
-                    cancellationToken).ConfigureAwait(false);
-
-                _logger.LogInformation(
-                    "Force killed guest process. VmName={VmName}, Process={Process}",
-                    vm.Name, processName);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogDebug(ex,
-                    "Force kill did not succeed (process may not exist). VmName={VmName}, Process={Process}",
-                    vm.Name, processName);
-            }
-        }
-    }
-
     private async Task<InitFileWriteAttempt> UpdateGuestTextFileWithFallbackAsync(
         VirtualMachineOptions vm,
         string guestPath,
@@ -391,18 +425,10 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
         }
 
         _logger.LogWarning(
-            "Direct Guest file update failed; stopping robot.exe before retry. VmName={VmName}, File={File}, Error={Error}",
+            "Direct Guest file update failed; retrying with a temporary file. VmName={VmName}, File={File}, Error={Error}",
             vm.Name,
             fileLabel,
             directAttempt.ErrorMessage);
-
-        await ForceKillProcessesAsync(vm, cancellationToken).ConfigureAwait(false);
-        if (!await WaitForProcessExitAsync(vm, "robot.exe", cancellationToken).ConfigureAwait(false))
-        {
-            return new InitFileWriteAttempt(
-                false,
-                $"Timed out waiting for robot.exe to exit before writing {fileLabel}.");
-        }
 
         var retryAttempt = await TryWriteAndVerifyGuestTextFileAsync(
                 vm, guestPath, expectedValue, fileLabel, useTemporaryFile: true, cancellationToken)
@@ -414,7 +440,7 @@ public sealed class InitFileUpdateService : IInitFileUpdateService
 
         return new InitFileWriteAttempt(
             false,
-            $"Direct write failed: {directAttempt.ErrorMessage}; retry after stopping robot.exe failed: {retryAttempt.ErrorMessage}");
+            $"Direct write failed: {directAttempt.ErrorMessage}; temporary-file retry failed: {retryAttempt.ErrorMessage}");
     }
 
     private async Task<InitFileWriteAttempt> TryWriteAndVerifyGuestTextFileAsync(
@@ -488,41 +514,6 @@ if ($actual -ne $expected) {
         return value.Replace("'", "''", StringComparison.Ordinal);
     }
 
-    private async Task<bool> WaitForProcessExitAsync(
-        VirtualMachineOptions vm,
-        string processName,
-        CancellationToken cancellationToken)
-    {
-        var deadline = _timeProvider.GetUtcNow() + _processWaitTimeout;
-        while (_timeProvider.GetUtcNow() < deadline)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            try
-            {
-                var processes = await _vmrunService
-                    .ListProcessesInGuestAsync(vm.VmxPath, vm.GuestUser, vm.GuestPasswordSecret, cancellationToken)
-                    .ConfigureAwait(false);
-
-                if (!processes.Any(p => p.CommandLine.Contains(processName, StringComparison.OrdinalIgnoreCase)))
-                {
-                    _logger.LogInformation(
-                        "Guest process exited. VmName={VmName}, Process={Process}",
-                        vm.Name,
-                        processName);
-                    return true;
-                }
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogDebug(ex, "listProcessesInGuest failed while waiting for process exit. VmName={VmName}", vm.Name);
-            }
-
-            await Task.Delay(_processPollInterval, cancellationToken).ConfigureAwait(false);
-        }
-
-        return false;
-    }
-
     private sealed record InitFileWriteAttempt(bool Success, string? ErrorMessage);
 
     private async Task<ProfileInitUpdateResult?> ProvisionGuestTokenAsync(
@@ -530,12 +521,7 @@ if ($actual -ne $expected) {
         string profileId,
         CancellationToken cancellationToken)
     {
-        if (_guestTokenProvisioningService is null)
-        {
-            return null;
-        }
-
-        var result = await _guestTokenProvisioningService.ProvisionAsync(vm, cancellationToken)
+        var result = await _guestTokenProvisioningService!.ProvisionAsync(vm, cancellationToken)
             .ConfigureAwait(false);
         return result.Success
             ? null

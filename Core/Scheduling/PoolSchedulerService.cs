@@ -77,14 +77,8 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
 
         if (targetProfiles.Count == 0)
         {
-            var generalTargets = BuildGeneralRevertTargets(vmStates);
-            if (generalTargets.Count == 0)
-            {
-                _logger.LogInformation("调度周期结束，本次未执行切换。Reason={Reason}", "没有待处理的 Profile 任务。");
-                return NoSwitch("No pending profile tasks.");
-            }
-
-            targetProfiles = generalTargets;
+            _logger.LogInformation("调度周期结束，本次未执行切换。Reason={Reason}", "云端没有返回待处理的 Profile。");
+            return NoSwitch("No pending profile tasks returned by scheduler.");
         }
 
         var pendingProfileIds = targetProfiles.Select(r => r.ProfileId).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -185,52 +179,6 @@ public sealed class PoolSchedulerService : IPoolSchedulerService
 
         _logger.LogInformation("调度周期结束，本次未执行切换。Reason={Reason}", "没有兼容且处于空闲状态的候选 VM。");
         return NoSwitch("No compatible idle VM candidate.");
-    }
-
-    private IReadOnlyList<ProfilePendingTaskResponse> BuildGeneralRevertTargets(IReadOnlyList<VmCurrentState> vmStates)
-    {
-        var generalProfileId = _options.Agent.GeneralProfileId;
-        if (string.IsNullOrWhiteSpace(generalProfileId))
-        {
-            return [];
-        }
-
-        var targets = new List<ProfilePendingTaskResponse>();
-        foreach (var state in vmStates)
-        {
-            if (string.Equals(state.CurrentProfileId, generalProfileId, StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            var vm = EnabledVirtualMachines().FirstOrDefault(v =>
-                string.Equals(v.Name, state.VmName, StringComparison.OrdinalIgnoreCase));
-            if (vm is null)
-            {
-                continue;
-            }
-
-            var generalProfile = vm.Profiles.FirstOrDefault(p =>
-                string.Equals(p.ProfileId, generalProfileId, StringComparison.OrdinalIgnoreCase));
-            if (generalProfile is null)
-            {
-                continue;
-            }
-
-            targets.Add(new ProfilePendingTaskResponse
-            {
-                HasTask = true,
-                ProfileId = generalProfileId,
-                PendingCount = 0,
-                FirstTaskId = null,
-                Priority = 0,
-                OldestQueuedAt = null
-            });
-
-            break;
-        }
-
-        return targets;
     }
 
     private async Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingProfilesAsync(

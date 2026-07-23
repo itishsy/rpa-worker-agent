@@ -62,6 +62,7 @@ public static class WorkerAgentOptionsValidator
         {
             errors.Add($"{vmPath}.GuestBackupPaths must contain at least one directory name.");
         }
+
     }
 
     private static void ValidateProfiles(IReadOnlyList<ProfileOptions> profiles, string vmPath, List<string> errors)

@@ -211,6 +211,20 @@ public static class OperationsApiExtensions
                 : Results.UnprocessableEntity(result);
         });
 
+        group.MapPost("/vms/{vmName}/profiles/{profileId}/update-init-workerid", async (
+            string vmName,
+            string profileId,
+            IInitFileUpdateService initFileUpdateService,
+            CancellationToken cancellationToken) =>
+        {
+            var result = await initFileUpdateService
+                .UpdateWorkerIdInSnapshotAsync(vmName, profileId, cancellationToken)
+                .ConfigureAwait(false);
+            return result.Success
+                ? Results.Ok(result)
+                : Results.UnprocessableEntity(result);
+        });
+
         group.MapPost("/snapshots/{vmName}/{profileId}/update", async (
             string vmName,
             string profileId,
@@ -463,6 +477,7 @@ public static class OperationsApiExtensions
             <button class="primary" type="submit">Save Profile</button>
             <button type="button" onclick="switchSelectedSnapshot()">切换</button>
             <button type="button" onclick="updateSelectedSnapshot()">升级</button>
+            <button type="button" id="updateProfileWorkerIdBtn" onclick="updateSelectedProfileWorkerId()">更新机器码</button>
             <button type="button" onclick="clearProfileForm()">Clear</button>
           </div>
         </form>
@@ -633,6 +648,48 @@ public static class OperationsApiExtensions
         status(`Update failed: ${err.message}`);
       } finally {
         if (btn) { btn.disabled = false; btn.textContent = '更新机器码'; }
+      }
+    }
+
+    async function updateSelectedProfileWorkerId() {
+      const form = document.getElementById('profileForm');
+      const vmName = form.elements.vmName.value;
+      const profileId = form.elements.profileId.value;
+      if (!vmName || !profileId) {
+        status('Select a profile first.');
+        return;
+      }
+
+      const button = document.getElementById('updateProfileWorkerIdBtn');
+      await updateProfileWorkerId(vmName, profileId, button);
+    }
+
+    async function updateProfileWorkerId(vmName, profileId, button) {
+      if (!confirm(`更新 VM "${vmName}" 的 Profile "${profileId}" 机器码？\n\n将恢复并启动该快照，写入 NetType、BaseUrl、WorkerId 和 Token，然后关机并重建该快照。`)) return;
+
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = '更新中...';
+      status(`正在更新机器码：${vmName} / ${profileId}...`);
+
+      try {
+        const result = await request(
+          `/vms/${encodeURIComponent(vmName)}/profiles/${encodeURIComponent(profileId)}/update-init-workerid`,
+          { method: 'POST' }
+        );
+        const profileResult = (result.profiles || [])[0];
+        status(profileResult?.success
+          ? `机器码更新完成：${vmName} / ${profileId} -> ${profileResult.newSnapshotName || ''}`
+          : `机器码更新失败：${profileResult?.errorCode || result.errorCode || ''} ${profileResult?.errorMessage || result.errorMessage || ''}`);
+        selectedVmName = vmName;
+        await load();
+      } catch (err) {
+        status(`机器码更新失败：${err.message}`);
+      } finally {
+        if (button.isConnected) {
+          button.disabled = false;
+          button.textContent = originalText;
+        }
       }
     }
 

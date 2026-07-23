@@ -4,7 +4,6 @@ public sealed class AgentOptions
 {
     public string HostId { get; set; } = "";
     public string AgentName { get; set; } = "";
-    public string GeneralProfileId { get; set; } = "General";
     public string HostWorkPath { get; set; } = "";
     public int PollIntervalSeconds { get; set; }
     public int SwitchTimeoutSeconds { get; set; }

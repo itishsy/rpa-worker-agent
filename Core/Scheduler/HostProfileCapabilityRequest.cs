@@ -7,4 +7,5 @@ public sealed class HostProfileCapabilityRequest
     public string ProfileCode { get; set; } = "";
     public string ProfileName { get; set; } = "";
     public string SnapshotName { get; set; } = "";
+    public string Status { get; set; } = "";
 }
