@@ -49,6 +49,10 @@ function Install-RobotStartupTask {
     Assert-Administrator
     Assert-WaitSettings
 
+    if ($TriggerMode -ne "Logon") {
+        throw "TriggerMode Startup cannot display robot.exe on the interactive desktop. Use TriggerMode Logon."
+    }
+
     if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or
         -not (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)) {
         throw "The current script path could not be resolved."
@@ -79,24 +83,15 @@ function Install-RobotStartupTask {
         -Argument ($actionArguments -join " ") `
         -WorkingDirectory (Split-Path -Parent $scriptPath)
 
-    if ($TriggerMode -eq "Logon") {
-        if ([string]::IsNullOrWhiteSpace($RunAsUser)) {
-            throw "RunAsUser is required when TriggerMode is Logon."
-        }
+    if ([string]::IsNullOrWhiteSpace($RunAsUser)) {
+        throw "RunAsUser is required when TriggerMode is Logon."
+    }
 
-        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $RunAsUser
-        $principal = New-ScheduledTaskPrincipal `
-            -UserId $RunAsUser `
-            -LogonType Interactive `
-            -RunLevel Highest
-    }
-    else {
-        $trigger = New-ScheduledTaskTrigger -AtStartup
-        $principal = New-ScheduledTaskPrincipal `
-            -UserId "SYSTEM" `
-            -LogonType ServiceAccount `
-            -RunLevel Highest
-    }
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $RunAsUser
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId $RunAsUser `
+        -LogonType Interactive `
+        -RunLevel Highest
 
     $executionTimeLimit = New-TimeSpan -Seconds ($TimeoutSeconds + 300)
     $settings = New-ScheduledTaskSettingsSet `
@@ -141,6 +136,11 @@ function Uninstall-RobotStartupTask {
 function Start-RobotAfterToken {
     Assert-WaitSettings
 
+    $currentSessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+    if ($currentSessionId -eq 0) {
+        throw "robot.exe must be started in an interactive user session, not Windows Session 0."
+    }
+
     if (-not (Test-Path -LiteralPath $RobotPath -PathType Leaf)) {
         throw "robot.exe does not exist: $RobotPath"
     }
@@ -175,6 +175,7 @@ function Start-RobotAfterToken {
                     $startParameters = @{
                         FilePath         = $RobotPath
                         WorkingDirectory = (Split-Path -Parent $RobotPath)
+                        WindowStyle      = "Normal"
                         PassThru         = $true
                     }
                     if ($RobotArguments.Count -gt 0) {

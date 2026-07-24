@@ -39,7 +39,13 @@ public sealed class SchedulerClient : ISchedulerClient
 
     public async Task<IReadOnlyList<ProfilePendingTaskResponse>> QueryPendingTasksAsync(string workerId, string profileId, CancellationToken cancellationToken)
     {
-        var url = BuildUri($"robot/client/task/findTaskProfileCode/{Uri.EscapeDataString(workerId)}?profileCode={Uri.EscapeDataString(profileId)}");
+        var relativePath = $"robot/client/task/findTaskProfileCode/{Uri.EscapeDataString(workerId)}";
+        if (!IsGeneralProfile(profileId))
+        {
+            relativePath += $"?profileCode={Uri.EscapeDataString(profileId)}";
+        }
+
+        var url = BuildUri(relativePath);
         _logger.LogInformation(
             "Scheduler query pending tasks started. WorkerId={WorkerId}, CurrentProfileId={ProfileId}, Url={Url}",
             workerId,
@@ -59,6 +65,11 @@ public sealed class SchedulerClient : ISchedulerClient
             profileId,
             profiles.Count);
         return profiles;
+    }
+
+    private static bool IsGeneralProfile(string profileId)
+    {
+        return string.Equals(profileId, "General", StringComparison.OrdinalIgnoreCase);
     }
 
     public Task ReportCapabilitiesAsync(IReadOnlyList<HostProfileCapabilityRequest> request, CancellationToken cancellationToken)

@@ -77,6 +77,7 @@ var tests = new (string Name, Action Body)[]
     ("VmrunService passes deleteSnapshot arguments", VmrunServicePassesDeleteSnapshotArguments),
     ("VmrunService serializes concurrent vmrun commands", VmrunServiceSerializesConcurrentCommands),
     ("SchedulerClient pending query includes profileId and bearer token", SchedulerClientPendingQueryIncludesProfileIdAndBearerToken),
+    ("SchedulerClient pending query omits profileCode for General", SchedulerClientPendingQueryOmitsProfileCodeForGeneral),
     ("SchedulerClient capabilities posts profile capability list", SchedulerClientCapabilitiesPostsProfileCapabilityList),
     ("SchedulerClient logs report payload", SchedulerClientLogsReportPayload),
     ("SchedulerClient VM status includes current profile snapshot and runner status", SchedulerClientVmStatusIncludesCurrentProfileSnapshotAndRunnerStatus),
@@ -969,6 +970,21 @@ static void SchedulerClientPendingQueryIncludesProfileIdAndBearerToken()
     Assert.Equal<string?>(null, handler.LastRequestBody, "Pending query should not send profileIds in the request body.");
     Assert.Equal("Bearer", handler.LastRequest.Headers.Authorization!.Scheme, "Authorization scheme should be Bearer.");
     Assert.Equal("scheduler-token", handler.LastRequest.Headers.Authorization.Parameter, "Authorization token should match scheduler AccessToken.");
+}
+
+static void SchedulerClientPendingQueryOmitsProfileCodeForGeneral()
+{
+    var handler = new FakeHttpMessageHandler(new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = JsonContent("""{"code":0,"message":"ok","data":["rpa-sh-tax-etax"]}""")
+    });
+    var client = NewSchedulerClient(handler);
+
+    var response = client.QueryPendingTasksAsync("rpa-sh-tax-etax-001", "General", CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert.Equal(1, response.Count, "Pending response should deserialize profileId list.");
+    Assert.Equal("/api/rpa/robot/client/task/findTaskProfileCode/rpa-sh-tax-etax-001", handler.LastRequest!.RequestUri!.AbsolutePath, "Pending query path should match scheduler contract.");
+    Assert.Equal("", handler.LastRequest.RequestUri.Query, "General profile should not pass profileCode.");
 }
 
 static void SchedulerClientCapabilitiesPostsProfileCapabilityList()
